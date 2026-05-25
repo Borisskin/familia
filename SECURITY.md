@@ -76,4 +76,4 @@ at a level that lets operators decide whether they need to upgrade
 urgently. CVE assignment is best-effort — I'm happy to support an
 external request via MITRE / GitHub Security Advisory.
 
-For the full security model see [`docs/security.md`](docs/security.md).
+For the full security model see [`docs/en/security.md`](docs/en/security.md).
