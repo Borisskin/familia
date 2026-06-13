@@ -75,6 +75,15 @@ def _make_familia_agent_loop_kwargs(workspace: Path) -> dict[str, Any]:
         return {}
     return familia_bootstrap.make_agent_loop_kwargs(workspace)
 
+
+def _make_familia_channel_manager_kwargs() -> dict[str, Any]:
+    """Load optional familia channel adapters without coupling channels to familia."""
+    try:
+        from familia import bootstrap as familia_bootstrap
+    except ImportError:
+        return {}
+    return familia_bootstrap.make_channel_manager_kwargs()
+
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
 # ---------------------------------------------------------------------------
@@ -811,7 +820,12 @@ def _run_gateway(
 
     # Create channel manager (forwards SessionManager so the WebSocket channel
     # can serve the embedded webui's REST surface).
-    channels = ChannelManager(config, bus, session_manager=session_manager)
+    channels = ChannelManager(
+        config,
+        bus,
+        session_manager=session_manager,
+        **_make_familia_channel_manager_kwargs(),
+    )
 
     from familia.bus.callback_dispatcher import CallbackDispatcher
     callback_dispatcher = CallbackDispatcher(bus)

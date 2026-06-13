@@ -41,6 +41,22 @@ def make_context_extensions(workspace: Any) -> list[Any]:
     return [FamiliaContextExtension(workspace)]
 
 
+def make_inbound_enrichers() -> list[Any]:
+    """Return familia adapters for channel-level inbound enrichment."""
+    try:
+        from familia.nanobot_extension.inbound import FamiliaInboundEnricher
+    except ImportError:
+        return []
+    return [FamiliaInboundEnricher()]
+
+
+def make_channel_manager_kwargs() -> dict[str, Any]:
+    """Return familia adapters for nanobot's neutral channel extension points."""
+    return {
+        "inbound_enrichers": make_inbound_enrichers(),
+    }
+
+
 def make_agent_loop_kwargs(workspace: Any) -> dict[str, Any]:
     """Return familia adapters for nanobot's neutral extension points."""
     from familia import audit
@@ -48,6 +64,8 @@ def make_agent_loop_kwargs(workspace: Any) -> dict[str, Any]:
     return {
         "context_extensions": make_context_extensions(workspace),
         "tool_installers": [install_tools],
+        # Loop-level enrichment owns per-turn ContextVars/roles after the
+        # channel-level enricher has already resolved msg.actor.
         "inbound_enrichers": [on_inbound],
         "outbound_guard": make_outbound_guard(),
         "pending_inbound_handler": handle_pending_inbound,
