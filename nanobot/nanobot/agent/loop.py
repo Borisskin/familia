@@ -185,6 +185,7 @@ class AgentLoop:
         pending_inbound_handler: (
             CallableABC[[InboundMessage], AwaitableABC[tuple[bool, OutboundMessage | None]]] | None
         ) = None,
+        direct_actor_resolver: CallableABC[[str, str], str | None] | None = None,
         current_actor_getter: CallableABC[[], str | None] | None = None,
         tool_call_auditor: CallableABC[..., None] | None = None,
         cron_tool_options: dict[str, Any] | None = None,
@@ -224,6 +225,7 @@ class AgentLoop:
         self._inbound_enrichers = inbound_enrichers or []
         self._outbound_guard = outbound_guard or allow_outbound
         self._pending_inbound_handler = pending_inbound_handler
+        self._direct_actor_resolver = direct_actor_resolver
         self._current_actor_getter = current_actor_getter or (lambda: None)
         self._tool_call_auditor = tool_call_auditor
         self._cron_tool_options = cron_tool_options or {}
@@ -1225,6 +1227,10 @@ class AgentLoop:
         the recipient's principal is known from ``payload.to``.
         """
         await self._connect_mcp()
+        if actor is None and self._direct_actor_resolver is not None:
+            # Direct cron/heartbeat paths bypass channel enrichment, so the
+            # optional adapter resolves an actor before ContextVars are pinned.
+            actor = self._direct_actor_resolver(channel, chat_id)
         msg = InboundMessage(
             channel=channel, sender_id=actor or "user", chat_id=chat_id,
             content=content, media=media or [],

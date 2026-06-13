@@ -84,6 +84,45 @@ def _make_familia_channel_manager_kwargs() -> dict[str, Any]:
         return {}
     return familia_bootstrap.make_channel_manager_kwargs()
 
+
+def _make_familia_callback_handlers(bus: Any) -> list[Any]:
+    """Load optional familia callback handlers for gateway runtime."""
+    try:
+        from familia import bootstrap as familia_bootstrap
+    except ImportError:
+        return []
+    return familia_bootstrap.make_callback_handlers(bus)
+
+
+def _resolve_familia_heartbeat_target(
+    target_actor: str, enabled_channels: set[str]
+) -> tuple[str, str] | None:
+    """Resolve optional familia heartbeat target without concrete imports."""
+    try:
+        from familia import bootstrap as familia_bootstrap
+    except ImportError:
+        return None
+    return familia_bootstrap.resolve_heartbeat_target(target_actor, enabled_channels)
+
+
+def _apply_familia_heartbeat_defaults(hb_cfg: Any) -> None:
+    """Apply optional familia heartbeat defaults if the adapter is installed."""
+    try:
+        from familia import bootstrap as familia_bootstrap
+    except ImportError:
+        logger.debug("familia not available; heartbeat target_actor stays unset")
+        return
+    familia_bootstrap.apply_heartbeat_defaults(hb_cfg)
+
+
+def _reload_familia_runtime_registry() -> None:
+    """Reload optional familia registry state for gateway hot reload."""
+    try:
+        from familia import bootstrap as familia_bootstrap
+    except ImportError:
+        return
+    familia_bootstrap.reload_runtime_registry()
+
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
 # ---------------------------------------------------------------------------
@@ -678,6 +717,7 @@ def _run_gateway(
 ) -> None:
     """Shared gateway runtime; ``open_browser_url`` opens a tab once channels are up."""
     from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.callbacks import CallbackDispatcher
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
     from nanobot.cron.service import CronService
@@ -779,18 +819,12 @@ def _run_gateway(
         async def _silent(*_args, **_kwargs):
             pass
 
-        from familia.principals import resolve_actor
-        actor = None
-        if job.payload.channel and job.payload.to:
-            actor = resolve_actor(job.payload.channel, job.payload.to)
-
         try:
             resp = await agent.process_direct(
                 reminder_note,
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
-                actor=actor,
                 on_progress=_silent,
             )
         finally:
@@ -827,8 +861,7 @@ def _run_gateway(
         **_make_familia_channel_manager_kwargs(),
     )
 
-    from familia.bus.callback_dispatcher import CallbackDispatcher
-    callback_dispatcher = CallbackDispatcher(bus)
+    callback_dispatcher = CallbackDispatcher(bus, _make_familia_callback_handlers(bus))
 
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages.
@@ -847,12 +880,9 @@ def _run_gateway(
 
         target_actor = (config.gateway.heartbeat.target_actor or "").strip()
         if target_actor:
-            from familia.principals import get_registry
-            principal = get_registry().get(target_actor)
-            if principal is not None:
-                for ident in principal.identities:
-                    if ident.channel in enabled and ident.sender_id:
-                        return ident.channel, str(ident.sender_id)
+            resolved = _resolve_familia_heartbeat_target(target_actor, enabled)
+            if resolved is not None:
+                return resolved
             # Fail closed: when target_actor is set but unresolvable, do NOT
             # silently leak system messages into the most-recently-active
             # user's chat. Returning (cli, direct) suppresses delivery on
@@ -887,20 +917,11 @@ def _run_gateway(
         async def _silent(*_args, **_kwargs):
             pass
 
-        # Pin the principal derived from the delivery target so scoped
-        # tools (memX shared/pair, role gates) resolve under a real
-        # actor. Without this, ``get_current_actor()`` returns None in
-        # heartbeat turns and memory_get fails with "no actor in
-        # context". Same pattern as cron delivery.
-        from familia.principals import resolve_actor
-        actor = resolve_actor(channel, chat_id) if channel and chat_id else None
-
         resp = await agent.process_direct(
             tasks,
             session_key="heartbeat",
             channel=channel,
             chat_id=chat_id,
-            actor=actor,
             on_progress=_silent,
         )
 
@@ -921,13 +942,7 @@ def _run_gateway(
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
 
     hb_cfg = config.gateway.heartbeat
-    try:
-        from familia import bootstrap as familia_bootstrap
-        familia_bootstrap.apply_heartbeat_defaults(hb_cfg)
-    except ImportError:
-        # Standalone nanobot install — heartbeat keeps the legacy
-        # most-recent-session behavior since target_actor is empty.
-        logger.debug("familia not available; heartbeat target_actor stays unset")
+    _apply_familia_heartbeat_defaults(hb_cfg)
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
         provider=provider,
@@ -1109,8 +1124,7 @@ def _run_gateway(
                 # 1. principals.json — drop the cached registry; next
                 #    ``get_registry()`` call reads the file again.
                 try:
-                    from familia.principals import reload_registry
-                    reload_registry()
+                    _reload_familia_runtime_registry()
                     logger.info("SIGHUP: principals registry reloaded")
                 except Exception:
                     logger.exception(

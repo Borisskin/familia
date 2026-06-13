@@ -122,6 +122,40 @@ async def test_agent_loop_runs_inbound_enrichers_before_processing(tmp_path: Pat
     assert seen == [message]
 
 
+@pytest.mark.asyncio
+async def test_process_direct_uses_configured_actor_resolver(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    resolved: list[tuple[str, str]] = []
+    captured: list[InboundMessage] = []
+
+    def resolve_actor(channel: str, chat_id: str) -> str | None:
+        resolved.append((channel, chat_id))
+        return "principal_a"
+
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=_provider(),
+        workspace=tmp_path,
+        model="test-model",
+        direct_actor_resolver=resolve_actor,
+    )
+
+    async def connect_mcp() -> None:
+        return None
+
+    async def process_message(msg: InboundMessage, **_kwargs: Any) -> None:
+        captured.append(msg)
+        return None
+
+    monkeypatch.setattr(loop, "_connect_mcp", connect_mcp)
+    monkeypatch.setattr(loop, "_process_message", process_message)
+
+    await loop.process_direct("scheduled task", channel="telegram", chat_id="chat_a")
+
+    assert resolved == [("telegram", "chat_a")]
+    assert captured[0].actor == "principal_a"
+    assert captured[0].sender_id == "principal_a"
+
+
 def test_loop_and_message_tool_do_not_import_familia_directly() -> None:
     root = Path(__file__).resolve().parents[3]
     paths = [

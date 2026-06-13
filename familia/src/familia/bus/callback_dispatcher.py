@@ -197,6 +197,11 @@ class CallbackDispatcher:
         )
         await self.bus.publish_inbound(msg)
 
+    async def handle_callback(self, evt: CallbackEvent) -> bool:
+        """Neutral nanobot callback handler entry point."""
+        await self._handle(evt)
+        return True
+
     async def _handle_approval(
         self, evt: CallbackEvent, verb: str, token: str
     ) -> None:

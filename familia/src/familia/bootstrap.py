@@ -69,6 +69,7 @@ def make_agent_loop_kwargs(workspace: Any) -> dict[str, Any]:
         "inbound_enrichers": [on_inbound],
         "outbound_guard": make_outbound_guard(),
         "pending_inbound_handler": handle_pending_inbound,
+        "direct_actor_resolver": make_direct_actor_resolver(),
         "current_actor_getter": get_current_actor,
         "tool_call_auditor": audit.log_event,
         "cron_tool_options": {
@@ -78,6 +79,40 @@ def make_agent_loop_kwargs(workspace: Any) -> dict[str, Any]:
             "reachable_tags_getter": make_reachable_tags_getter(),
         },
     }
+
+
+def make_direct_actor_resolver() -> Any:
+    """Return resolver for direct cron/heartbeat turns that skip channels."""
+    from familia.principals import resolve_actor
+
+    return resolve_actor
+
+
+def make_callback_handlers(bus: Any) -> list[Any]:
+    """Return familia callback handlers for nanobot's neutral dispatcher."""
+    from familia.bus.callback_dispatcher import CallbackDispatcher
+
+    return [CallbackDispatcher(bus)]
+
+
+def resolve_heartbeat_target(target_actor: str, enabled_channels: set[str]) -> tuple[str, str] | None:
+    """Resolve configured heartbeat actor to an enabled channel identity."""
+    from familia.principals import get_registry
+
+    principal = get_registry().get(target_actor)
+    if principal is None:
+        return None
+    for ident in principal.identities:
+        if ident.channel in enabled_channels and ident.sender_id:
+            return ident.channel, str(ident.sender_id)
+    return None
+
+
+def reload_runtime_registry() -> None:
+    """Reload mutable familia registry state for gateway SIGHUP."""
+    from familia.principals import reload_registry
+
+    reload_registry()
 
 
 def make_outbound_guard() -> Any:
