@@ -29,10 +29,10 @@ FILES=(
     nanobot/nanobot/agent/tools/message.py
     nanobot/nanobot/channels/base.py
     nanobot/nanobot/cli/commands.py
-    nanobot/nanobot/command/builtin.py
 )
 
 echo "→ regenerating patches against $UPSTREAM"
+echo "→ Phase 9 note: review hunks manually before treating patches as live"
 
 for f in "${FILES[@]}"; do
     name=$(echo "$f" | sed 's|nanobot/nanobot/||;s|/|_|g;s|\.py$|.patch|')

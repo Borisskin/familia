@@ -107,7 +107,12 @@ def make_dream_tool_installers() -> list[Any]:
 
 
 def make_heartbeat_source_reader(target_actor: str | None) -> Any:
-    """Return optional heartbeat source reader for a configured principal."""
+    """Return the adapter-owned heartbeat reader for a configured principal.
+
+    ``None`` means nanobot may use its standalone legacy file path. A returned
+    reader owns source selection, and empty reader content must fail closed in
+    nanobot heartbeat service instead of falling back to ``HEARTBEAT.md``.
+    """
     if not (target_actor or "").strip():
         return None
     from familia.nanobot_extension.cron import make_heartbeat_source_reader as _make

@@ -108,6 +108,12 @@ class MemoryStore:
             logger.exception("Failed to migrate legacy HISTORY.md")
 
     def _parse_legacy_history(self, text: str) -> list[dict[str, Any]]:
+        """Parse pre-jsonl HISTORY.md into cursor-ordered entries.
+
+        Legacy files mixed timestamp-prefixed entries and raw multiline
+        message dumps. The splitter preserves raw dumps as one entry and uses
+        the file mtime only when an entry has no timestamp prefix.
+        """
         normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
         if not normalized:
             return []

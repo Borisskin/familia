@@ -49,6 +49,15 @@ class SafeFileHistory(FileHistory):
 from nanobot.cli.stream import StreamRenderer, ThinkingSpinner
 from nanobot.config.paths import get_workspace_path, is_default_workspace
 from nanobot.config.schema import Config
+from nanobot.runtime_adapters import (
+    apply_heartbeat_defaults,
+    make_agent_loop_kwargs,
+    make_callback_handlers,
+    make_channel_manager_kwargs,
+    make_heartbeat_source_reader,
+    reload_runtime_registry,
+    resolve_heartbeat_target,
+)
 from nanobot.utils.helpers import sync_workspace_templates
 from nanobot.utils.restart import (
     consume_restart_notice_from_env,
@@ -65,77 +74,6 @@ app = typer.Typer(
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
-
-
-def _make_familia_agent_loop_kwargs(workspace: Path) -> dict[str, Any]:
-    """Load optional familia adapters without coupling AgentLoop to familia."""
-    try:
-        from familia import bootstrap as familia_bootstrap
-    except ImportError:
-        return {}
-    return familia_bootstrap.make_agent_loop_kwargs(workspace)
-
-
-def _make_familia_channel_manager_kwargs() -> dict[str, Any]:
-    """Load optional familia channel adapters without coupling channels to familia."""
-    try:
-        from familia import bootstrap as familia_bootstrap
-    except ImportError:
-        return {}
-    return familia_bootstrap.make_channel_manager_kwargs()
-
-
-def _make_familia_callback_handlers(bus: Any) -> list[Any]:
-    """Load optional familia callback handlers for gateway runtime."""
-    try:
-        from familia import bootstrap as familia_bootstrap
-    except ImportError:
-        return []
-    return familia_bootstrap.make_callback_handlers(bus)
-
-
-def _resolve_familia_heartbeat_target(
-    target_actor: str, enabled_channels: set[str]
-) -> tuple[str, str] | None:
-    """Resolve optional familia heartbeat target without concrete imports."""
-    try:
-        from familia import bootstrap as familia_bootstrap
-    except ImportError:
-        return None
-    return familia_bootstrap.resolve_heartbeat_target(target_actor, enabled_channels)
-
-
-def _apply_familia_heartbeat_defaults(hb_cfg: Any) -> None:
-    """Apply optional familia heartbeat defaults if the adapter is installed."""
-    try:
-        from familia import bootstrap as familia_bootstrap
-    except ImportError:
-        logger.debug("familia not available; heartbeat target_actor stays unset")
-        return
-    familia_bootstrap.apply_heartbeat_defaults(hb_cfg)
-
-
-def _make_familia_heartbeat_source_reader(target_actor: str | None) -> Any:
-    """Load optional familia-owned heartbeat source reader.
-
-    Returning ``None`` keeps standalone nanobot on the legacy ``HEARTBEAT.md``
-    path. Returning a reader means the adapter owns source selection and the
-    heartbeat service must not fall back to the file on empty adapter content.
-    """
-    try:
-        from familia import bootstrap as familia_bootstrap
-    except ImportError:
-        return None
-    return familia_bootstrap.make_heartbeat_source_reader(target_actor)
-
-
-def _reload_familia_runtime_registry() -> None:
-    """Reload optional familia registry state for gateway hot reload."""
-    try:
-        from familia import bootstrap as familia_bootstrap
-    except ImportError:
-        return
-    familia_bootstrap.reload_runtime_registry()
 
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
@@ -665,7 +603,7 @@ def serve(
         disabled_skills=runtime_config.agents.defaults.disabled_skills,
         session_ttl_minutes=runtime_config.agents.defaults.session_ttl_minutes,
         tools_config=runtime_config.tools,
-        **_make_familia_agent_loop_kwargs(runtime_config.workspace_path),
+        **make_agent_loop_kwargs(runtime_config.workspace_path),
     )
 
     model_name = runtime_config.agents.defaults.model
@@ -778,7 +716,7 @@ def _run_gateway(
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         tools_config=config.tools,
-        **_make_familia_agent_loop_kwargs(config.workspace_path),
+        **make_agent_loop_kwargs(config.workspace_path),
     )
 
     # Set cron callback (needs agent)
@@ -872,10 +810,10 @@ def _run_gateway(
         config,
         bus,
         session_manager=session_manager,
-        **_make_familia_channel_manager_kwargs(),
+        **make_channel_manager_kwargs(),
     )
 
-    callback_dispatcher = CallbackDispatcher(bus, _make_familia_callback_handlers(bus))
+    callback_dispatcher = CallbackDispatcher(bus, make_callback_handlers(bus))
 
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages.
@@ -894,7 +832,7 @@ def _run_gateway(
 
         target_actor = (config.gateway.heartbeat.target_actor or "").strip()
         if target_actor:
-            resolved = _resolve_familia_heartbeat_target(target_actor, enabled)
+            resolved = resolve_heartbeat_target(target_actor, enabled)
             if resolved is not None:
                 return resolved
             # Fail closed: when target_actor is set but unresolvable, do NOT
@@ -956,7 +894,7 @@ def _run_gateway(
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
 
     hb_cfg = config.gateway.heartbeat
-    _apply_familia_heartbeat_defaults(hb_cfg)
+    apply_heartbeat_defaults(hb_cfg)
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
         provider=provider,
@@ -966,7 +904,7 @@ def _run_gateway(
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
         timezone=config.agents.defaults.timezone,
-        source_reader=_make_familia_heartbeat_source_reader(hb_cfg.target_actor),
+        source_reader=make_heartbeat_source_reader(hb_cfg.target_actor),
     )
 
     if channels.enabled_channels:
@@ -1139,7 +1077,7 @@ def _run_gateway(
                 # 1. principals.json — drop the cached registry; next
                 #    ``get_registry()`` call reads the file again.
                 try:
-                    _reload_familia_runtime_registry()
+                    reload_runtime_registry()
                     logger.info("SIGHUP: principals registry reloaded")
                 except Exception:
                     logger.exception(
@@ -1334,7 +1272,7 @@ def agent(
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         tools_config=config.tools,
-        **_make_familia_agent_loop_kwargs(config.workspace_path),
+        **make_agent_loop_kwargs(config.workspace_path),
     )
     restart_notice = consume_restart_notice_from_env()
     if restart_notice and should_show_cli_restart_notice(restart_notice, session_id):

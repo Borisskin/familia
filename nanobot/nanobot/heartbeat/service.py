@@ -76,8 +76,8 @@ class HeartbeatService:
 
     @property
     def heartbeat_file(self) -> Path:
-        # Legacy fallback path. Used only when familia is not installed
-        # OR no admin principal can be resolved.
+        # Legacy fallback path. Used only when no adapter source_reader is
+        # installed; adapter readers fail closed instead of falling back here.
         return self.workspace / "HEARTBEAT.md"
 
     def _read_heartbeat_content(self) -> tuple[str | None, str | None]:

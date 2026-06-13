@@ -9,6 +9,7 @@ from typing import Any
 from nanobot.agent.hook import AgentHook
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.queue import MessageBus
+from nanobot.runtime_adapters import make_agent_loop_kwargs
 
 
 @dataclass(slots=True)
@@ -18,15 +19,6 @@ class RunResult:
     content: str
     tools_used: list[str]
     messages: list[dict[str, Any]]
-
-
-def _make_familia_agent_loop_kwargs(workspace: Path) -> dict[str, Any]:
-    """Load optional familia adapters without coupling AgentLoop to familia."""
-    try:
-        from familia import bootstrap as familia_bootstrap
-    except ImportError:
-        return {}
-    return familia_bootstrap.make_agent_loop_kwargs(workspace)
 
 
 class Nanobot:
@@ -94,7 +86,7 @@ class Nanobot:
             disabled_skills=defaults.disabled_skills,
             session_ttl_minutes=defaults.session_ttl_minutes,
             tools_config=config.tools,
-            **_make_familia_agent_loop_kwargs(config.workspace_path),
+            **make_agent_loop_kwargs(config.workspace_path),
         )
         return cls(loop)
 

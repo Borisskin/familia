@@ -38,6 +38,9 @@ familia = "familia.cli.graph_admin:main"
 [project.entry-points."nanobot.channels"]
 vk = "familia.channels.vk:VKChannel"
 
+[project.entry-points."nanobot.runtime_adapters"]
+familia = "familia.bootstrap"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/familia"]
 

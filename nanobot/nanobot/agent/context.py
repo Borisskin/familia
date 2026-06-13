@@ -79,24 +79,6 @@ class ContextBuilder:
         # the operator sees in admin.
         parts.append(render_template("agent/conversation_rules.md"))
 
-        # Memory-scope defaults: family-by-default for private records.
-        # Peers can read each other's private:* unless tagged 'secret'.
-        # Also code-level, not user-editable.
-        parts.append(render_template("agent/scope_defaults.md"))
-
-        # User-facing memory model: enables the assistant to answer
-        # questions about access/visibility honestly and consistently.
-        # Without this, the LLM falls back on the dictionary meaning of
-        # "private" and contradicts the actual ACL behaviour.
-        parts.append(render_template("agent/memory_model.md"))
-
-        # Grocery shopping via VkusVill official MCP. The MCP server
-        # itself is wired in nanobot-config.json (deployment-time); this
-        # snippet teaches the LLM the proper flow: search with
-        # vvonly=0, confirm cart preview with user, hand off payment
-        # via cart_link_create rather than attempting checkout.
-        parts.append(render_template("agent/shopping_vkusvill.md"))
-
         # Standalone nanobot keeps the legacy single-tenant USER/MEMORY
         # file behavior. Actor-specific context belongs to extensions.
         if actor is None:
