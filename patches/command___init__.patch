@@ -1,0 +1,15 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/command/__init__.py b/nanobot/nanobot/command/__init__.py
+deleted file mode 100644
+index 84e7138..0000000
+--- a/nanobot/nanobot/command/__init__.py
++++ /dev/null
+@@ -1,6 +0,0 @@
+-"""Slash command routing and built-in handlers."""
+-
+-from nanobot.command.builtin import register_builtin_commands
+-from nanobot.command.router import CommandContext, CommandRouter
+-
+-__all__ = ["CommandContext", "CommandRouter", "register_builtin_commands"]

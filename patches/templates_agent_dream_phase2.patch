@@ -1,0 +1,34 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/templates/agent/dream_phase2.md b/nanobot/nanobot/templates/agent/dream_phase2.md
+index f833afb..8460c3a 100644
+--- a/nanobot/nanobot/templates/agent/dream_phase2.md
++++ b/nanobot/nanobot/templates/agent/dream_phase2.md
+@@ -1,6 +1,13 @@
+-Update memory files based on the analysis below.
++Update memory files / scoped memX based on the analysis below.
+ - [FILE] entries: add the described content to the appropriate file
+ - [FILE-REMOVE] entries: delete the corresponding content from memory files
++- [PRIVATE:<actor>] entries: call `dream_memory_set` with scope='private',
++  actor='<actor>', key='<stable_key>', value='<content>'.
++  Pick a stable key from MEMORY_KEYS.md conventions (e.g. `feelings`,
++  `work_context`, `daily_routine`) so repeated dreams overwrite the same slot
++  rather than accumulating forever.  memX is last-write-wins.
++- [PAIR:<a>,<b>] entries: call `dream_memory_set` with scope='pair',
++  actor='<a>', other='<b>', key='<stable_key>', value='<content>'.
+ - [SKILL] entries: create a new skill under skills/<name>/SKILL.md using write_file
+ 
+ ## File paths (relative to workspace root)
+@@ -11,6 +18,11 @@ Update memory files based on the analysis below.
+ 
+ Do NOT guess paths.
+ 
++## Privacy invariant
++Never copy a [PRIVATE:<actor>] or [PAIR:…] fact into MEMORY.md / USER.md / SOUL.md.
++MEMORY.md is read by the agent in every session (including sessions with other
++principals); shared files must not carry private-to-one-principal content.
++
+ ## Editing rules
+ - Edit directly — file contents provided below, no read_file needed
+ - Use exact text as old_text, include surrounding blank lines for unique match

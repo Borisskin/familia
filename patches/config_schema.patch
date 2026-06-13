@@ -1,0 +1,70 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/config/schema.py b/nanobot/nanobot/config/schema.py
+index ac48619..2bf2792 100644
+--- a/nanobot/nanobot/config/schema.py
++++ b/nanobot/nanobot/config/schema.py
+@@ -29,6 +29,15 @@ class ChannelsConfig(Base):
+     send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
+     send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
+     transcription_provider: str = "groq"  # Voice transcription backend: "groq" or "openai"
++    # Cap cumulative STT seconds per inbound turn (current message +
++    # forwards + replied-to). Protects the user's STT quota when
++    # someone forwards a long voice / replies to a long audio.
++    transcription_audio_budget_s: int = Field(default=300, ge=0)
++    # BCP-47 language hint for STT. Yandex requires it (defaults to
++    # ``ru-RU`` if empty); Whisper/OpenAI/Groq auto-detect — passing
++    # it nudges the model when audio is short or noisy. Empty string
++    # = leave default. Format: ``ru-RU``, ``es-ES``, ``en-US`` etc.
++    transcription_lang: str = ""
+ 
+ 
+ class DreamConfig(Base):
+@@ -104,6 +113,7 @@ class ProviderConfig(Base):
+     api_key: str | None = None
+     api_base: str | None = None
+     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
++    folder_id: str | None = None  # Yandex Cloud folder id (STT; optional for other providers)
+ 
+ 
+ class ProvidersConfig(Base):
+@@ -138,6 +148,7 @@ class ProvidersConfig(Base):
+     openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
+     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # Github Copilot (OAuth)
+     qianfan: ProviderConfig = Field(default_factory=ProviderConfig)  # Qianfan (百度千帆)
++    yandex: ProviderConfig = Field(default_factory=ProviderConfig)  # Yandex Cloud (STT only for now)
+ 
+ 
+ class HeartbeatConfig(Base):
+@@ -146,6 +157,14 @@ class HeartbeatConfig(Base):
+     enabled: bool = True
+     interval_s: int = 30 * 60  # 30 minutes
+     keep_recent_messages: int = 8
++    # Optional principal id to receive heartbeat-triggered messages and to
++    # serve as the actor for memory/role-scoped tool calls inside a tick.
++    # Empty string falls back to "most recently active session on an enabled
++    # channel" — appropriate for single-user installs but wrong for
++    # multi-user setups, where heartbeat would otherwise hop to whoever
++    # spoke last. Familia populates this from FAMILIA_OWNER_ACTOR when the
++    # config leaves it blank.
++    target_actor: str = ""
+ 
+ 
+ class ApiConfig(Base):
+@@ -190,7 +209,14 @@ class ExecToolConfig(Base):
+     enable: bool = True
+     timeout: int = 60
+     path_append: str = ""
+-    sandbox: str = ""  # sandbox backend: "" (none) or "bwrap"
++    # Sandbox backend: "bwrap" (default — bubblewrap-isolated; required for
++    # any deploy where the LLM consumes untrusted input — VK/Telegram chat,
++    # web_fetch results, memX values) or "" (none — direct subprocess in
++    # the container). Empty mode is only acceptable for offline single-user
++    # dev where prompt-injection is not in scope. Production Dockerfile
++    # installs bubblewrap; loop.py wires the workspace bind-mount when
++    # sandbox is set.
++    sandbox: str = "bwrap"
+     allowed_env_keys: list[str] = Field(default_factory=list)  # Env var names to pass through to subprocess (e.g. ["GOPATH", "JAVA_HOME"])
+ 
+ class MCPServerConfig(Base):

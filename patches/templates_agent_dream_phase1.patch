@@ -1,0 +1,38 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/templates/agent/dream_phase1.md b/nanobot/nanobot/templates/agent/dream_phase1.md
+index 114db38..b05dd6c 100644
+--- a/nanobot/nanobot/templates/agent/dream_phase1.md
++++ b/nanobot/nanobot/templates/agent/dream_phase1.md
+@@ -2,11 +2,29 @@ You have TWO equally important tasks:
+ 1. Extract new facts from conversation history
+ 2. Deduplicate existing memory files — find and flag redundant, overlapping, or stale content even if NOT mentioned in history
+ 
++Each conversation entry is tagged with `actor=<principal_id>` — this is the
++principal whose turn produced the summary. `(untagged)` means the entry is
++from before per-scope tagging or from a system/mixed source.
++
+ Output one line per finding:
+-[FILE] atomic fact (not already in memory)
++[FILE] atomic fact (not already in memory)               # MEMORY/USER/SOUL — family-wide
+ [FILE-REMOVE] reason for removal
++[PRIVATE:<actor>] atomic fact private to <actor>         # goes to memX private:<actor>:*
++[PAIR:<a>,<b>] atomic fact shared by <a> and <b> only    # goes to memX pair:<a>_<b>:*
+ [SKILL] kebab-case-name: one-line description of the reusable pattern
+ 
++Scope routing — CRITICAL to prevent leaks between principals:
++- [FILE]  — only facts the whole family knows or needs (shared logistics, pet names,
++            common routines). NEVER put here something only one principal said in
++            private (medical details, work secrets, personal feelings towards
++            another principal).
++- [PRIVATE:<actor>] — a fact mentioned by one principal that should NOT leak to
++            others when the agent talks to them. Example:
++            [PRIVATE:alex] concerned about work deadline next week
++- [PAIR:<a>,<b>] — a fact relevant only to a specific pair (e.g. spouses
++            planning a gift for a third person). Sort actor ids alphabetically.
++- When in doubt — prefer PRIVATE over FILE. Over-sharing is the worse failure mode.
++
+ Files: USER (identity, preferences), SOUL (bot behavior, tone), MEMORY (knowledge, project context)
+ 
+ Rules:

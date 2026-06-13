@@ -1,0 +1,24 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/channels/inbound.py b/nanobot/nanobot/channels/inbound.py
+new file mode 100644
+index 0000000..95fb128
+--- /dev/null
++++ b/nanobot/nanobot/channels/inbound.py
+@@ -0,0 +1,15 @@
++"""Neutral inbound message enrichment extension point for channels."""
++
++from __future__ import annotations
++
++from collections.abc import Awaitable, Callable
++
++from nanobot.bus.events import InboundMessage
++
++
++InboundEnricher = Callable[[InboundMessage], Awaitable[None]]
++
++
++async def noop_inbound_enricher(message: InboundMessage) -> None:
++    """Default standalone behavior: leave inbound messages unchanged."""
++    del message

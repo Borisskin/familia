@@ -1,41 +1,193 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
 diff --git a/nanobot/nanobot/agent/loop.py b/nanobot/nanobot/agent/loop.py
-index 116868b..130d9d4 100644
+index 25af137..d645939 100644
 --- a/nanobot/nanobot/agent/loop.py
 +++ b/nanobot/nanobot/agent/loop.py
-@@ -17,6 +17,9 @@ from nanobot.agent.autocompact import AutoCompact
+@@ -7,6 +7,8 @@ import dataclasses
+ import json
+ import os
+ import time
++from collections.abc import Awaitable as AwaitableABC
++from collections.abc import Callable as CallableABC
+ from contextlib import AsyncExitStack, nullcontext
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any, Awaitable, Callable
+@@ -16,7 +18,8 @@ from loguru import logger
+ from nanobot.agent.autocompact import AutoCompact
  from nanobot.agent.context import ContextBuilder
  from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
- from nanobot.agent.memory import Consolidator, Dream
-+from familia.policy import gate_outbound_send
-+from familia.principals import get_current_actor
-+from familia import audit, bootstrap as familia_bootstrap
+-from nanobot.agent.memory import Consolidator, Dream
++from nanobot.agent.memory import Consolidator, Dream, MemoryStore
++from nanobot.agent.outbound import OutboundGuard, OutboundRequest, allow_outbound
  from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
  from nanobot.agent.skills import BUILTIN_SKILLS_DIR
  from nanobot.agent.subagent import SubagentManager
-@@ -107,6 +110,14 @@ class _LoopHook(AgentHook):
+@@ -26,13 +29,12 @@ from nanobot.agent.tools.message import MessageTool
+ from nanobot.agent.tools.notebook import NotebookEditTool
+ from nanobot.agent.tools.registry import ToolRegistry
+ from nanobot.agent.tools.search import GlobTool, GrepTool
+-from nanobot.agent.tools.shell import ExecTool
+ from nanobot.agent.tools.self import MyTool
++from nanobot.agent.tools.shell import ExecTool
+ from nanobot.agent.tools.spawn import SpawnTool
+ from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+ from nanobot.bus.events import InboundMessage, OutboundMessage
+ from nanobot.bus.queue import MessageBus
+-from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
+ from nanobot.config.schema import AgentDefaults
+ from nanobot.providers.base import LLMProvider
+ from nanobot.session.manager import Session, SessionManager
+@@ -48,6 +50,12 @@ if TYPE_CHECKING:
+ 
+ UNIFIED_SESSION_KEY = "unified:default"
+ 
++# Watchdog: max lifetime for one inbound message's processing turn. Bounds
++# tool-call loops and stuck LLM streams so a single bad turn cannot wedge
++# the dispatcher and starve other senders. Provider-level timeouts (codex)
++# are tighter; this is the outer net.
++_DISPATCH_WATCHDOG_TIMEOUT = 900.0  # 15 minutes
++
+ 
+ class _LoopHook(AgentHook):
+     """Core hook for the main loop."""
+@@ -107,6 +115,15 @@ class _LoopHook(AgentHook):
          for tc in context.tool_calls:
              args_str = json.dumps(tc.arguments, ensure_ascii=False)
              logger.info("Tool call: {}({})", tc.name, args_str[:200])
-+            audit.log_event(
-+                "tool_call",
-+                tool=tc.name,
-+                args_preview=args_str[:500],
-+                actor=get_current_actor(),
-+                channel=self._channel,
-+                chat_id=self._chat_id,
-+            )
++            if self._loop._tool_call_auditor:
++                self._loop._tool_call_auditor(
++                    "tool_call",
++                    tool=tc.name,
++                    args_preview=args_str[:500],
++                    actor=self._loop._current_actor_getter(),
++                    channel=self._channel,
++                    chat_id=self._chat_id,
++                )
          self._loop._set_tool_context(self._channel, self._chat_id, self._message_id)
  
      async def after_iteration(self, context: AgentHookContext) -> None:
-@@ -288,6 +299,7 @@ class AgentLoop:
+@@ -161,6 +178,18 @@ class AgentLoop:
+         unified_session: bool = False,
+         disabled_skills: list[str] | None = None,
+         tools_config: ToolsConfig | None = None,
++        context_extensions: list[Any] | None = None,
++        tool_installers: list[CallableABC[[AgentLoop], None]] | None = None,
++        inbound_enrichers: list[CallableABC[[InboundMessage], AwaitableABC[None]]] | None = None,
++        outbound_guard: OutboundGuard | None = None,
++        pending_inbound_handler: (
++            CallableABC[[InboundMessage], AwaitableABC[tuple[bool, OutboundMessage | None]]] | None
++        ) = None,
++        direct_actor_resolver: CallableABC[[str, str], str | None] | None = None,
++        current_actor_getter: CallableABC[[], str | None] | None = None,
++        tool_call_auditor: CallableABC[..., None] | None = None,
++        cron_tool_options: dict[str, Any] | None = None,
++        dream_tool_installers: list[CallableABC[[ToolRegistry, MemoryStore], None]] | None = None,
+     ):
+         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
+ 
+@@ -193,8 +222,24 @@ class AgentLoop:
+         self._start_time = time.time()
+         self._last_usage: dict[str, int] = {}
+         self._extra_hooks: list[AgentHook] = hooks or []
+-
+-        self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
++        self._tool_installers = tool_installers or []
++        self._inbound_enrichers = inbound_enrichers or []
++        self._outbound_guard = outbound_guard or allow_outbound
++        self._pending_inbound_handler = pending_inbound_handler
++        self._direct_actor_resolver = direct_actor_resolver
++        self._current_actor_getter = current_actor_getter or (lambda: None)
++        self._tool_call_auditor = tool_call_auditor
++        self._cron_tool_options = cron_tool_options or {}
++        self._dream_tool_installers = dream_tool_installers or []
++
++        # Deployments inject concrete prompt/runtime extensions here; the
++        # builder remains unaware of which product owns them.
++        self.context = ContextBuilder(
++            workspace,
++            timezone=timezone,
++            disabled_skills=disabled_skills,
++            context_extensions=context_extensions or [],
++        )
+         self.sessions = session_manager or SessionManager(workspace)
+         self.tools = ToolRegistry()
+         self.runner = AgentRunner(provider)
+@@ -246,14 +291,13 @@ class AgentLoop:
+             store=self.context.memory,
+             provider=provider,
+             model=self.model,
++            dream_tool_installers=self._dream_tool_installers,
+         )
+         self._register_default_tools()
+         if _tc.my.enable:
+             self.tools.register(MyTool(loop=self, modify_allowed=_tc.my.allow_set))
+         self._runtime_vars: dict[str, Any] = {}
+         self._current_iteration: int = 0
+-        self.commands = CommandRouter()
+-        register_builtin_commands(self.commands)
+ 
+     def _register_default_tools(self) -> None:
+         """Register the default set of tools."""
+@@ -272,6 +316,27 @@ class AgentLoop:
+             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
+         self.tools.register(NotebookEditTool(workspace=self.workspace, allowed_dir=allowed_dir))
+         if self.exec_config.enable:
++            sandbox = (self.exec_config.sandbox or "").strip()
++            if not sandbox:
++                # Refuse to expose an unsandboxed shell to the LLM unless the
++                # operator explicitly opts in. Prompt-injection from any
++                # untrusted input source (chat, web_fetch, memX) becomes RCE
++                # in the container otherwise. Set NANOBOT_ALLOW_UNSANDBOXED_EXEC=1
++                # only for offline single-user dev where injection isn't a
++                # concern.
++                if os.environ.get("NANOBOT_ALLOW_UNSANDBOXED_EXEC") != "1":
++                    raise RuntimeError(
++                        "ExecTool refuses to start: tools.exec.sandbox is empty. "
++                        "Set sandbox: 'bwrap' in config (default), or override with "
++                        "NANOBOT_ALLOW_UNSANDBOXED_EXEC=1 (DEV ONLY — disables the "
++                        "container's only line of defense against prompt-injection "
++                        "RCE)."
++                    )
++                logger.warning(
++                    "ExecTool: sandbox is empty and NANOBOT_ALLOW_UNSANDBOXED_EXEC=1 "
++                    "is set — running shell unsandboxed. Do NOT use in any deploy "
++                    "where the LLM consumes untrusted input."
++                )
+             self.tools.register(
+                 ExecTool(
+                     working_dir=str(self.workspace),
+@@ -287,11 +352,26 @@ class AgentLoop:
+                 WebSearchTool(config=self.web_config.search, proxy=self.web_config.proxy)
              )
              self.tools.register(WebFetchTool(proxy=self.web_config.proxy))
-         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
-+        familia_bootstrap.install_tools(self)
+-        self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
++        self.tools.register(
++            MessageTool(
++                send_callback=self.bus.publish_outbound,
++                outbound_guard=self._outbound_guard,
++            )
++        )
++        for install_tools in self._tool_installers:
++            install_tools(self)
          self.tools.register(SpawnTool(manager=self.subagents))
          if self.cron_service:
++            cron_options = self._cron_tool_options
              self.tools.register(
-@@ -321,7 +333,7 @@ class AgentLoop:
+-                CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
++                CronTool(
++                    self.cron_service,
++                    default_timezone=self.context.timezone or "UTC",
++                    to_validator=cron_options.get("to_validator"),
++                    current_actor_getter=cron_options.get("current_actor_getter"),
++                    is_admin_getter=cron_options.get("is_admin_getter"),
++                    reachable_tags_getter=cron_options.get("reachable_tags_getter"),
++                )
+             )
+ 
+     async def _connect_mcp(self) -> None:
+@@ -321,7 +401,7 @@ class AgentLoop:
          # Compute the effective session key (accounts for unified sessions)
          # so that subagent results route to the correct pending queue.
          effective_key = UNIFIED_SESSION_KEY if self._unified_session else f"{channel}:{chat_id}"
@@ -44,8 +196,83 @@ index 116868b..130d9d4 100644
              if tool := self.tools.get(name):
                  if hasattr(tool, "set_context"):
                      if name == "spawn":
-@@ -571,7 +583,7 @@ class AgentLoop:
-                         pending_queue=pending,
+@@ -345,36 +425,6 @@ class AgentLoop:
+ 
+         return format_tool_hints(tool_calls)
+ 
+-    async def _dispatch_command_inline(
+-        self,
+-        msg: InboundMessage,
+-        key: str,
+-        raw: str,
+-        dispatch_fn: Callable[[CommandContext], Awaitable[OutboundMessage | None]],
+-    ) -> None:
+-        """Dispatch a command directly from the run() loop and publish the result."""
+-        ctx = CommandContext(msg=msg, session=None, key=key, raw=raw, loop=self)
+-        result = await dispatch_fn(ctx)
+-        if result:
+-            await self.bus.publish_outbound(result)
+-        else:
+-            logger.warning("Command '{}' matched but dispatch returned None", raw)
+-
+-    async def _cancel_active_tasks(self, key: str) -> int:
+-        """Cancel and await all active tasks and subagents for *key*.
+-
+-        Returns the total number of cancelled tasks + subagents.
+-        """
+-        tasks = self._active_tasks.pop(key, [])
+-        cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
+-        for t in tasks:
+-            try:
+-                await t
+-            except (asyncio.CancelledError, Exception):
+-                pass
+-        sub_cancelled = await self.subagents.cancel_by_session(key)
+-        return cancelled + sub_cancelled
+-
+     def _effective_session_key(self, msg: InboundMessage) -> str:
+         """Return the session key used for task routing and mid-turn injections."""
+         if self._unified_session and not msg.session_key_override:
+@@ -506,26 +556,11 @@ class AgentLoop:
+                 logger.warning("Error consuming inbound message: {}, continuing...", e)
+                 continue
+ 
+-            raw = msg.content.strip()
+-            if self.commands.is_priority(raw):
+-                await self._dispatch_command_inline(
+-                    msg, msg.session_key, raw,
+-                    self.commands.dispatch_priority,
+-                )
+-                continue
+             effective_key = self._effective_session_key(msg)
+             # If this session already has an active pending queue (i.e. a task
+             # is processing this session), route the message there for mid-turn
+             # injection instead of creating a competing task.
+             if effective_key in self._pending_queues:
+-                # Non-priority commands must not be queued for injection;
+-                # dispatch them directly (same pattern as priority commands).
+-                if self.commands.is_dispatchable_command(raw):
+-                    await self._dispatch_command_inline(
+-                        msg, effective_key, raw,
+-                        self.commands.dispatch,
+-                    )
+-                    continue
+                 pending_msg = msg
+                 if effective_key != msg.session_key:
+                     pending_msg = dataclasses.replace(
+@@ -604,12 +639,15 @@ class AgentLoop:
+                             ))
+                             stream_segment += 1
+ 
+-                    response = await self._process_message(
+-                        msg, on_stream=on_stream, on_stream_end=on_stream_end,
+-                        pending_queue=pending,
++                    response = await asyncio.wait_for(
++                        self._process_message(
++                            msg, on_stream=on_stream, on_stream_end=on_stream_end,
++                            pending_queue=pending,
++                        ),
++                        timeout=_DISPATCH_WATCHDOG_TIMEOUT,
                      )
                      if response is not None:
 -                        await self.bus.publish_outbound(response)
@@ -53,18 +280,33 @@ index 116868b..130d9d4 100644
                      elif msg.channel == "cli":
                          await self.bus.publish_outbound(OutboundMessage(
                              channel=msg.channel, chat_id=msg.chat_id,
-@@ -652,6 +664,57 @@ class AgentLoop:
+@@ -641,6 +679,15 @@ class AgentLoop:
+                             exc_info=True,
+                         )
+                     raise
++                except asyncio.TimeoutError:
++                    logger.error(
++                        "Watchdog: turn for session {} exceeded {}s; aborting",
++                        session_key, _DISPATCH_WATCHDOG_TIMEOUT,
++                    )
++                    await self.bus.publish_outbound(OutboundMessage(
++                        channel=msg.channel, chat_id=msg.chat_id,
++                        content="Извините, не успел ответить за отведённое время. Попробуйте ещё раз.",
++                    ))
+                 except Exception:
+                     logger.exception("Error processing message for session {}", session_key)
+                     await self.bus.publish_outbound(OutboundMessage(
+@@ -690,6 +737,62 @@ class AgentLoop:
          self._running = False
          logger.info("Agent loop stopping")
  
 +    async def _publish_reply_with_policy(
 +        self, inbound: InboundMessage, outbound: OutboundMessage
 +    ) -> None:
-+        """Gate a direct agent reply through the familia policy engine
-+        before publishing. All four message-send paths (this one plus
-+        MessageTool, SendButtonsTool, AskPrincipalTool) delegate the
-+        policy decision to :func:`familia.policy.gate_outbound_send` so
-+        the self-reply bypass and ASK parking live in one place.
++        """Gate a direct agent reply through the configured outbound guard.
++
++        Direct replies and MessageTool delegate to the same guard so self-reply
++        bypasses, approval parking, and audit stay behind one extension point.
 +        Streaming deltas, progress/retry notices and status metadata
 +        messages are passed through without gating — they are system
 +        output, not agent decisions about who to address."""
@@ -77,20 +319,26 @@ index 116868b..130d9d4 100644
 +            await self.bus.publish_outbound(outbound)
 +            return
 +
-+        result = await gate_outbound_send(
-+            action="message.send",
-+            outbound=outbound,
-+            inbound_channel=inbound.channel,
-+            inbound_chat_id=inbound.chat_id,
-+            publish_outbound=self.bus.publish_outbound,
++        # Direct replies and MessageTool share the same neutral guard. Familia
++        # can park or deny sends without loop.py importing familia.policy.
++        result = await self._outbound_guard(
++            OutboundRequest(
++                action="message.send",
++                outbound=outbound,
++                inbound_channel=inbound.channel,
++                inbound_chat_id=inbound.chat_id,
++                publish_outbound=self.bus.publish_outbound,
++            )
 +        )
 +        if result.kind == "allow":
 +            await self.bus.publish_outbound(outbound)
 +            return
 +        if result.kind == "deny":
 +            logger.warning(
-+                "familia policy: dropped direct reply to {}:{} — {}",
-+                outbound.channel, outbound.chat_id, result.reason,
++                "outbound guard: dropped direct reply to {}:{} — {}",
++                outbound.channel,
++                outbound.chat_id,
++                result.reason,
 +            )
 +            return
 +
@@ -111,15 +359,16 @@ index 116868b..130d9d4 100644
      async def _process_message(
          self,
          msg: InboundMessage,
-@@ -690,6 +753,7 @@ class AgentLoop:
+@@ -728,6 +831,8 @@ class AgentLoop:
              if is_subagent and self._persist_subagent_followup(session, msg):
                  self.sessions.save(session)
              self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
-+            await familia_bootstrap.on_inbound(msg)
++            for enrich_inbound in self._inbound_enrichers:
++                await enrich_inbound(msg)
              history = session.get_history(max_messages=0)
              current_role = "assistant" if is_subagent else "user"
  
-@@ -702,6 +766,7 @@ class AgentLoop:
+@@ -740,6 +845,7 @@ class AgentLoop:
                  chat_id=chat_id,
                  session_summary=pending,
                  current_role=current_role,
@@ -127,15 +376,40 @@ index 116868b..130d9d4 100644
              )
              final_content, _, all_msgs, _, _ = await self._run_agent_loop(
                  messages, session=session, channel=channel, chat_id=chat_id,
-@@ -747,6 +812,7 @@ class AgentLoop:
+@@ -755,6 +861,11 @@ class AgentLoop:
+                 content=final_content or "Background task completed.",
+             )
+ 
++        if self._pending_inbound_handler:
++            handled, pending_response = await self._pending_inbound_handler(msg)
++            if handled:
++                return pending_response
++
+         # Extract document text from media at the processing boundary so all
+         # channels benefit without format-specific logic in ContextBuilder.
+         if msg.media:
+@@ -773,18 +884,14 @@ class AgentLoop:
+ 
+         session, pending = self.auto_compact.prepare_session(session, key)
+ 
+-        # Slash commands
+-        raw = msg.content.strip()
+-        ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
+-        if result := await self.commands.dispatch(ctx):
+-            return result
+-
+         await self.consolidator.maybe_consolidate_by_tokens(
+             session,
+             session_summary=pending,
          )
  
          self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
-+        await familia_bootstrap.on_inbound(msg)
++        for enrich_inbound in self._inbound_enrichers:
++            await enrich_inbound(msg)
          if message_tool := self.tools.get("message"):
              if isinstance(message_tool, MessageTool):
                  message_tool.start_turn()
-@@ -760,6 +826,7 @@ class AgentLoop:
+@@ -798,6 +905,7 @@ class AgentLoop:
              media=msg.media if msg.media else None,
              channel=msg.channel,
              chat_id=msg.chat_id,
@@ -143,12 +417,43 @@ index 116868b..130d9d4 100644
          )
  
          async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
-@@ -795,7 +862,11 @@ class AgentLoop:
+@@ -814,16 +922,20 @@ class AgentLoop:
+             )
+ 
+         async def _on_retry_wait(content: str) -> None:
+-            meta = dict(msg.metadata or {})
+-            meta["_retry_wait"] = True
+-            await self.bus.publish_outbound(
+-                OutboundMessage(
+-                    channel=msg.channel,
+-                    chat_id=msg.chat_id,
+-                    content=content,
+-                    metadata=meta,
+-                )
+-            )
++            # Old behaviour pushed the verbatim "Model request failed,
++            # retry in 4s (attempt 2)." string into the user's chat on
++            # every retry tick. Two issues: (a) the wording leaks the
++            # word "failed" before the retry has even given up, scaring
++            # users who would have gotten a normal answer 3 seconds
++            # later; (b) it spammed the chat at every heartbeat chunk
++            # of a long sleep. With the extended retry budget (60s
++            # total, six attempts) most transient errors resolve
++            # silently — emitting these notifications is a net loss.
++            #
++            # The full diagnostic text still lands in the gateway log
++            # via base._sleep_with_heartbeat's logger.warning, so the
++            # operator can correlate slow turns with a provider blip.
++            logger.debug("retry-wait callback (silenced for chat): {}", content)
+ 
+         # Persist the triggering user message immediately, before running the
+         # agent loop. If the process is killed mid-turn (OOM, SIGKILL, self-
+@@ -833,7 +945,11 @@ class AgentLoop:
          # makes recovery possible from the session log alone.
          user_persisted_early = False
          if isinstance(msg.content, str) and msg.content.strip():
 -            session.add_message("user", msg.content)
-+            user_actor = get_current_actor()
++            user_actor = self._current_actor_getter()
 +            if user_actor:
 +                session.add_message("user", msg.content, actor=user_actor)
 +            else:
@@ -156,7 +461,7 @@ index 116868b..130d9d4 100644
              self._mark_pending_user_turn(session)
              self.sessions.save(session)
              user_persisted_early = True
-@@ -1064,15 +1135,22 @@ class AgentLoop:
+@@ -1102,15 +1218,27 @@ class AgentLoop:
          channel: str = "cli",
          chat_id: str = "direct",
          media: list[str] | None = None,
@@ -173,6 +478,11 @@ index 116868b..130d9d4 100644
 +        the recipient's principal is known from ``payload.to``.
 +        """
          await self._connect_mcp()
++        direct_actor_resolver = getattr(self, "_direct_actor_resolver", None)
++        if actor is None and direct_actor_resolver is not None:
++            # Direct cron/heartbeat paths bypass channel enrichment, so the
++            # optional adapter resolves an actor before ContextVars are pinned.
++            actor = direct_actor_resolver(channel, chat_id)
          msg = InboundMessage(
 -            channel=channel, sender_id="user", chat_id=chat_id,
 +            channel=channel, sender_id=actor or "user", chat_id=chat_id,

@@ -1,0 +1,37 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/bus/events.py b/nanobot/nanobot/bus/events.py
+index 018c25b..5612f88 100644
+--- a/nanobot/nanobot/bus/events.py
++++ b/nanobot/nanobot/bus/events.py
+@@ -17,6 +17,7 @@ class InboundMessage:
+     media: list[str] = field(default_factory=list)  # Media URLs
+     metadata: dict[str, Any] = field(default_factory=dict)  # Channel-specific data
+     session_key_override: str | None = None  # Optional override for thread-scoped sessions
++    actor: str | None = None  # Optional actor id supplied by an inbound enricher
+ 
+     @property
+     def session_key(self) -> str:
+@@ -36,3 +37,21 @@ class OutboundMessage:
+     metadata: dict[str, Any] = field(default_factory=dict)
+ 
+ 
++@dataclass
++class CallbackEvent:
++    """Inline-keyboard callback press from a channel.
++
++    Separated from ``InboundMessage`` so the agent doesn't treat button
++    presses as user turns.  Scenarios consume these via
++    ``MessageBus.consume_callback`` (or a dispatcher on top) and correlate
++    them with outbound messages they sent using the ``payload``.
++    """
++
++    channel: str
++    sender_id: str
++    chat_id: str
++    payload: Any  # JSON-decoded if the channel sent JSON, else raw
++    timestamp: datetime = field(default_factory=datetime.now)
++    actor: str | None = None
++    metadata: dict[str, Any] = field(default_factory=dict)
++

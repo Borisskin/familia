@@ -1,0 +1,24 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/cron/types.py b/nanobot/nanobot/cron/types.py
+index c38542e..f7071c0 100644
+--- a/nanobot/nanobot/cron/types.py
++++ b/nanobot/nanobot/cron/types.py
+@@ -27,6 +27,16 @@ class CronPayload:
+     deliver: bool = False
+     channel: str | None = None  # e.g. "whatsapp"
+     to: str | None = None  # e.g. phone number
++    # Principal id of the actor who scheduled this job. Used by ``cron list`` to
++    # filter visibility so non-admin participants only see their own reminders
++    # (created by them OR addressed to them). None on jobs predating the field
++    # or on system jobs — they're treated as admin-only by the list filter.
++    created_by: str | None = None
++    # Tag-ids attached to this job. Same namespace as memory_set tags
++    # (principals + topics from the family graphs). When set, ``cron list``
++    # filters by intersection of tags with the viewer's reachable set, in
++    # addition to the legacy creator/addressee match.
++    tags: list[str] = field(default_factory=list)
+ 
+ 
+ @dataclass

@@ -1,58 +1,310 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
 diff --git a/nanobot/nanobot/cli/commands.py b/nanobot/nanobot/cli/commands.py
-index ec572ff..299eccd 100644
+index 7892df0..294c3c1 100644
 --- a/nanobot/nanobot/cli/commands.py
 +++ b/nanobot/nanobot/cli/commands.py
-@@ -730,12 +730,18 @@ def _run_gateway(
-         async def _silent(*_args, **_kwargs):
-             pass
+@@ -49,6 +49,15 @@ class SafeFileHistory(FileHistory):
+ from nanobot.cli.stream import StreamRenderer, ThinkingSpinner
+ from nanobot.config.paths import get_workspace_path, is_default_workspace
+ from nanobot.config.schema import Config
++from nanobot.runtime_adapters import (
++    apply_heartbeat_defaults,
++    make_agent_loop_kwargs,
++    make_callback_handlers,
++    make_channel_manager_kwargs,
++    make_heartbeat_source_reader,
++    reload_runtime_registry,
++    resolve_heartbeat_target,
++)
+ from nanobot.utils.helpers import sync_workspace_templates
+ from nanobot.utils.restart import (
+     consume_restart_notice_from_env,
+@@ -594,6 +603,7 @@ def serve(
+         disabled_skills=runtime_config.agents.defaults.disabled_skills,
+         session_ttl_minutes=runtime_config.agents.defaults.session_ttl_minutes,
+         tools_config=runtime_config.tools,
++        **make_agent_loop_kwargs(runtime_config.workspace_path),
+     )
  
-+        from familia.principals import resolve_actor
-+        actor = None
-+        if job.payload.channel and job.payload.to:
-+            actor = resolve_actor(job.payload.channel, job.payload.to)
-+
-         try:
-             resp = await agent.process_direct(
-                 reminder_note,
-                 session_key=f"cron:{job.id}",
-                 channel=job.payload.channel or "cli",
-                 chat_id=job.payload.to or "direct",
-+                actor=actor,
-                 on_progress=_silent,
-             )
-         finally:
-@@ -767,6 +773,9 @@ def _run_gateway(
+     model_name = runtime_config.agents.defaults.model
+@@ -641,7 +651,12 @@ def gateway(
+ 
+         logging.basicConfig(level=logging.DEBUG)
+     cfg = _load_runtime_config(config, workspace)
+-    _run_gateway(cfg, port=port)
++    _run_gateway(
++        cfg,
++        port=port,
++        reload_config_path=config,
++        reload_workspace=workspace,
++    )
+ 
+ 
+ def _run_gateway(
+@@ -649,9 +664,12 @@ def _run_gateway(
+     *,
+     port: int | None = None,
+     open_browser_url: str | None = None,
++    reload_config_path: str | None = None,
++    reload_workspace: str | None = None,
+ ) -> None:
+     """Shared gateway runtime; ``open_browser_url`` opens a tab once channels are up."""
+     from nanobot.agent.loop import AgentLoop
++    from nanobot.bus.callbacks import CallbackDispatcher
+     from nanobot.bus.queue import MessageBus
+     from nanobot.channels.manager import ChannelManager
+     from nanobot.cron.service import CronService
+@@ -698,12 +716,14 @@ def _run_gateway(
+         disabled_skills=config.agents.defaults.disabled_skills,
+         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
+         tools_config=config.tools,
++        **make_agent_loop_kwargs(config.workspace_path),
+     )
+ 
+     # Set cron callback (needs agent)
+     async def on_cron_job(job: CronJob) -> str | None:
+         """Execute a cron job through the agent."""
+-        # Dream is an internal job — run directly, not through the agent loop.
++        # Internal maintenance jobs — run directly, not through the
++        # agent loop. They have no LLM step and no notification.
+         if job.name == "dream":
+             try:
+                 await agent.dream.run()
+@@ -711,6 +731,27 @@ def _run_gateway(
+             except Exception:
+                 logger.exception("Dream cron job failed")
+             return None
++        if job.name == "media_cleanup":
++            from nanobot.utils.maintenance import cleanup_media
++            try:
++                cleanup_media()
++            except Exception:
++                logger.exception("media_cleanup failed")
++            return None
++        if job.name == "sessions_cleanup":
++            from nanobot.utils.maintenance import cleanup_sessions
++            try:
++                cleanup_sessions()
++            except Exception:
++                logger.exception("sessions_cleanup failed")
++            return None
++        if job.name == "workspace_git_gc":
++            from nanobot.utils.maintenance import workspace_git_gc
++            try:
++                workspace_git_gc()
++            except Exception:
++                logger.exception("workspace_git_gc failed")
++            return None
+ 
+         from nanobot.agent.tools.cron import CronTool
+         from nanobot.agent.tools.message import MessageTool
+@@ -765,11 +806,48 @@ def _run_gateway(
+ 
+     # Create channel manager (forwards SessionManager so the WebSocket channel
      # can serve the embedded webui's REST surface).
-     channels = ChannelManager(config, bus, session_manager=session_manager)
- 
-+    from familia.bus.callback_dispatcher import CallbackDispatcher
-+    callback_dispatcher = CallbackDispatcher(bus)
+-    channels = ChannelManager(config, bus, session_manager=session_manager)
++    channels = ChannelManager(
++        config,
++        bus,
++        session_manager=session_manager,
++        **make_channel_manager_kwargs(),
++    )
 +
++    callback_dispatcher = CallbackDispatcher(bus, make_callback_handlers(bus))
+ 
      def _pick_heartbeat_target() -> tuple[str, str]:
-         """Pick a routable channel/chat target for heartbeat-triggered messages."""
-         enabled = set(channels.enabled_channels)
-@@ -791,11 +800,20 @@ def _run_gateway(
-         async def _silent(*_args, **_kwargs):
-             pass
- 
-+        # Pin the principal derived from the delivery target so scoped
-+        # tools (memX shared/pair, role gates) resolve under a real
-+        # actor. Without this, ``get_current_actor()`` returns None in
-+        # heartbeat turns and memory_get fails with "no actor in
-+        # context". Same pattern as cron delivery.
-+        from familia.principals import resolve_actor
-+        actor = resolve_actor(channel, chat_id) if channel and chat_id else None
+-        """Pick a routable channel/chat target for heartbeat-triggered messages."""
++        """Pick a routable channel/chat target for heartbeat-triggered messages.
 +
-         resp = await agent.process_direct(
-             tasks,
-             session_key="heartbeat",
-             channel=channel,
-             chat_id=chat_id,
-+            actor=actor,
-             on_progress=_silent,
-         )
++        Priority:
++          1. ``gateway.heartbeat.target_actor`` (config) — resolved to the
++             actor's primary identity on an enabled channel. This is the
++             correct choice for multi-user setups: heartbeat is a system
++             tick and shouldn't ride whichever participant happened to
++             chat last.
++          2. Most-recently-updated non-internal session on an enabled
++             channel — legacy behavior, used when target_actor is unset
++             or unresolvable.
++        """
+         enabled = set(channels.enabled_channels)
++
++        target_actor = (config.gateway.heartbeat.target_actor or "").strip()
++        if target_actor:
++            resolved = resolve_heartbeat_target(target_actor, enabled)
++            if resolved is not None:
++                return resolved
++            # Fail closed: when target_actor is set but unresolvable, do NOT
++            # silently leak system messages into the most-recently-active
++            # user's chat. Returning (cli, direct) suppresses delivery on
++            # any external channel; the heartbeat tick will still log, but
++            # on_notify checks ``channel == 'cli'`` and short-circuits.
++            logger.error(
++                "heartbeat: target_actor '{}' is configured but unresolvable "
++                "(principal missing or has no identity on enabled channels {}); "
++                "delivery suppressed to avoid cross-user leak",
++                target_actor, sorted(enabled),
++            )
++            return "cli", "direct"
++
+         # Prefer the most recently updated non-internal session on an enabled channel.
+         for item in session_manager.list_sessions():
+             key = item.get("key") or ""
+@@ -816,6 +894,7 @@ def _run_gateway(
+         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
  
-@@ -925,6 +943,7 @@ def _run_gateway(
+     hb_cfg = config.gateway.heartbeat
++    apply_heartbeat_defaults(hb_cfg)
+     heartbeat = HeartbeatService(
+         workspace=config.workspace_path,
+         provider=provider,
+@@ -825,6 +904,7 @@ def _run_gateway(
+         interval_s=hb_cfg.interval_s,
+         enabled=hb_cfg.enabled,
+         timezone=config.agents.defaults.timezone,
++        source_reader=make_heartbeat_source_reader(hb_cfg.target_actor),
+     )
+ 
+     if channels.enabled_channels:
+@@ -887,7 +967,7 @@ def _run_gateway(
+     agent.dream.max_batch_size = dream_cfg.max_batch_size
+     agent.dream.max_iterations = dream_cfg.max_iterations
+     agent.dream.annotate_line_ages = dream_cfg.annotate_line_ages
+-    from nanobot.cron.types import CronJob, CronPayload
++    from nanobot.cron.types import CronJob, CronPayload, CronSchedule
+     cron.register_system_job(CronJob(
+         id="dream",
+         name="dream",
+@@ -896,6 +976,32 @@ def _run_gateway(
+     ))
+     console.print(f"[green]✓[/green] Dream: {dream_cfg.describe_schedule()}")
+ 
++    # Maintenance system jobs: media TTL, idle-session prune, git gc.
++    # Hardcoded cadences keep the schema simple — config knobs can come
++    # later if a deployment really needs them. All three are noops on a
++    # cold install (nothing to delete / nothing to pack).
++    cron.register_system_job(CronJob(
++        id="media_cleanup",
++        name="media_cleanup",
++        schedule=CronSchedule(kind="every", every_ms=60 * 60 * 1000),  # hourly
++        payload=CronPayload(kind="system_event"),
++    ))
++    cron.register_system_job(CronJob(
++        id="sessions_cleanup",
++        name="sessions_cleanup",
++        schedule=CronSchedule(kind="every",
++                              every_ms=24 * 60 * 60 * 1000),  # daily
++        payload=CronPayload(kind="system_event"),
++    ))
++    cron.register_system_job(CronJob(
++        id="workspace_git_gc",
++        name="workspace_git_gc",
++        schedule=CronSchedule(kind="every",
++                              every_ms=30 * 24 * 60 * 60 * 1000),  # ~monthly
++        payload=CronPayload(kind="system_event"),
++    ))
++    console.print("[green]✓[/green] Maintenance: media TTL 24h, sessions TTL 90d, git gc monthly")
++
+     async def _open_browser_when_ready() -> None:
+         """Wait for the gateway to bind, then point the user's browser at the webui."""
+         if not open_browser_url:
+@@ -921,10 +1027,102 @@ def _run_gateway(
+         except Exception as e:
+             console.print(f"[yellow]Could not open browser ({e}); visit {open_browser_url}[/yellow]")
+ 
++    # Re-entrancy guard for the SIGHUP handler. Two admin operations
++    # in quick succession (e.g. ``channels remove`` immediately
++    # followed by ``pending approve``) each fire ``docker kill
++    # --signal=HUP``. Without the lock both would spawn concurrent
++    # ``_handle_sighup`` tasks: each calls ``manager.stop_all()`` and
++    # then ``_init_channels()`` + ``start_all()``, leaving two
++    # ``_dispatch_outbound`` tasks consuming from the same outbound
++    # queue and (for VK) two long-poll readers on the same token —
++    # duplicate-message processing and a half-stopped channel state
++    # are reachable from this race.
++    #
++    # Coalescing strategy: while a reload is running, queue at most
++    # one follow-up reload (boolean ``pending``). If three SIGHUPs
++    # arrive while a reload is in flight, the second one schedules
++    # the follow-up, the third is dropped (its work is already
++    # captured by the queued follow-up since the on-disk state is
++    # what we re-read).
++    sighup_lock = asyncio.Lock()
++    sighup_pending = False
++
++    async def _handle_sighup() -> None:
++        """Hot-reload principals registry and channel adapters from disk.
++
++        Triggered by ``docker kill --signal=HUP familia-gateway`` from
++        the admin app after operations that mutate principals.json or
++        config.json (pending approve, channel add/remove/edit). Avoids
++        a full container restart — the gateway keeps its loaded
++        agent / cron / heartbeat / callback dispatcher / providers,
++        and only the parts that read mutable on-disk state get
++        rebuilt. Drops the ~30 s «restart_gateway_quiet» wait the
++        admin used to do after every such mutation.
++
++        Serialised under ``sighup_lock`` so concurrent SIGHUPs can't
++        interleave stop/start cycles. A second SIGHUP that arrives
++        while a reload is in flight sets ``sighup_pending`` and is
++        re-run exactly once after the in-flight reload completes —
++        sufficient because reloads are idempotent re-reads of disk
++        state.
++        """
++        nonlocal sighup_pending
++        if sighup_lock.locked():
++            sighup_pending = True
++            logger.debug("SIGHUP: reload already in flight, queued one follow-up")
++            return
++        async with sighup_lock:
++            while True:
++                sighup_pending = False
++                # 1. principals.json — drop the cached registry; next
++                #    ``get_registry()`` call reads the file again.
++                try:
++                    reload_runtime_registry()
++                    logger.info("SIGHUP: principals registry reloaded")
++                except Exception:
++                    logger.exception(
++                        "SIGHUP: failed to reload principals registry"
++                    )
++                # 2. config.json — re-read from the same path the
++                #    gateway booted with, then ask the channel manager
++                #    to reconcile its running adapters against the new
++                #    config.
++                try:
++                    new_cfg = _load_runtime_config(
++                        reload_config_path, reload_workspace
++                    )
++                    await channels.reload_from_disk(new_cfg)
++                    logger.info("SIGHUP: channels reconciled from disk")
++                except Exception:
++                    logger.exception("SIGHUP: channel reconcile failed")
++                # If a SIGHUP arrived while we were running, do one
++                # more pass and clear the flag. Otherwise we're done.
++                if not sighup_pending:
++                    return
++
++    def _on_sighup() -> None:
++        # ``add_signal_handler`` callbacks must be sync; spawn the
++        # async work on the running loop. The handler itself
++        # serialises via ``sighup_lock`` so this can't pile up
++        # concurrent reload tasks.
++        asyncio.create_task(_handle_sighup())
++
+     async def run():
++        # Register SIGHUP for hot-reload. POSIX-only; Windows has no
++        # SIGHUP and ``loop.add_signal_handler`` raises NotImplementedError
++        # there. The gateway only ever runs in Linux containers in
++        # production, so the cfg-guard is just defence in depth.
++        if hasattr(signal, "SIGHUP"):
++            try:
++                loop = asyncio.get_running_loop()
++                loop.add_signal_handler(signal.SIGHUP, _on_sighup)
++                logger.info("SIGHUP handler registered for hot-reload")
++            except (NotImplementedError, RuntimeError) as exc:
++                logger.warning("SIGHUP handler not available: {}", exc)
          try:
              await cron.start()
              await heartbeat.start()
@@ -60,7 +312,7 @@ index ec572ff..299eccd 100644
              tasks = [
                  agent.run(),
                  channels.start_all(),
-@@ -945,6 +964,7 @@ def _run_gateway(
+@@ -945,11 +1143,74 @@ def _run_gateway(
              heartbeat.stop()
              cron.stop()
              agent.stop()
@@ -68,3 +320,78 @@ index ec572ff..299eccd 100644
              await channels.stop_all()
  
      asyncio.run(run())
+ 
+ 
++@app.command()
++def web(
++    port: int | None = typer.Option(None, "--port", "-p", help="WebSocket port for the webui"),
++    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
++    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
++    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
++    open_browser: bool = typer.Option(True, "--open/--no-open", help="Open the browser when ready"),
++):
++    """Start the gateway with the embedded webui and (by default) open a browser."""
++    if verbose:
++        import logging
++
++        logging.basicConfig(level=logging.DEBUG)
++
++    cfg = _load_runtime_config(config, workspace)
++
++    # Force the websocket channel on with token-gated auth so the webui is functional.
++    # ``--port`` applies to the webui's websocket/HTTP port, not the gateway's
++    # management port, since that's the only surface users visit.
++    ws_section = cfg.channels.websocket
++    if isinstance(ws_section, dict):
++        ws_section.setdefault("host", "127.0.0.1")
++        ws_section["enabled"] = True
++        ws_section["websocketRequiresToken"] = True
++        if port is not None:
++            ws_section["port"] = port
++        ws_host = ws_section.get("host", "127.0.0.1")
++        ws_port = ws_section.get("port", 8765)
++        ws_path = ws_section.get("path", "/")
++    else:
++        ws_section.enabled = True
++        if hasattr(ws_section, "websocket_requires_token"):
++            ws_section.websocket_requires_token = True
++        if port is not None:
++            ws_section.port = port
++        ws_host = getattr(ws_section, "host", "127.0.0.1") or "127.0.0.1"
++        ws_port = getattr(ws_section, "port", 8765)
++        ws_path = getattr(ws_section, "path", "/") or "/"
++
++    # Confirm the bundled SPA exists before promising the user a browser launch.
++    from nanobot.channels.manager import _default_webui_dist
++
++    dist = _default_webui_dist()
++    if dist is None:
++        console.print(
++            "[yellow]Warning: webui assets not found at nanobot/web/dist/. "
++            "Run `cd webui && bun install && bun run build` from a source checkout.[/yellow]"
++        )
++
++    scheme = "http"
++    # Browsers refuse cookies/JS on 0.0.0.0 — collapse to loopback for the visit URL.
++    visit_host = "127.0.0.1" if ws_host in {"0.0.0.0", "::"} else ws_host
++    open_url = f"{scheme}://{visit_host}:{ws_port}{ws_path if ws_path != '/' else ''}/"
++
++    # The gateway's management port is separate from the webui port; leave it
++    # on its configured default so --port only moves the visible surface.
++    _run_gateway(
++        cfg,
++        open_browser_url=open_url if open_browser else None,
++    )
++
++
+ # ============================================================================
+ # Agent Commands
+ # ============================================================================
+@@ -1011,6 +1272,7 @@ def agent(
+         disabled_skills=config.agents.defaults.disabled_skills,
+         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
+         tools_config=config.tools,
++        **make_agent_loop_kwargs(config.workspace_path),
+     )
+     restart_notice = consume_restart_notice_from_env()
+     if restart_notice and should_show_cli_restart_notice(restart_notice, session_id):

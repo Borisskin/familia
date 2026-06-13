@@ -1,8 +1,24 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
 diff --git a/nanobot/nanobot/agent/memory.py b/nanobot/nanobot/agent/memory.py
-index 60bc9ac..99d7af4 100644
+index 60bc9ac..5a5936f 100644
 --- a/nanobot/nanobot/agent/memory.py
 +++ b/nanobot/nanobot/agent/memory.py
-@@ -221,9 +221,14 @@ class MemoryStore:
+@@ -108,6 +108,12 @@ class MemoryStore:
+             logger.exception("Failed to migrate legacy HISTORY.md")
+ 
+     def _parse_legacy_history(self, text: str) -> list[dict[str, Any]]:
++        """Parse pre-jsonl HISTORY.md into cursor-ordered entries.
++
++        Legacy files mixed timestamp-prefixed entries and raw multiline
++        message dumps. The splitter preserves raw dumps as one entry and uses
++        the file mtime only when an entry has no timestamp prefix.
++        """
+         normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+         if not normalized:
+             return []
+@@ -221,9 +227,14 @@ class MemoryStore:
  
      # -- history.jsonl — append-only, JSONL format ---------------------------
  
@@ -18,7 +34,7 @@ index 60bc9ac..99d7af4 100644
          Entries are passed through `strip_think` to drop template-level leaks
          (e.g. unclosed `<think` prefixes, `<channel|>` markers) before being
          persisted. If the cleaned content is empty but the raw entry wasn't,
-@@ -241,7 +246,9 @@ class MemoryStore:
+@@ -241,7 +252,9 @@ class MemoryStore:
                  "persisting empty content to avoid re-polluting context",
                  cursor,
              )
@@ -29,7 +45,7 @@ index 60bc9ac..99d7af4 100644
          with open(self.history_file, "a", encoding="utf-8") as f:
              f.write(json.dumps(record, ensure_ascii=False) + "\n")
          self._cursor_file.write_text(str(cursor), encoding="utf-8")
-@@ -368,19 +375,25 @@ class MemoryStore:
+@@ -368,19 +381,25 @@ class MemoryStore:
              if not message.get("content"):
                  continue
              tools = f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
@@ -59,7 +75,7 @@ index 60bc9ac..99d7af4 100644
          )
  
  
-@@ -486,13 +499,53 @@ class Consolidator:
+@@ -486,13 +505,53 @@ class Consolidator:
              self._get_tool_definitions(),
          )
  
@@ -114,7 +130,7 @@ index 60bc9ac..99d7af4 100644
          try:
              formatted = MemoryStore._format_messages(messages)
              response = await self.provider.chat_with_retry(
-@@ -513,11 +566,14 @@ class Consolidator:
+@@ -513,11 +572,14 @@ class Consolidator:
              if response.finish_reason == "error":
                  raise RuntimeError(f"LLM returned error: {response.content}")
              summary = response.content or "[no summary]"
@@ -132,24 +148,34 @@ index 60bc9ac..99d7af4 100644
              return None
  
      async def maybe_consolidate_by_tokens(
-@@ -676,6 +732,7 @@ class Dream:
-         """Build a minimal tool registry for the Dream agent."""
-         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
-         from nanobot.agent.tools.filesystem import EditFileTool, ReadFileTool, WriteFileTool
-+        from familia.tools.dream_memory import DreamMemorySetTool
+@@ -656,6 +718,7 @@ class Dream:
+         max_iterations: int = 10,
+         max_tool_result_chars: int = 16_000,
+         annotate_line_ages: bool = True,
++        dream_tool_installers: list[Callable[[ToolRegistry, MemoryStore], None]] | None = None,
+     ):
+         self.store = store
+         self.provider = provider
+@@ -667,6 +730,7 @@ class Dream:
+         # Default True keeps the #3212 behavior; set False to feed MEMORY.md raw
+         # (e.g. if a specific LLM reacts poorly to the `← Nd` suffix).
+         self.annotate_line_ages = annotate_line_ages
++        self._dream_tool_installers = dream_tool_installers or []
+         self._runner = AgentRunner(provider)
+         self._tools = self._build_tools()
  
-         tools = ToolRegistry()
-         workspace = self.store.workspace
-@@ -692,6 +749,8 @@ class Dream:
+@@ -692,6 +756,10 @@ class Dream:
          skills_dir = workspace / "skills"
          skills_dir.mkdir(parents=True, exist_ok=True)
          tools.register(WriteFileTool(workspace=workspace, allowed_dir=skills_dir))
-+        # familia per-scope Dream — write private facts to memX instead of MEMORY.md.
-+        tools.register(DreamMemorySetTool())
++        # Product adapters may add Dream-specific write tools without coupling
++        # nanobot memory consolidation to their storage implementation.
++        for install_tools in self._dream_tool_installers:
++            install_tools(tools, self.store)
          return tools
  
      # -- skill listing --------------------------------------------------------
-@@ -785,10 +844,16 @@ class Dream:
+@@ -785,10 +853,16 @@ class Dream:
              len(entries), last_cursor, batch[-1]["cursor"], len(batch),
          )
  

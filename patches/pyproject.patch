@@ -1,13 +1,21 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
 diff --git a/nanobot/pyproject.toml b/nanobot/pyproject.toml
-index 3447ffc..048d5c7 100644
+index 1e4ca97..bc7c847 100644
 --- a/nanobot/pyproject.toml
 +++ b/nanobot/pyproject.toml
-@@ -55,7 +55,7 @@ dependencies = [
-     "jinja2>=3.1.0,<4.0.0",
-     "dulwich>=0.22.0,<1.0.0",
-     "pyyaml>=6.0,<7.0.0",
--    "pypdf>=5.0.0,<6.0.0",
-+    "pypdf>=6.10.2,<7.0.0",
-     "python-docx>=1.1.0,<2.0.0",
-     "openpyxl>=3.1.0,<4.0.0",
-     "python-pptx>=1.0.0,<2.0.0",
+@@ -118,6 +118,13 @@ include = [
+     "nanobot/skills/**/*.md",
+     "nanobot/skills/**/*.sh",
+ ]
++# Build-time generated assets that live under .gitignore'd paths but must ship
++# in the wheel/sdist. `artifacts` bypasses the VCS filter (unlike `include`).
++# The webui is compiled via `bun run build` into nanobot/web/dist/ right before
++# `python -m build` runs.
++artifacts = [
++    "nanobot/web/dist/**/*",
++]
+ 
+ [tool.hatch.build.targets.wheel]
+ packages = ["nanobot"]

@@ -1,0 +1,430 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/channels/telegram.py b/nanobot/nanobot/channels/telegram.py
+index 6925658..92125db 100644
+--- a/nanobot/nanobot/channels/telegram.py
++++ b/nanobot/nanobot/channels/telegram.py
+@@ -11,7 +11,7 @@ from typing import Any, Literal
+ 
+ from loguru import logger
+ from pydantic import Field
+-from telegram import BotCommand, ReactionTypeEmoji, ReplyParameters, Update
++from telegram import ReactionTypeEmoji, ReplyParameters, Update
+ from telegram.error import BadRequest, NetworkError, TimedOut
+ from telegram.ext import Application, ContextTypes, MessageHandler, filters
+ from telegram.request import HTTPXRequest
+@@ -19,7 +19,6 @@ from telegram.request import HTTPXRequest
+ from nanobot.bus.events import OutboundMessage
+ from nanobot.bus.queue import MessageBus
+ from nanobot.channels.base import BaseChannel
+-from nanobot.command.builtin import build_help_text
+ from nanobot.config.paths import get_media_dir
+ from nanobot.config.schema import Base
+ from nanobot.security.network import validate_url_target
+@@ -32,6 +31,27 @@ TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
+ # the final rendered message never overflows.
+ TELEGRAM_HTML_MAX_LEN = 4096
+ TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for reply context in user message
++# Default per-turn STT seconds cap. Admin-configurable via
++# ``config.channels.transcriptionAudioBudgetS``; falls back to this
++# constant when the channel manager hasn't set ``audio_budget_s``.
++TELEGRAM_AUDIO_BUDGET_S_DEFAULT = 300
++
++
++class _TgAudioBudget:
++    """Mutable shared budget for STT across one inbound turn (current + reply)."""
++
++    __slots__ = ("remaining_s",)
++
++    def __init__(self, total_s: int = TELEGRAM_AUDIO_BUDGET_S_DEFAULT):
++        self.remaining_s = total_s
++
++    def try_spend(self, duration_s: int) -> bool:
++        if duration_s <= 0:
++            duration_s = 1
++        if self.remaining_s <= 0:
++            return False
++        self.remaining_s -= duration_s
++        return True
+ 
+ 
+ def _escape_telegram_html(text: str) -> str:
+@@ -53,34 +73,6 @@ def _strip_md(s: str) -> str:
+     return s.strip()
+ 
+ 
+-def _strip_md_block(text: str) -> str:
+-    """Strip block-level and inline markdown for readable plain-text preview.
+-
+-    Used during streaming mid-edits so users see clean text instead of raw
+-    markdown syntax while the response is still being generated.
+-    """
+-    # Code blocks -> just the code
+-    text = re.sub(r'```[\w]*\n?([\s\S]*?)```', r'\1', text)
+-    # Headers -> plain text
+-    text = re.sub(r'^#{1,6}\s+(.+)$', r'\1', text, flags=re.MULTILINE)
+-    # Blockquotes
+-    text = re.sub(r'^>\s*(.*)$', r'\1', text, flags=re.MULTILINE)
+-    # Bold / italic / strikethrough
+-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+-    text = re.sub(r'__(.+?)__', r'\1', text)
+-    text = re.sub(r'(?<![a-zA-Z0-9])_([^_]+)_(?![a-zA-Z0-9])', r'\1', text)
+-    text = re.sub(r'~~(.+?)~~', r'\1', text)
+-    # Inline code
+-    text = re.sub(r'`([^`]+)`', r'\1', text)
+-    # Links [text](url) -> text
+-    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+-    # Bullet lists
+-    text = re.sub(r'^[-*]\s+', '• ', text, flags=re.MULTILINE)
+-    # Numbered lists (normalize spacing)
+-    text = re.sub(r'^(\d+)\.\s+', r'\1. ', text, flags=re.MULTILINE)
+-    return text
+-
+-
+ def _render_table_box(table_lines: list[str]) -> str:
+     """Convert markdown pipe-table to compact aligned text for <pre> display."""
+ 
+@@ -157,8 +149,8 @@ def _markdown_to_telegram_html(text: str) -> str:
+ 
+     text = re.sub(r'`([^`]+)`', save_inline_code, text)
+ 
+-    # 3. Headers # Title -> <b>Title</b> (preserve visual hierarchy)
+-    text = re.sub(r'^#{1,6}\s+(.+)$', r'⟪B⟫\1⟪/B⟫', text, flags=re.MULTILINE)
++    # 3. Headers # Title -> just the title text
++    text = re.sub(r'^#{1,6}\s+(.+)$', r'\1', text, flags=re.MULTILINE)
+ 
+     # 4. Blockquotes > text -> just the text (before HTML escaping)
+     text = re.sub(r'^>\s*(.*)$', r'\1', text, flags=re.MULTILINE)
+@@ -182,9 +174,6 @@ def _markdown_to_telegram_html(text: str) -> str:
+     # 10. Bullet lists - item -> • item
+     text = re.sub(r'^[-*]\s+', '• ', text, flags=re.MULTILINE)
+ 
+-    # 10.5. Numbered lists  1. item -> 1. item (keep number, normalize indent)
+-    text = re.sub(r'^(\d+)\.\s+', r'\1. ', text, flags=re.MULTILINE)
+-
+     # 11. Restore inline code with HTML tags
+     for i, code in enumerate(inline_codes):
+         # Escape HTML in code content
+@@ -197,9 +186,6 @@ def _markdown_to_telegram_html(text: str) -> str:
+         escaped = _escape_telegram_html(code)
+         text = text.replace(f"\x00CB{i}\x00", f"<pre><code>{escaped}</code></pre>")
+ 
+-    # 13. Restore header bold markers (inserted in step 3, after HTML escaping)
+-    text = text.replace('⟪B⟫', '<b>').replace('⟪/B⟫', '</b>')
+-
+     return text
+ 
+ 
+@@ -222,6 +208,8 @@ class TelegramConfig(Base):
+ 
+     enabled: bool = False
+     token: str = ""
++    base_url: str | None = None
++    base_file_url: str | None = None
+     allow_from: list[str] = Field(default_factory=list)
+     proxy: str | None = None
+     reply_to_message: bool = False
+@@ -243,18 +231,9 @@ class TelegramChannel(BaseChannel):
+     name = "telegram"
+     display_name = "Telegram"
+ 
+-    # Commands registered with Telegram's command menu
+-    BOT_COMMANDS = [
+-        BotCommand("start", "Start the bot"),
+-        BotCommand("new", "Start a new conversation"),
+-        BotCommand("stop", "Stop the current task"),
+-        BotCommand("restart", "Restart the bot"),
+-        BotCommand("status", "Show bot status"),
+-        BotCommand("dream", "Run Dream memory consolidation now"),
+-        BotCommand("dream_log", "Show the latest Dream memory change"),
+-        BotCommand("dream_restore", "Restore Dream memory to an earlier version"),
+-        BotCommand("help", "Show available commands"),
+-    ]
++    # No slash commands registered with Telegram's menu — see commit
++    # message for the rationale. Bot listens to natural language only;
++    # auto-compact + Dream handle session management without UI.
+ 
+     @classmethod
+     def default_config(cls) -> dict[str, Any]:
+@@ -294,17 +273,6 @@ class TelegramChannel(BaseChannel):
+ 
+         return sid in allow_list or username in allow_list
+ 
+-    @staticmethod
+-    def _normalize_telegram_command(content: str) -> str:
+-        """Map Telegram-safe command aliases back to canonical nanobot commands."""
+-        if not content.startswith("/"):
+-            return content
+-        if content == "/dream_log" or content.startswith("/dream_log "):
+-            return content.replace("/dream_log", "/dream-log", 1)
+-        if content == "/dream_restore" or content.startswith("/dream_restore "):
+-            return content.replace("/dream_restore", "/dream-restore", 1)
+-        return content
+-
+     async def start(self) -> None:
+         """Start the Telegram bot with long polling."""
+         if not self.config.token:
+@@ -336,30 +304,22 @@ class TelegramChannel(BaseChannel):
+             .request(api_request)
+             .get_updates_request(poll_request)
+         )
++        if self.config.base_url:
++            builder = builder.base_url(self.config.base_url)
++        if self.config.base_file_url:
++            builder = builder.base_file_url(self.config.base_file_url)
+         self._app = builder.build()
+         self._app.add_error_handler(self._on_error)
+ 
+-        # Add command handlers (using Regex to support @username suffixes before bot initialization)
+-        self._app.add_handler(MessageHandler(filters.Regex(r"^/start(?:@\w+)?$"), self._on_start))
+-        self._app.add_handler(
+-            MessageHandler(
+-                filters.Regex(r"^/(new|stop|restart|status|dream)(?:@\w+)?(?:\s+.*)?$"),
+-                self._forward_command,
+-            )
+-        )
+-        self._app.add_handler(
+-            MessageHandler(
+-                filters.Regex(r"^/(dream-log|dream_log|dream-restore|dream_restore)(?:@\w+)?(?:\s+.*)?$"),
+-                self._forward_command,
+-            )
+-        )
+-        self._app.add_handler(MessageHandler(filters.Regex(r"^/help(?:@\w+)?$"), self._on_help))
+-
+-        # Add message handler for text, photos, voice, documents, and locations
++        # Single message handler: every text/photo/voice/audio/document/
++        # location update routes straight through the agent loop. No slash-
++        # command regexes — :class:`AgentLoop` no longer maintains a
++        # ``CommandRouter``; auto-compact and Dream handle session-level
++        # concerns without a UI affordance, and the LLM understands
++        # "забудь, давай заново" / "stop, не отвечай" in natural language.
+         self._app.add_handler(
+             MessageHandler(
+-                (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL | filters.LOCATION)
+-                & ~filters.COMMAND,
++                (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL | filters.LOCATION),
+                 self._on_message
+             )
+         )
+@@ -370,17 +330,25 @@ class TelegramChannel(BaseChannel):
+         await self._app.initialize()
+         await self._app.start()
+ 
+-        # Get bot info and register command menu
++        # Get bot info; no slash-command menu to register — the bot is
++        # natural-language only.
+         bot_info = await self._app.bot.get_me()
+         self._bot_user_id = getattr(bot_info, "id", None)
+         self._bot_username = getattr(bot_info, "username", None)
+         logger.info("Telegram bot @{} connected", bot_info.username)
+ 
++        # Best-effort wipe of any commands previously registered with
++        # BotFather / older versions of this code, so the in-app menu
++        # doesn't keep showing /new /stop /dream etc. Failure is fine —
++        # the menu is cosmetic, the regex handlers were the actual
++        # routing surface and they're already gone.
+         try:
+-            await self._app.bot.set_my_commands(self.BOT_COMMANDS)
+-            logger.debug("Telegram bot commands registered")
++            from telegram import BotCommand  # noqa: PLC0415 — local to keep top imports tight
++            await self._app.bot.set_my_commands([])  # empty list clears the menu
++            logger.debug("Telegram bot command menu cleared")
++            del BotCommand
+         except Exception as e:
+-            logger.warning("Failed to register bot commands: {}", e)
++            logger.warning("Failed to clear bot command menu: {}", e)
+ 
+         # Start polling (this runs until stopped)
+         await self._app.updater.start_polling(
+@@ -519,7 +487,7 @@ class TelegramChannel(BaseChannel):
+     async def _call_with_retry(self, fn, *args, **kwargs):
+         """Call an async Telegram API function with retry on pool/network timeout and RetryAfter."""
+         from telegram.error import RetryAfter
+-        
++
+         for attempt in range(1, _SEND_MAX_RETRIES + 1):
+             try:
+                 return await fn(*args, **kwargs)
+@@ -671,11 +639,10 @@ class TelegramChannel(BaseChannel):
+         if message_thread_id := meta.get("message_thread_id"):
+             thread_kwargs["message_thread_id"] = message_thread_id
+         if buf.message_id is None:
+-            preview = _strip_md_block(buf.text)
+             try:
+                 sent = await self._call_with_retry(
+                     self._app.bot.send_message,
+-                    chat_id=int_chat_id, text=preview,
++                    chat_id=int_chat_id, text=buf.text,
+                     **thread_kwargs,
+                 )
+                 buf.message_id = sent.message_id
+@@ -688,12 +655,11 @@ class TelegramChannel(BaseChannel):
+                 await self._flush_stream_overflow(int_chat_id, buf, thread_kwargs)
+                 buf.last_edit = now
+                 return
+-            preview = _strip_md_block(buf.text)
+             try:
+                 await self._call_with_retry(
+                     self._app.bot.edit_message_text,
+                     chat_id=int_chat_id, message_id=buf.message_id,
+-                    text=preview,
++                    text=buf.text,
+                 )
+                 buf.last_edit = now
+             except Exception as e:
+@@ -741,24 +707,6 @@ class TelegramChannel(BaseChannel):
+         buf.message_id = sent.message_id
+         buf.text = tail
+ 
+-    async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+-        """Handle /start command."""
+-        if not update.message or not update.effective_user:
+-            return
+-
+-        user = update.effective_user
+-        await update.message.reply_text(
+-            f"👋 Hi {user.first_name}! I'm nanobot.\n\n"
+-            "Send me a message and I'll respond!\n"
+-            "Type /help to see available commands."
+-        )
+-
+-    async def _on_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+-        """Handle /help command, bypassing ACL so all users can access it."""
+-        if not update.message:
+-            return
+-        await update.message.reply_text(build_help_text())
+-
+     @staticmethod
+     def _sender_id(user) -> str:
+         """Build sender_id with username for allowlist matching."""
+@@ -796,13 +744,13 @@ class TelegramChannel(BaseChannel):
+         text = getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
+         if len(text) > TELEGRAM_REPLY_CONTEXT_MAX_LEN:
+             text = text[:TELEGRAM_REPLY_CONTEXT_MAX_LEN] + "..."
+-            
++
+         if not text:
+             return None
+-            
++
+         bot_id, _ = await self._ensure_bot_identity()
+         reply_user = getattr(reply, "from_user", None)
+-        
++
+         if bot_id and reply_user and getattr(reply_user, "id", None) == bot_id:
+             return f"[Reply to bot: {text}]"
+         elif reply_user and getattr(reply_user, "username", None):
+@@ -813,9 +761,20 @@ class TelegramChannel(BaseChannel):
+             return f"[Reply to: {text}]"
+ 
+     async def _download_message_media(
+-        self, msg, *, add_failure_content: bool = False
++        self,
++        msg,
++        *,
++        add_failure_content: bool = False,
++        audio_budget: "_TgAudioBudget | None" = None,
+     ) -> tuple[list[str], list[str]]:
+-        """Download media from a message (current or reply). Returns (media_paths, content_parts)."""
++        """Download media from a message (current or reply). Returns (media_paths, content_parts).
++
++        ``audio_budget`` is an optional shared cap on cumulative STT
++        seconds across the inbound message + its reply (see callers).
++        Voice/audio that overruns the budget gets a textual stub
++        instead of a transcription so we don't blow through the STT
++        quota on a forwarded long voice / replied-to lecture.
++        """
+         media_file = None
+         media_type = None
+         if getattr(msg, "photo", None):
+@@ -854,11 +813,25 @@ class TelegramChannel(BaseChannel):
+             await file.download_to_drive(str(file_path))
+             path_str = str(file_path)
+             if media_type in ("voice", "audio"):
++                duration = int(getattr(media_file, "duration", 0) or 0)
++                if audio_budget is not None and not audio_budget.try_spend(duration):
++                    logger.info(
++                        "Telegram: skipping STT for {} (audio budget exhausted)",
++                        path_str,
++                    )
++                    return [path_str], [
++                        f"[{media_type} {duration}s — не распознавали "
++                        "(превышен общий лимит распознавания на это сообщение)]"
++                    ]
+                 transcription = await self.transcribe_audio(file_path)
+                 if transcription:
+                     logger.info("Transcribed {}: {}...", media_type, transcription[:50])
+                     return [path_str], [f"[transcription: {transcription}]"]
+-                return [path_str], [f"[{media_type}: {path_str}]"]
++                logger.warning("Telegram: {} transcription empty for {}", media_type, path_str)
++                return [path_str], [
++                    "[голосовое сообщение не удалось распознать — "
++                    "вежливо попроси повторить или прислать текстом]"
++                ]
+             return [path_str], [f"[{media_type}: {path_str}]"]
+         except Exception as e:
+             logger.warning("Failed to download message media: {}", e)
+@@ -940,30 +913,6 @@ class TelegramChannel(BaseChannel):
+         if len(self._message_threads) > 1000:
+             self._message_threads.pop(next(iter(self._message_threads)))
+ 
+-    async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+-        """Forward slash commands to the bus for unified handling in AgentLoop."""
+-        if not update.message or not update.effective_user:
+-            return
+-        message = update.message
+-        user = update.effective_user
+-        self._remember_thread_context(message)
+-        
+-        # Strip @bot_username suffix if present
+-        content = message.text or ""
+-        if content.startswith("/") and "@" in content:
+-            cmd_part, *rest = content.split(" ", 1)
+-            cmd_part = cmd_part.split("@")[0]
+-            content = f"{cmd_part} {rest[0]}" if rest else cmd_part
+-        content = self._normalize_telegram_command(content)
+-            
+-        await self._handle_message(
+-            sender_id=self._sender_id(user),
+-            chat_id=str(message.chat_id),
+-            content=content,
+-            metadata=self._build_message_metadata(message, user),
+-            session_key=self._derive_topic_session_key(message),
+-        )
+-
+     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+         """Handle incoming messages (text, photos, voice, documents)."""
+         if not update.message or not update.effective_user:
+@@ -997,9 +946,19 @@ class TelegramChannel(BaseChannel):
+             lon = message.location.longitude
+             content_parts.append(f"[location: {lat}, {lon}]")
+ 
++        # Shared STT budget for current + reply (depth-1). Forwarded
++        # Telegram messages don't have a separate envelope — Telegram
++        # delivers the forwarded payload AS the inbound message, so
++        # the current-message branch already covers them. The cap is
++        # admin-configurable via
++        # ``config.channels.transcriptionAudioBudgetS``.
++        audio_budget = _TgAudioBudget(
++            total_s=int(getattr(self, "audio_budget_s", None) or TELEGRAM_AUDIO_BUDGET_S_DEFAULT)
++        )
++
+         # Download current message media
+         current_media_paths, current_media_parts = await self._download_message_media(
+-            message, add_failure_content=True
++            message, add_failure_content=True, audio_budget=audio_budget,
+         )
+         media_paths.extend(current_media_paths)
+         content_parts.extend(current_media_parts)
+@@ -1010,7 +969,9 @@ class TelegramChannel(BaseChannel):
+         reply = getattr(message, "reply_to_message", None)
+         if reply is not None:
+             reply_ctx = await self._extract_reply_context(message)
+-            reply_media, reply_media_parts = await self._download_message_media(reply)
++            reply_media, reply_media_parts = await self._download_message_media(
++                reply, audio_budget=audio_budget,
++            )
+             if reply_media:
+                 media_paths = reply_media + media_paths
+                 logger.debug("Attached replied-to media: {}", reply_media[0])

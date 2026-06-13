@@ -1,0 +1,22 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/providers/base.py b/nanobot/nanobot/providers/base.py
+--- a/nanobot/nanobot/providers/base.py
++++ b/nanobot/nanobot/providers/base.py
+@@ -91,7 +91,14 @@ _SYNTHETIC_USER_CONTENT = "(conversation continued)"
+ class LLMProvider(ABC):
+     """Base class for LLM providers."""
+ 
+-    _CHAT_RETRY_DELAYS = (1, 2, 4)
++    # Six-stage backoff: ~1+2+4+8+15+30 = 60 seconds total before a
++    # transient provider error reaches the user as a friendly fallback.
++    # Was (1, 2, 4) = 3 attempts ~7 sec; that was too tight for chat
++    # users where a 429-burst from Anthropic / Codex routinely lasts
++    # 10-20 sec. With the runner suppressing raw provider text from
++    # the final user reply, the longer budget trades visible "error"
++    # messages for a slightly later but successful response.
++    _CHAT_RETRY_DELAYS = (1, 2, 4, 8, 15, 30)
+     _PERSISTENT_MAX_DELAY = 60
+     _PERSISTENT_IDENTICAL_ERROR_LIMIT = 10
+     _RETRY_HEARTBEAT_CHUNK = 30

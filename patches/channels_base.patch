@@ -1,51 +1,214 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
 diff --git a/nanobot/nanobot/channels/base.py b/nanobot/nanobot/channels/base.py
-index a59b31e..c7724a9 100644
+index a59b31e..02c784c 100644
 --- a/nanobot/nanobot/channels/base.py
 +++ b/nanobot/nanobot/channels/base.py
-@@ -8,6 +8,7 @@ from typing import Any
+@@ -10,6 +10,9 @@ from loguru import logger
  
- from loguru import logger
- 
-+from familia.principals import resolve_actor
  from nanobot.bus.events import InboundMessage, OutboundMessage
  from nanobot.bus.queue import MessageBus
++from nanobot.channels.inbound import InboundEnricher
++
++_ACTOR_UNRESOLVED = object()
  
-@@ -25,6 +26,7 @@ class BaseChannel(ABC):
+ 
+ class BaseChannel(ABC):
+@@ -25,6 +28,17 @@ class BaseChannel(ABC):
      transcription_provider: str = "groq"
      transcription_api_key: str = ""
      transcription_api_base: str = ""
 +    transcription_folder_id: str = ""  # yandex-only; ignored by openai/groq
++    # BCP-47 language hint passed to the STT provider. Empty = use
++    # provider default (Yandex falls back to ru-RU; OpenAI/Groq
++    # auto-detect). Configured globally via
++    # ``config.channels.transcriptionLang``.
++    transcription_lang: str = ""
++    # Per-turn STT seconds cap (set by ChannelManager from
++    # config.channels.transcriptionAudioBudgetS). Channels that
++    # support forward/reply re-processing share this budget across
++    # the inbound message + nested forwards/replies.
++    audio_budget_s: int = 300
  
      def __init__(self, config: Any, bus: MessageBus):
          """
-@@ -49,6 +51,13 @@ class BaseChannel(ABC):
+@@ -37,29 +51,77 @@ class BaseChannel(ABC):
+         self.config = config
+         self.bus = bus
+         self._running = False
++        self._inbound_enrichers: list[InboundEnricher] = []
++
++    def set_inbound_enrichers(self, enrichers: list[InboundEnricher]) -> None:
++        """Install channel-level enrichers owned by the runtime adapter."""
++        self._inbound_enrichers = list(enrichers)
+ 
+     async def transcribe_audio(self, file_path: str | Path) -> str:
+-        """Transcribe an audio file via Whisper (OpenAI or Groq). Returns empty string on failure."""
++        """Transcribe an audio file via Whisper (OpenAI/Groq) or Yandex SpeechKit.
++
++        Returns empty string on failure. A ``<file>.txt`` sidecar is
++        written next to the audio after a successful run; on subsequent
++        calls (forward / reply re-processing) we read the sidecar and
++        skip the API round-trip — saves STT quota for the same voice
++        being seen multiple times.
++        """
+         if not self.transcription_api_key:
+             return ""
++
++        path = Path(file_path)
++        cache_path = path.with_suffix(path.suffix + ".txt")
++        if cache_path.exists():
++            try:
++                cached = cache_path.read_text(encoding="utf-8").strip()
++                if cached:
++                    logger.debug("{}: transcript cache hit for {}", self.name, path.name)
++                    return cached
++            except OSError as e:
++                logger.warning(
++                    "{}: transcript cache read failed for {}: {}",
++                    self.name, path.name, e,
++                )
++
++        lang = self.transcription_lang or None
+         try:
+             if self.transcription_provider == "openai":
+                 from nanobot.providers.transcription import OpenAITranscriptionProvider
+                 provider = OpenAITranscriptionProvider(
                      api_key=self.transcription_api_key,
                      api_base=self.transcription_api_base or None,
-                 )
++                    language=lang,
++                )
 +            elif self.transcription_provider == "yandex":
 +                from nanobot.providers.transcription import YandexTranscriptionProvider
 +                provider = YandexTranscriptionProvider(
 +                    api_key=self.transcription_api_key,
 +                    folder_id=self.transcription_folder_id or None,
 +                    api_base=self.transcription_api_base or None,
-+                )
++                    lang=lang,
+                 )
              else:
                  from nanobot.providers.transcription import GroqTranscriptionProvider
                  provider = GroqTranscriptionProvider(
-@@ -171,6 +180,8 @@ class BaseChannel(ABC):
+                     api_key=self.transcription_api_key,
+                     api_base=self.transcription_api_base or None,
++                    language=lang,
+                 )
+-            return await provider.transcribe(file_path)
++            text = await provider.transcribe(file_path)
+         except Exception as e:
+             logger.warning("{}: audio transcription failed: {}", self.name, e)
+             return ""
+ 
++        if text:
++            try:
++                cache_path.write_text(text, encoding="utf-8")
++            except OSError as e:
++                logger.warning(
++                    "{}: transcript cache write failed for {}: {}",
++                    self.name, path.name, e,
++                )
++        return text
++
+     async def login(self, force: bool = False) -> bool:
+         """
+         Perform channel-specific interactive login (e.g. QR code scan).
+@@ -121,6 +183,45 @@ class BaseChannel(ABC):
+         streaming = cfg.get("streaming", False) if isinstance(cfg, dict) else getattr(cfg, "streaming", False)
+         return bool(streaming) and type(self).send_delta is not BaseChannel.send_delta
+ 
++    async def should_drop_inbound(
++        self,
++        sender_id: str,
++        *,
++        actor: str | None | object = _ACTOR_UNRESOLVED,
++    ) -> bool:
++        """Channel-level inbound filter for the pending-principal flow.
++
++        Returns True iff the message should be silently dropped at the
++        channel adapter, BEFORE it reaches :meth:`_handle_message` or
++        the agent loop. The drop list is narrow on purpose:
++
++        * Known principal whose ``sender_id`` was removed from
++          ``allow_from`` — the operator's "kick out" gesture; we
++          honour it.
++        * Otherwise (unknown sender, or known principal still in
++          ``allow_from``) — let the message through. Unknown senders
++          land in the agent loop's pending hook with ``actor=None``
++          and get a templated "ждите подтверждения" reply.
++
++        Adapters that pre-filter inbound traffic before delegating to
++        ``_handle_message`` should call this instead of ``is_allowed``
++        directly, otherwise unknown senders are silently denied at
++        the channel layer and never reach the pending flow.
++        """
++        if actor is _ACTOR_UNRESOLVED:
++            msg = InboundMessage(
++                channel=self.name,
++                sender_id=str(sender_id),
++                chat_id=str(sender_id),
++                content="",
++            )
++            # Adapters that pre-filter before _handle_message still need the
++            # same actor resolution boundary as the main inbound path.
++            for enrich_inbound in self._inbound_enrichers:
++                await enrich_inbound(msg)
++            actor = msg.actor
++        return actor is not None and not self.is_allowed(sender_id)
++
+     def is_allowed(self, sender_id: str) -> bool:
+         """Check if *sender_id* is permitted.  Empty list → deny all; ``"*"`` → allow all."""
+         if isinstance(self.config, dict):
+@@ -149,24 +250,14 @@ class BaseChannel(ABC):
+         """
+         Handle an incoming message from the chat platform.
+ 
+-        This method checks permissions and forwards to the bus.
+-
+-        Args:
+-            sender_id: The sender's identifier.
+-            chat_id: The chat/channel identifier.
+-            content: Message text content.
+-            media: Optional list of media URLs.
+-            metadata: Optional channel-specific metadata.
+-            session_key: Optional session key override (e.g. thread-scoped sessions).
++        Forwards to the bus unless the sender is a known principal that
++        the operator has explicitly removed from ``allow_from``. Truly
++        unknown senders (no enrichment sets ``actor``) are
++        forwarded with ``actor=None`` so the agent loop's pending-
++        approval hook can register them and send the templated reply —
++        the channel-layer ``allow_from`` check is no longer the gate
++        for newcomers.
+         """
+-        if not self.is_allowed(sender_id):
+-            logger.warning(
+-                "Access denied for sender {} on channel {}. "
+-                "Add them to allowFrom list in config to grant access.",
+-                sender_id, self.name,
+-            )
+-            return
+-
+         meta = metadata or {}
          if self.supports_streaming:
              meta = {**meta, "_wants_stream": True}
- 
-+        actor = resolve_actor(self.name, str(sender_id))
-+
-         msg = InboundMessage(
-             channel=self.name,
-             sender_id=str(sender_id),
-@@ -179,6 +190,7 @@ class BaseChannel(ABC):
-             media=media or [],
-             metadata=meta,
+@@ -181,6 +272,20 @@ class BaseChannel(ABC):
              session_key_override=session_key,
-+            actor=actor,
          )
  
++        # Runtime adapters can resolve actors or attach metadata before the
++        # channel decides whether a known principal was removed from allow_from.
++        for enrich_inbound in self._inbound_enrichers:
++            await enrich_inbound(msg)
++
++        if await self.should_drop_inbound(sender_id, actor=msg.actor):
++            logger.warning(
++                "Access denied at channel level for {} on channel {} "
++                "(known principal removed from allow_from); "
++                "delete the identity in principals.json to fully revoke.",
++                sender_id, self.name,
++            )
++            return
++
          await self.bus.publish_inbound(msg)
+ 
+     @classmethod

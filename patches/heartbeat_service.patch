@@ -1,0 +1,88 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/heartbeat/service.py b/nanobot/nanobot/heartbeat/service.py
+index 6312308..9bded19 100644
+--- a/nanobot/nanobot/heartbeat/service.py
++++ b/nanobot/nanobot/heartbeat/service.py
+@@ -60,6 +60,7 @@ class HeartbeatService:
+         interval_s: int = 30 * 60,
+         enabled: bool = True,
+         timezone: str | None = None,
++        source_reader: Callable[[], tuple[str | None, str | None]] | None = None,
+     ):
+         self.workspace = workspace
+         self.provider = provider
+@@ -69,20 +70,45 @@ class HeartbeatService:
+         self.interval_s = interval_s
+         self.enabled = enabled
+         self.timezone = timezone
++        self.source_reader = source_reader
+         self._running = False
+         self._task: asyncio.Task | None = None
+ 
+     @property
+     def heartbeat_file(self) -> Path:
++        # Legacy fallback path. Used only when no adapter source_reader is
++        # installed; adapter readers fail closed instead of falling back here.
+         return self.workspace / "HEARTBEAT.md"
+ 
+-    def _read_heartbeat_file(self) -> str | None:
++    def _read_heartbeat_content(self) -> tuple[str | None, str | None]:
++        """Return ``(content, source)`` for the next tick.
++
++        When a product adapter supplies ``source_reader``, it owns heartbeat
++        source selection completely. Returning no content is fail-closed and
++        does not fall back to the legacy file.
++        """
++        if self.source_reader is not None:
++            try:
++                content, source = self.source_reader()
++            except Exception as exc:  # noqa: BLE001
++                logger.warning("Heartbeat: source reader failed: {}", exc)
++                return None, None
++            if content and content.strip():
++                return content, source
++            # Adapter-installed readers fail closed: an empty product-owned
++            # source must not fall through to a stale legacy HEARTBEAT.md file.
++            return None, None
++
++        # Legacy fallback: workspace/HEARTBEAT.md (single-tenant or
++        # pre-migration). Keeps standalone nanobot unchanged.
+         if self.heartbeat_file.exists():
+             try:
+-                return self.heartbeat_file.read_text(encoding="utf-8")
++                content = self.heartbeat_file.read_text(encoding="utf-8")
+             except Exception:
+-                return None
+-        return None
++                return None, None
++            if content.strip():
++                return content, "file"
++        return None, None
+ 
+     async def _decide(self, content: str) -> tuple[str, str]:
+         """Phase 1: ask LLM to decide skip/run via virtual tool call.
+@@ -151,10 +177,11 @@ class HeartbeatService:
+         """Execute a single heartbeat tick."""
+         from nanobot.utils.evaluator import evaluate_response
+ 
+-        content = self._read_heartbeat_file()
++        content, source = self._read_heartbeat_content()
+         if not content:
+-            logger.debug("Heartbeat: HEARTBEAT.md missing or empty")
++            logger.debug("Heartbeat: no source has tasks")
+             return
++        logger.debug("Heartbeat: source={}", source)
+ 
+         logger.info("Heartbeat: checking for tasks...")
+ 
+@@ -183,7 +210,7 @@ class HeartbeatService:
+ 
+     async def trigger_now(self) -> str | None:
+         """Manually trigger a heartbeat."""
+-        content = self._read_heartbeat_file()
++        content, _source = self._read_heartbeat_content()
+         if not content:
+             return None
+         action, tasks = await self._decide(content)
