@@ -10,6 +10,8 @@ Usage from the patched loop.py::
 
     from familia import bootstrap as familia_bootstrap
     ...
+    context_extensions=familia_bootstrap.make_context_extensions(workspace)
+    ...
     familia_bootstrap.install_tools(self)     # inside _register_tools
     ...
     await familia_bootstrap.on_inbound(msg)   # wherever msg.actor is set
@@ -26,6 +28,17 @@ import sys
 
 from familia.principals import set_current_actor, set_current_channel
 from familia.roles import load_effective_roles
+
+
+def make_context_extensions(workspace: Any) -> list[Any]:
+    """Return familia prompt/runtime extensions for a nanobot context builder."""
+    # Keep nanobot.context generic: familia owns the concrete extension class
+    # and exposes only already-built extension objects to the runtime loop.
+    try:
+        from familia.nanobot_extension.context import FamiliaContextExtension
+    except ImportError:
+        return []
+    return [FamiliaContextExtension(workspace)]
 
 
 def install_tools(loop: Any) -> None:

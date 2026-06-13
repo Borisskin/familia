@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -162,3 +163,54 @@ def test_context_extension_formats_actor_label(tmp_path, familia_graph) -> None:
     assert extension.format_actor_label("principal_a") == "Principal A"
     assert extension.format_actor_label("missing_principal") == "missing_principal"
     assert extension.format_actor_label(None) == ""
+
+
+def test_agent_loop_wires_context_extension_into_runtime_builder(monkeypatch, tmp_path) -> None:
+    from familia.nanobot_extension.context import FamiliaContextExtension
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+
+    # Stub the extension output so this test proves wiring into LLM messages
+    # without depending on memx data, principal graphs, or real identities.
+    monkeypatch.setattr(
+        FamiliaContextExtension,
+        "build_sections",
+        lambda self, *, actor, channel: [
+            f"<familia-system actor={actor} channel={channel}>mem_key_a</familia-system>"
+        ],
+    )
+    monkeypatch.setattr(
+        FamiliaContextExtension,
+        "build_runtime_sections",
+        lambda self, *, actor, channel, chat_id: [
+            f"<familia-runtime actor={actor} channel={channel} chat={chat_id}>mem_key_a</familia-runtime>"
+        ],
+    )
+    monkeypatch.setattr(
+        FamiliaContextExtension,
+        "format_actor_label",
+        lambda self, actor: "Principal A" if actor == "principal_a" else "",
+    )
+    monkeypatch.setattr(
+        "nanobot.agent.context.current_time_str",
+        lambda timezone=None: "2026-06-13 15:53",
+    )
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+
+    messages = loop.context.build_messages(
+        history=[],
+        current_message="hi",
+        channel="telegram",
+        chat_id="chat_a",
+        actor="principal_a",
+    )
+
+    assert "<familia-system actor=principal_a channel=telegram>mem_key_a</familia-system>" in messages[0]["content"]
+    assert (
+        "<familia-runtime actor=principal_a channel=telegram chat=chat_a>mem_key_a</familia-runtime>"
+        in messages[-1]["content"]
+    )
+    assert "[Principal A]: hi" in messages[-1]["content"]
