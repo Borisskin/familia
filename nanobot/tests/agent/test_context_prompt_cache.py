@@ -80,6 +80,57 @@ def test_system_prompt_includes_context_extension_sections(tmp_path) -> None:
     assert extension.calls == [{"actor": "principal_a", "channel": "telegram"}]
 
 
+def test_runtime_context_includes_context_extension_sections(tmp_path, monkeypatch) -> None:
+    class Extension:
+        def build_sections(self, *, actor: str | None, channel: str | None) -> list[str]:
+            return []
+
+        def build_runtime_sections(
+            self,
+            *,
+            actor: str | None,
+            channel: str | None,
+            chat_id: str | None,
+        ) -> list[str]:
+            return [f"<runtime actor={actor} channel={channel} chat={chat_id}>"]
+
+    monkeypatch.setattr("nanobot.agent.context.current_time_str", lambda timezone=None: "2026-02-24 13:59")
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace, context_extensions=[Extension()])
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="hi",
+        channel="telegram",
+        chat_id="chat_a",
+        actor="principal_a",
+    )
+
+    assert "<runtime actor=principal_a channel=telegram chat=chat_a>" in messages[-1]["content"]
+
+
+def test_current_message_uses_context_extension_actor_label(tmp_path) -> None:
+    class Extension:
+        def build_sections(self, *, actor: str | None, channel: str | None) -> list[str]:
+            return []
+
+        def format_actor_label(self, actor: str | None) -> str:
+            return "Principal A" if actor == "principal_a" else ""
+
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace, context_extensions=[Extension()])
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="hi",
+        channel="telegram",
+        chat_id="chat_a",
+        actor="principal_a",
+    )
+
+    assert "[Principal A]: hi" in messages[-1]["content"]
+
+
 def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     """Runtime metadata should be merged with the user message."""
     workspace = _make_workspace(tmp_path)
