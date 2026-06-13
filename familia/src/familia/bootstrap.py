@@ -54,7 +54,17 @@ def make_channel_manager_kwargs() -> dict[str, Any]:
     """Return familia adapters for nanobot's neutral channel extension points."""
     return {
         "inbound_enrichers": make_inbound_enrichers(),
+        "channel_classes": make_channel_classes(),
     }
+
+
+def make_channel_classes() -> dict[str, Any]:
+    """Return familia-owned channel classes for explicit runtime registration."""
+    try:
+        from familia.channels.vk import VKChannel
+    except ImportError:
+        return {}
+    return {"vk": VKChannel}
 
 
 def make_agent_loop_kwargs(workspace: Any) -> dict[str, Any]:

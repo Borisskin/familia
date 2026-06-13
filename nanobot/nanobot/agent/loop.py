@@ -1227,10 +1227,11 @@ class AgentLoop:
         the recipient's principal is known from ``payload.to``.
         """
         await self._connect_mcp()
-        if actor is None and self._direct_actor_resolver is not None:
+        direct_actor_resolver = getattr(self, "_direct_actor_resolver", None)
+        if actor is None and direct_actor_resolver is not None:
             # Direct cron/heartbeat paths bypass channel enrichment, so the
             # optional adapter resolves an actor before ContextVars are pinned.
-            actor = self._direct_actor_resolver(channel, chat_id)
+            actor = direct_actor_resolver(channel, chat_id)
         msg = InboundMessage(
             channel=channel, sender_id=actor or "user", chat_id=chat_id,
             content=content, media=media or [],

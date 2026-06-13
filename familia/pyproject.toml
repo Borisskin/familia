@@ -35,6 +35,9 @@ dev = [
 familia-audit = "familia.cli.audit_view:main"
 familia = "familia.cli.graph_admin:main"
 
+[project.entry-points."nanobot.channels"]
+vk = "familia.channels.vk:VKChannel"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/familia"]
 

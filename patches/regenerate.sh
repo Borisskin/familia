@@ -28,7 +28,6 @@ FILES=(
     nanobot/nanobot/agent/memory.py
     nanobot/nanobot/agent/tools/message.py
     nanobot/nanobot/channels/base.py
-    nanobot/nanobot/channels/vk.py
     nanobot/nanobot/cli/commands.py
     nanobot/nanobot/command/builtin.py
 )

@@ -12,7 +12,6 @@ for f in nanobot/nanobot/agent/loop.py \
          nanobot/nanobot/agent/memory.py \
          nanobot/nanobot/agent/tools/message.py \
          nanobot/nanobot/channels/base.py \
-         nanobot/nanobot/channels/vk.py \
          nanobot/nanobot/cli/commands.py \
          nanobot/nanobot/command/builtin.py; do
     name=$(echo "$f" | sed 's|nanobot/nanobot/||;s|/|_|g;s|\.py$|.patch|')
@@ -46,8 +45,8 @@ land here, re-apply by hand:
 |------|------------:|--------|
 | `agent_loop.patch`    |  ~30 | tool registration → `familia.bootstrap.install_tools`; per-turn setup → `familia.bootstrap.on_inbound` |
 | `agent_memory.patch`  | ~170 | Dream consolidation integrated with `dream_memory_set` + per-scope routing |
-| `channels_vk.patch`   | ~590 | VK polling loop — verbose error logging; keyboard + callback metadata |
 
-`channels/vk.py` was kept in nanobot (per project decision — VK is a
-nanobot channel, not a familia concept), so its patch covers VK-side
-edits only.
+`channels_vk.patch` was removed in Phase 7 of the nanobot separation
+track: VK is now a familia-owned channel adapter registered through the
+neutral channel registry boundary, so regenerating patches must not
+re-create `nanobot/nanobot/channels/vk.py`.
