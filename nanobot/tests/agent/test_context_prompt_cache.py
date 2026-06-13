@@ -61,6 +61,25 @@ def test_system_prompt_reflects_current_dream_memory_contract(tmp_path) -> None:
     assert "write important facts here" not in prompt
 
 
+def test_system_prompt_includes_context_extension_sections(tmp_path) -> None:
+    class Extension:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, str | None]] = []
+
+        def build_sections(self, *, actor: str | None, channel: str | None) -> list[str]:
+            self.calls.append({"actor": actor, "channel": channel})
+            return ["# Extension Section\n\nextra context"]
+
+    workspace = _make_workspace(tmp_path)
+    extension = Extension()
+    builder = ContextBuilder(workspace, context_extensions=[extension])
+
+    prompt = builder.build_system_prompt(channel="telegram", actor="principal_a")
+
+    assert "# Extension Section\n\nextra context" in prompt
+    assert extension.calls == [{"actor": "principal_a", "channel": "telegram"}]
+
+
 def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     """Runtime metadata should be merged with the user message."""
     workspace = _make_workspace(tmp_path)
@@ -133,7 +152,7 @@ def test_partial_dream_processing_shows_only_remainder(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
     builder = ContextBuilder(workspace)
 
-    c1 = builder.memory.append_history("old conversation about Python")
+    builder.memory.append_history("old conversation about Python")
     c2 = builder.memory.append_history("old conversation about Rust")
     builder.memory.append_history("recent question about Docker")
     builder.memory.append_history("recent question about K8s")

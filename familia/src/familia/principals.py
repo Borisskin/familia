@@ -72,8 +72,8 @@ class PrincipalRegistry:
             # routed as ``actor=None`` → pending queue.
             #
             # Index both forms so ``resolve_actor("telegram",
-            # "33143799")`` and ``resolve_actor("telegram",
-            # "33143799|Borisskin")`` both return the principal.
+            # "123456789")`` and ``resolve_actor("telegram",
+            # "123456789|example_user")`` both return the principal.
             if ident.channel == "telegram" and "|" in sid:
                 chat_id = sid.split("|", 1)[0]
                 if chat_id and (ident.channel, chat_id) not in self._index:
