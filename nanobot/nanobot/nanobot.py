@@ -20,6 +20,15 @@ class RunResult:
     messages: list[dict[str, Any]]
 
 
+def _make_familia_agent_loop_kwargs(workspace: Path) -> dict[str, Any]:
+    """Load optional familia adapters without coupling AgentLoop to familia."""
+    try:
+        from familia import bootstrap as familia_bootstrap
+    except ImportError:
+        return {}
+    return familia_bootstrap.make_agent_loop_kwargs(workspace)
+
+
 class Nanobot:
     """Programmatic facade for running the nanobot agent.
 
@@ -85,6 +94,7 @@ class Nanobot:
             disabled_skills=defaults.disabled_skills,
             session_ttl_minutes=defaults.session_ttl_minutes,
             tools_config=config.tools,
+            **_make_familia_agent_loop_kwargs(config.workspace_path),
         )
         return cls(loop)
 

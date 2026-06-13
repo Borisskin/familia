@@ -66,6 +66,15 @@ app = typer.Typer(
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
 
+
+def _make_familia_agent_loop_kwargs(workspace: Path) -> dict[str, Any]:
+    """Load optional familia adapters without coupling AgentLoop to familia."""
+    try:
+        from familia import bootstrap as familia_bootstrap
+    except ImportError:
+        return {}
+    return familia_bootstrap.make_agent_loop_kwargs(workspace)
+
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
 # ---------------------------------------------------------------------------
@@ -594,6 +603,7 @@ def serve(
         disabled_skills=runtime_config.agents.defaults.disabled_skills,
         session_ttl_minutes=runtime_config.agents.defaults.session_ttl_minutes,
         tools_config=runtime_config.tools,
+        **_make_familia_agent_loop_kwargs(runtime_config.workspace_path),
     )
 
     model_name = runtime_config.agents.defaults.model
@@ -705,6 +715,7 @@ def _run_gateway(
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         tools_config=config.tools,
+        **_make_familia_agent_loop_kwargs(config.workspace_path),
     )
 
     # Set cron callback (needs agent)
@@ -1280,6 +1291,7 @@ def agent(
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         tools_config=config.tools,
+        **_make_familia_agent_loop_kwargs(config.workspace_path),
     )
     restart_notice = consume_restart_notice_from_env()
     if restart_notice and should_show_cli_restart_notice(restart_notice, session_id):

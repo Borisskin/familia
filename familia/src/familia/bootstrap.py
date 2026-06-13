@@ -26,7 +26,7 @@ from loguru import logger
 
 import sys
 
-from familia.principals import set_current_actor, set_current_channel
+from familia.principals import get_current_actor, set_current_actor, set_current_channel
 from familia.roles import load_effective_roles
 
 
@@ -39,6 +39,104 @@ def make_context_extensions(workspace: Any) -> list[Any]:
     except ImportError:
         return []
     return [FamiliaContextExtension(workspace)]
+
+
+def make_agent_loop_kwargs(workspace: Any) -> dict[str, Any]:
+    """Return familia adapters for nanobot's neutral extension points."""
+    from familia import audit
+
+    return {
+        "context_extensions": make_context_extensions(workspace),
+        "tool_installers": [install_tools],
+        "inbound_enrichers": [on_inbound],
+        "outbound_guard": make_outbound_guard(),
+        "pending_inbound_handler": handle_pending_inbound,
+        "current_actor_getter": get_current_actor,
+        "tool_call_auditor": audit.log_event,
+        "cron_tool_options": {
+            "to_validator": make_principal_chat_validator(),
+            "current_actor_getter": get_current_actor,
+            "is_admin_getter": make_admin_check(),
+            "reachable_tags_getter": make_reachable_tags_getter(),
+        },
+    }
+
+
+def make_outbound_guard() -> Any:
+    """Adapt familia outbound policy to nanobot's guard protocol."""
+    from familia.policy import gate_outbound_send
+    from nanobot.agent.outbound import OutboundDecision
+
+    async def _guard(request: Any) -> Any:
+        result = await gate_outbound_send(
+            action=request.action,
+            outbound=request.outbound,
+            inbound_channel=request.inbound_channel,
+            inbound_chat_id=request.inbound_chat_id,
+            publish_outbound=request.publish_outbound,
+        )
+        return OutboundDecision(
+            kind=result.kind,
+            reason=result.reason,
+            approvers_label=result.approvers_label,
+        )
+
+    return _guard
+
+
+async def handle_pending_inbound(msg: Any) -> tuple[bool, Any | None]:
+    """Intercept unknown principals before nanobot logs or processes content."""
+    if getattr(msg, "actor", None) is not None or getattr(msg, "channel", None) in (
+        "cli",
+        "system",
+    ):
+        return False, None
+
+    from nanobot.bus.events import OutboundMessage
+
+    try:
+        from familia.pending import store as pending_store
+        from familia.pending.messages import reply_for_pending
+
+        display_name = ""
+        meta = getattr(msg, "metadata", None) or {}
+        # Channel adapters may provide a friendly name; fallback keeps admin
+        # pending rows identifiable without exposing this logic to nanobot.
+        for key in ("display_name", "first_name", "username", "from_name"):
+            value = meta.get(key)
+            if isinstance(value, str) and value.strip():
+                display_name = value.strip()
+                break
+        if not display_name:
+            display_name = str(getattr(msg, "sender_id", ""))
+
+        import asyncio
+
+        entry = await asyncio.to_thread(
+            pending_store.record,
+            channel=msg.channel,
+            sender_id=msg.sender_id,
+            display_name=display_name,
+            message_preview=msg.content,
+        )
+        if entry is not None:
+            return True, OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=reply_for_pending(),
+            )
+        return True, None
+    except Exception:
+        logger.exception(
+            "pending-principal gate failed for {}:{}; replying with degraded notice",
+            getattr(msg, "channel", None),
+            getattr(msg, "sender_id", None),
+        )
+        return True, OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content="Сейчас не могу обработать запрос. Попробуйте позже.",
+        )
 
 
 def install_tools(loop: Any) -> None:

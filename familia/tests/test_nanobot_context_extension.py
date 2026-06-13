@@ -198,7 +198,15 @@ def test_agent_loop_wires_context_extension_into_runtime_builder(monkeypatch, tm
 
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
-    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+    from familia import bootstrap as familia_bootstrap
+
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+        **familia_bootstrap.make_agent_loop_kwargs(tmp_path),
+    )
 
     messages = loop.context.build_messages(
         history=[],
