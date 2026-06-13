@@ -18,7 +18,7 @@ from loguru import logger
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
-from nanobot.agent.memory import Consolidator, Dream
+from nanobot.agent.memory import Consolidator, Dream, MemoryStore
 from nanobot.agent.outbound import OutboundGuard, OutboundRequest, allow_outbound
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
@@ -189,6 +189,7 @@ class AgentLoop:
         current_actor_getter: CallableABC[[], str | None] | None = None,
         tool_call_auditor: CallableABC[..., None] | None = None,
         cron_tool_options: dict[str, Any] | None = None,
+        dream_tool_installers: list[CallableABC[[ToolRegistry, MemoryStore], None]] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
@@ -229,6 +230,7 @@ class AgentLoop:
         self._current_actor_getter = current_actor_getter or (lambda: None)
         self._tool_call_auditor = tool_call_auditor
         self._cron_tool_options = cron_tool_options or {}
+        self._dream_tool_installers = dream_tool_installers or []
 
         # Deployments inject concrete prompt/runtime extensions here; the
         # builder remains unaware of which product owns them.
@@ -289,6 +291,7 @@ class AgentLoop:
             store=self.context.memory,
             provider=provider,
             model=self.model,
+            dream_tool_installers=self._dream_tool_installers,
         )
         self._register_default_tools()
         if _tc.my.enable:

@@ -115,6 +115,20 @@ def _apply_familia_heartbeat_defaults(hb_cfg: Any) -> None:
     familia_bootstrap.apply_heartbeat_defaults(hb_cfg)
 
 
+def _make_familia_heartbeat_source_reader(target_actor: str | None) -> Any:
+    """Load optional familia-owned heartbeat source reader.
+
+    Returning ``None`` keeps standalone nanobot on the legacy ``HEARTBEAT.md``
+    path. Returning a reader means the adapter owns source selection and the
+    heartbeat service must not fall back to the file on empty adapter content.
+    """
+    try:
+        from familia import bootstrap as familia_bootstrap
+    except ImportError:
+        return None
+    return familia_bootstrap.make_heartbeat_source_reader(target_actor)
+
+
 def _reload_familia_runtime_registry() -> None:
     """Reload optional familia registry state for gateway hot reload."""
     try:
@@ -952,6 +966,7 @@ def _run_gateway(
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
         timezone=config.agents.defaults.timezone,
+        source_reader=_make_familia_heartbeat_source_reader(hb_cfg.target_actor),
     )
 
     if channels.enabled_channels:

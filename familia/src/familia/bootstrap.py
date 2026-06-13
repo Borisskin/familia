@@ -88,6 +88,7 @@ def make_agent_loop_kwargs(workspace: Any) -> dict[str, Any]:
             "is_admin_getter": make_admin_check(),
             "reachable_tags_getter": make_reachable_tags_getter(),
         },
+        "dream_tool_installers": make_dream_tool_installers(),
     }
 
 
@@ -96,6 +97,22 @@ def make_direct_actor_resolver() -> Any:
     from familia.principals import resolve_actor
 
     return resolve_actor
+
+
+def make_dream_tool_installers() -> list[Any]:
+    """Return familia Dream memory tool installers for nanobot Dream."""
+    from familia.nanobot_extension.cron import make_dream_tool_installers as _make
+
+    return _make()
+
+
+def make_heartbeat_source_reader(target_actor: str | None) -> Any:
+    """Return optional heartbeat source reader for a configured principal."""
+    if not (target_actor or "").strip():
+        return None
+    from familia.nanobot_extension.cron import make_heartbeat_source_reader as _make
+
+    return _make(target_actor)
 
 
 def make_callback_handlers(bus: Any) -> list[Any]:

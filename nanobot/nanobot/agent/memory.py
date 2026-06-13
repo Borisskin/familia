@@ -712,6 +712,7 @@ class Dream:
         max_iterations: int = 10,
         max_tool_result_chars: int = 16_000,
         annotate_line_ages: bool = True,
+        dream_tool_installers: list[Callable[[ToolRegistry, MemoryStore], None]] | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -723,6 +724,7 @@ class Dream:
         # Default True keeps the #3212 behavior; set False to feed MEMORY.md raw
         # (e.g. if a specific LLM reacts poorly to the `← Nd` suffix).
         self.annotate_line_ages = annotate_line_ages
+        self._dream_tool_installers = dream_tool_installers or []
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
 
@@ -732,7 +734,6 @@ class Dream:
         """Build a minimal tool registry for the Dream agent."""
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
         from nanobot.agent.tools.filesystem import EditFileTool, ReadFileTool, WriteFileTool
-        from familia.tools.dream_memory import DreamMemorySetTool
 
         tools = ToolRegistry()
         workspace = self.store.workspace
@@ -749,8 +750,10 @@ class Dream:
         skills_dir = workspace / "skills"
         skills_dir.mkdir(parents=True, exist_ok=True)
         tools.register(WriteFileTool(workspace=workspace, allowed_dir=skills_dir))
-        # familia per-scope Dream — write private facts to memX instead of MEMORY.md.
-        tools.register(DreamMemorySetTool())
+        # Product adapters may add Dream-specific write tools without coupling
+        # nanobot memory consolidation to their storage implementation.
+        for install_tools in self._dream_tool_installers:
+            install_tools(tools, self.store)
         return tools
 
     # -- skill listing --------------------------------------------------------

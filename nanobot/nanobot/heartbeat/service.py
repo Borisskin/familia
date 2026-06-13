@@ -60,6 +60,7 @@ class HeartbeatService:
         interval_s: int = 30 * 60,
         enabled: bool = True,
         timezone: str | None = None,
+        source_reader: Callable[[], tuple[str | None, str | None]] | None = None,
     ):
         self.workspace = workspace
         self.provider = provider
@@ -69,6 +70,7 @@ class HeartbeatService:
         self.interval_s = interval_s
         self.enabled = enabled
         self.timezone = timezone
+        self.source_reader = source_reader
         self._running = False
         self._task: asyncio.Task | None = None
 
@@ -78,88 +80,25 @@ class HeartbeatService:
         # OR no admin principal can be resolved.
         return self.workspace / "HEARTBEAT.md"
 
-    def _admin_principal_id(self) -> str | None:
-        """Resolve the principal id whose namespace owns heartbeat.
-
-        Per project decision: heartbeat addresses ONLY the admin. We
-        require *exactly one* principal carrying ``role: admin`` in
-        principals.json. With zero admins, return None (nothing to
-        target). With more than one — refuse to guess: log an error
-        and return None so the heartbeat tick noops loudly. The
-        operator can then either (a) demote one admin, or (b) switch
-        to an explicit ``heartbeat_target_actor`` mechanism we'll add
-        when the multi-admin case actually appears.
-
-        Lex-smallest auto-pick was rejected during review: silent
-        retargeting on principal add is a class of bug we don't want.
-        """
-        try:
-            from familia.principals import get_registry
-        except ImportError:
-            return None
-        try:
-            registry = get_registry()
-        except Exception:  # noqa: BLE001
-            return None
-        admins = sorted(
-            pid for pid in registry.ids
-            if (p := registry.get(pid)) is not None
-            and "admin" in (p.roles or [])
-        )
-        if not admins:
-            return None
-        if len(admins) > 1:
-            logger.error(
-                "Heartbeat: refusing to target — multiple admin principals: {}. "
-                "Demote one or add explicit heartbeat_target_actor support.",
-                admins,
-            )
-            return None
-        return admins[0]
-
     def _read_heartbeat_content(self) -> tuple[str | None, str | None]:
         """Return ``(content, source)`` for the next tick.
 
-        Source is one of ``"memx"`` or ``"file"`` (or None on miss). We
-        log it once per tick so the operator knows which path served.
-
-        When familia is installed AND an admin principal is resolved
-        AND that principal has a memX key, ``value:heartbeat`` in memX
-        is the *only* source — the legacy file is ignored even if
-        present. This prevents source-divergence spam: previously an
-        empty memX slot would fall through to ``HEARTBEAT.md``, and a
-        stale entry there would re-fire every tick after its cron
-        equivalent had already been created.
-
-        The file fallback survives strictly for the cases the legacy
-        path was designed for: standalone nanobot (no familia import),
-        no admin principal, or an admin without a memX key.
+        When a product adapter supplies ``source_reader``, it owns heartbeat
+        source selection completely. Returning no content is fail-closed and
+        does not fall back to the legacy file.
         """
-        admin_id = self._admin_principal_id()
-        familia_owns_source = False
-        if admin_id is not None:
+        if self.source_reader is not None:
             try:
-                from familia.principals import get_registry
-                from familia.acl.principal_memory import PrincipalMemoryClient
-            except ImportError:
-                pass
-            else:
-                principal = get_registry().get(admin_id)
-                if principal is not None and principal.memx_key:
-                    familia_owns_source = True
-                    try:
-                        client = PrincipalMemoryClient(admin_id, principal.memx_key)
-                        text = client.get("value:heartbeat")
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "Heartbeat: memX read failed for {}: {}",
-                            admin_id, exc,
-                        )
-                        text = None
-                    if text and text.strip():
-                        return text, "memx"
-        if familia_owns_source:
+                content, source = self.source_reader()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Heartbeat: source reader failed: {}", exc)
+                return None, None
+            if content and content.strip():
+                return content, source
+            # Adapter-installed readers fail closed: an empty product-owned
+            # source must not fall through to a stale legacy HEARTBEAT.md file.
             return None, None
+
         # Legacy fallback: workspace/HEARTBEAT.md (single-tenant or
         # pre-migration). Keeps standalone nanobot unchanged.
         if self.heartbeat_file.exists():
