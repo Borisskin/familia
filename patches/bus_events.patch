@@ -2,7 +2,7 @@
 # upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
 
 diff --git a/nanobot/nanobot/bus/events.py b/nanobot/nanobot/bus/events.py
-index 018c25b..5612f88 100644
+index 018c25b..bf30024 100644
 --- a/nanobot/nanobot/bus/events.py
 +++ b/nanobot/nanobot/bus/events.py
 @@ -17,6 +17,7 @@ class InboundMessage:
@@ -13,7 +13,7 @@ index 018c25b..5612f88 100644
  
      @property
      def session_key(self) -> str:
-@@ -36,3 +37,21 @@ class OutboundMessage:
+@@ -36,3 +37,20 @@ class OutboundMessage:
      metadata: dict[str, Any] = field(default_factory=dict)
  
  
@@ -34,4 +34,3 @@ index 018c25b..5612f88 100644
 +    timestamp: datetime = field(default_factory=datetime.now)
 +    actor: str | None = None
 +    metadata: dict[str, Any] = field(default_factory=dict)
-+

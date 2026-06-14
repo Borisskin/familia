@@ -1027,14 +1027,13 @@ def _run_gateway(
         except Exception as e:
             console.print(f"[yellow]Could not open browser ({e}); visit {open_browser_url}[/yellow]")
 
-    # Re-entrancy guard for the SIGHUP handler. Two admin operations
-    # in quick succession (e.g. ``channels remove`` immediately
-    # followed by ``pending approve``) each fire ``docker kill
-    # --signal=HUP``. Without the lock both would spawn concurrent
+    # Re-entrancy guard for the SIGHUP handler. Two external config
+    # operations in quick succession can each send a reload signal.
+    # Without the lock both would spawn concurrent
     # ``_handle_sighup`` tasks: each calls ``manager.stop_all()`` and
     # then ``_init_channels()`` + ``start_all()``, leaving two
     # ``_dispatch_outbound`` tasks consuming from the same outbound
-    # queue and (for VK) two long-poll readers on the same token —
+    # queue and duplicate channel readers on the same credentials —
     # duplicate-message processing and a half-stopped channel state
     # are reachable from this race.
     #
@@ -1050,14 +1049,12 @@ def _run_gateway(
     async def _handle_sighup() -> None:
         """Hot-reload principals registry and channel adapters from disk.
 
-        Triggered by ``docker kill --signal=HUP familia-gateway`` from
-        the admin app after operations that mutate principals.json or
-        config.json (pending approve, channel add/remove/edit). Avoids
-        a full container restart — the gateway keeps its loaded
-        agent / cron / heartbeat / callback dispatcher / providers,
-        and only the parts that read mutable on-disk state get
-        rebuilt. Drops the ~30 s «restart_gateway_quiet» wait the
-        admin used to do after every such mutation.
+        Triggered by a HUP signal after operations that mutate runtime
+        config files (for example approval state or channel
+        add/remove/edit). Avoids a full process restart: the gateway
+        keeps its loaded agent / cron / heartbeat / callback dispatcher /
+        providers, and only the parts that read mutable on-disk state get
+        rebuilt.
 
         Serialised under ``sighup_lock`` so concurrent SIGHUPs can't
         interleave stop/start cycles. A second SIGHUP that arrives

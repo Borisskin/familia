@@ -2,7 +2,7 @@
 # upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
 
 diff --git a/nanobot/nanobot/channels/base.py b/nanobot/nanobot/channels/base.py
-index a59b31e..02c784c 100644
+index a59b31e..ad27bab 100644
 --- a/nanobot/nanobot/channels/base.py
 +++ b/nanobot/nanobot/channels/base.py
 @@ -10,6 +10,9 @@ from loguru import logger
@@ -204,7 +204,7 @@ index a59b31e..02c784c 100644
 +            logger.warning(
 +                "Access denied at channel level for {} on channel {} "
 +                "(known principal removed from allow_from); "
-+                "delete the identity in principals.json to fully revoke.",
++                "delete the identity in the runtime registry to fully revoke.",
 +                sender_id, self.name,
 +            )
 +            return

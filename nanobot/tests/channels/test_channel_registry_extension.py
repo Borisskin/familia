@@ -19,6 +19,10 @@ class AdapterChannel(BaseChannel):
         pass
 
 
+class DiscoveredAdapterChannel(AdapterChannel):
+    pass
+
+
 def _config() -> SimpleNamespace:
     return SimpleNamespace(
         channels=SimpleNamespace(
@@ -45,6 +49,23 @@ def test_channel_manager_accepts_adapter_channel_classes() -> None:
     )
 
     assert isinstance(manager.channels["adapter"], AdapterChannel)
+
+
+def test_runtime_adapter_channel_class_overrides_discovered_plugin(monkeypatch) -> None:
+    from nanobot.channels.manager import ChannelManager
+
+    monkeypatch.setattr(
+        "nanobot.channels.registry.discover_all",
+        lambda: {"adapter": DiscoveredAdapterChannel},
+    )
+
+    manager = ChannelManager(
+        _config(),
+        MessageBus(),
+        channel_classes={"adapter": AdapterChannel},
+    )
+
+    assert type(manager.channels["adapter"]) is AdapterChannel
 
 
 def test_vk_channel_lives_outside_nanobot_core() -> None:

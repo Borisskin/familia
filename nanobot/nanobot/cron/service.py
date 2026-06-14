@@ -393,17 +393,15 @@ class CronService:
         created_by: str | None = None,
         tags: list[str] | None = None,
     ) -> CronJob:
-        """Add a new job (idempotent on schedule + recipient + payload).
+        """Add a new job (idempotent on full delivery payload).
 
         If an enabled job already exists with the same schedule
         signature (cron expression / interval / one-shot timestamp +
-        timezone), the same delivery target (channel + to), and the
-        same message body, return that existing job instead of
-        creating a duplicate. Without this guard the LLM agent —
-        especially when re-prompted by the heartbeat tick reading
-        ``HEARTBEAT.md`` — happily creates a fresh cron with each
-        invocation, and one ``0 12 6-10 5 *`` reminder ends up firing
-        five times in parallel.
+        timezone), delivery target, message body, delivery mode,
+        lifecycle flag, creator, and visibility tags, return that
+        existing job instead of creating a duplicate. Without this
+        guard the agent can create a fresh cron for the same reminder
+        when it sees the same persisted instruction on later turns.
         """
         _validate_schedule_for_add(schedule)
         now = _now_ms()
@@ -417,6 +415,15 @@ class CronService:
                 schedule.at_ms,
                 schedule.tz,
             )
+            payload_sig = (
+                message,
+                deliver,
+                channel or "",
+                to or "",
+                delete_after_run,
+                created_by or "",
+                tuple(sorted(tags or [])),
+            )
             for existing in store.jobs:
                 if not existing.enabled:
                     continue
@@ -429,11 +436,16 @@ class CronService:
                 ) != sched_sig:
                     continue
                 ep = existing.payload
-                if (
-                    ep.message == message
-                    and (ep.channel or "") == (channel or "")
-                    and (ep.to or "") == (to or "")
-                ):
+                existing_sig = (
+                    ep.message,
+                    ep.deliver,
+                    ep.channel or "",
+                    ep.to or "",
+                    existing.delete_after_run,
+                    ep.created_by or "",
+                    tuple(sorted(ep.tags or [])),
+                )
+                if existing_sig == payload_sig:
                     logger.info(
                         "Cron: dedupe hit on add — returning existing job '{}' ({}) "
                         "instead of creating a duplicate",

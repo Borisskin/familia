@@ -2,7 +2,7 @@
 # upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
 
 diff --git a/nanobot/nanobot/providers/openai_codex_provider.py b/nanobot/nanobot/providers/openai_codex_provider.py
-index 44cb247..3d5fd74 100644
+index 44cb247..a7f1eb4 100644
 --- a/nanobot/nanobot/providers/openai_codex_provider.py
 +++ b/nanobot/nanobot/providers/openai_codex_provider.py
 @@ -22,6 +22,13 @@ from nanobot.providers.openai_responses import (
@@ -26,7 +26,7 @@ index 44cb247..3d5fd74 100644
 +            # Build a structured error response so ``_run_with_retry``
 +            # in base.py can decide retry/no-retry deterministically
 +            # (without resorting to fuzzy text-marker scans on the
-+            # final ``content``). Three classes:
++            # final ``content``). Four categories:
 +            #
 +            #  * ``_CodexHTTPError`` — server response with a status
 +            #    code; status drives retry policy in base._is_transient.

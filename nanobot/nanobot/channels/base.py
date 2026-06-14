@@ -281,7 +281,7 @@ class BaseChannel(ABC):
             logger.warning(
                 "Access denied at channel level for {} on channel {} "
                 "(known principal removed from allow_from); "
-                "delete the identity in principals.json to fully revoke.",
+                "delete the identity in the runtime registry to fully revoke.",
                 sender_id, self.name,
             )
             return

@@ -2,7 +2,7 @@
 # upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
 
 diff --git a/nanobot/nanobot/channels/telegram.py b/nanobot/nanobot/channels/telegram.py
-index 6925658..92125db 100644
+index 6925658..7a5ca15 100644
 --- a/nanobot/nanobot/channels/telegram.py
 +++ b/nanobot/nanobot/channels/telegram.py
 @@ -11,7 +11,7 @@ from typing import Any, Literal
@@ -125,7 +125,7 @@ index 6925658..92125db 100644
      allow_from: list[str] = Field(default_factory=list)
      proxy: str | None = None
      reply_to_message: bool = False
-@@ -243,18 +231,9 @@ class TelegramChannel(BaseChannel):
+@@ -243,18 +231,8 @@ class TelegramChannel(BaseChannel):
      name = "telegram"
      display_name = "Telegram"
  
@@ -141,13 +141,12 @@ index 6925658..92125db 100644
 -        BotCommand("dream_restore", "Restore Dream memory to an earlier version"),
 -        BotCommand("help", "Show available commands"),
 -    ]
-+    # No slash commands registered with Telegram's menu — see commit
-+    # message for the rationale. Bot listens to natural language only;
-+    # auto-compact + Dream handle session management without UI.
++    # No slash commands registered with Telegram's menu. Bot listens to
++    # natural language only; session lifecycle stays inside the runtime.
  
      @classmethod
      def default_config(cls) -> dict[str, Any]:
-@@ -294,17 +273,6 @@ class TelegramChannel(BaseChannel):
+@@ -294,17 +272,6 @@ class TelegramChannel(BaseChannel):
  
          return sid in allow_list or username in allow_list
  
@@ -165,7 +164,7 @@ index 6925658..92125db 100644
      async def start(self) -> None:
          """Start the Telegram bot with long polling."""
          if not self.config.token:
-@@ -336,30 +304,22 @@ class TelegramChannel(BaseChannel):
+@@ -336,30 +303,21 @@ class TelegramChannel(BaseChannel):
              .request(api_request)
              .get_updates_request(poll_request)
          )
@@ -195,10 +194,9 @@ index 6925658..92125db 100644
 -        # Add message handler for text, photos, voice, documents, and locations
 +        # Single message handler: every text/photo/voice/audio/document/
 +        # location update routes straight through the agent loop. No slash-
-+        # command regexes — :class:`AgentLoop` no longer maintains a
-+        # ``CommandRouter``; auto-compact and Dream handle session-level
-+        # concerns without a UI affordance, and the LLM understands
-+        # "забудь, давай заново" / "stop, не отвечай" in natural language.
++        # command regexes or command router; session-level concerns stay
++        # inside the runtime, and the LLM handles natural-language control
++        # requests as regular messages.
          self._app.add_handler(
              MessageHandler(
 -                (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL | filters.LOCATION)
@@ -207,7 +205,7 @@ index 6925658..92125db 100644
                  self._on_message
              )
          )
-@@ -370,17 +330,25 @@ class TelegramChannel(BaseChannel):
+@@ -370,17 +328,25 @@ class TelegramChannel(BaseChannel):
          await self._app.initialize()
          await self._app.start()
  
@@ -221,7 +219,7 @@ index 6925658..92125db 100644
  
 +        # Best-effort wipe of any commands previously registered with
 +        # BotFather / older versions of this code, so the in-app menu
-+        # doesn't keep showing /new /stop /dream etc. Failure is fine —
++        # doesn't keep showing disabled runtime commands. Failure is fine —
 +        # the menu is cosmetic, the regex handlers were the actual
 +        # routing surface and they're already gone.
          try:
@@ -237,7 +235,7 @@ index 6925658..92125db 100644
  
          # Start polling (this runs until stopped)
          await self._app.updater.start_polling(
-@@ -519,7 +487,7 @@ class TelegramChannel(BaseChannel):
+@@ -519,7 +485,7 @@ class TelegramChannel(BaseChannel):
      async def _call_with_retry(self, fn, *args, **kwargs):
          """Call an async Telegram API function with retry on pool/network timeout and RetryAfter."""
          from telegram.error import RetryAfter
@@ -246,7 +244,7 @@ index 6925658..92125db 100644
          for attempt in range(1, _SEND_MAX_RETRIES + 1):
              try:
                  return await fn(*args, **kwargs)
-@@ -671,11 +639,10 @@ class TelegramChannel(BaseChannel):
+@@ -671,11 +637,10 @@ class TelegramChannel(BaseChannel):
          if message_thread_id := meta.get("message_thread_id"):
              thread_kwargs["message_thread_id"] = message_thread_id
          if buf.message_id is None:
@@ -259,7 +257,7 @@ index 6925658..92125db 100644
                      **thread_kwargs,
                  )
                  buf.message_id = sent.message_id
-@@ -688,12 +655,11 @@ class TelegramChannel(BaseChannel):
+@@ -688,12 +653,11 @@ class TelegramChannel(BaseChannel):
                  await self._flush_stream_overflow(int_chat_id, buf, thread_kwargs)
                  buf.last_edit = now
                  return
@@ -273,7 +271,7 @@ index 6925658..92125db 100644
                  )
                  buf.last_edit = now
              except Exception as e:
-@@ -741,24 +707,6 @@ class TelegramChannel(BaseChannel):
+@@ -741,24 +705,6 @@ class TelegramChannel(BaseChannel):
          buf.message_id = sent.message_id
          buf.text = tail
  
@@ -298,7 +296,7 @@ index 6925658..92125db 100644
      @staticmethod
      def _sender_id(user) -> str:
          """Build sender_id with username for allowlist matching."""
-@@ -796,13 +744,13 @@ class TelegramChannel(BaseChannel):
+@@ -796,13 +742,13 @@ class TelegramChannel(BaseChannel):
          text = getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
          if len(text) > TELEGRAM_REPLY_CONTEXT_MAX_LEN:
              text = text[:TELEGRAM_REPLY_CONTEXT_MAX_LEN] + "..."
@@ -315,7 +313,7 @@ index 6925658..92125db 100644
          if bot_id and reply_user and getattr(reply_user, "id", None) == bot_id:
              return f"[Reply to bot: {text}]"
          elif reply_user and getattr(reply_user, "username", None):
-@@ -813,9 +761,20 @@ class TelegramChannel(BaseChannel):
+@@ -813,9 +759,20 @@ class TelegramChannel(BaseChannel):
              return f"[Reply to: {text}]"
  
      async def _download_message_media(
@@ -338,7 +336,7 @@ index 6925658..92125db 100644
          media_file = None
          media_type = None
          if getattr(msg, "photo", None):
-@@ -854,11 +813,25 @@ class TelegramChannel(BaseChannel):
+@@ -854,11 +811,25 @@ class TelegramChannel(BaseChannel):
              await file.download_to_drive(str(file_path))
              path_str = str(file_path)
              if media_type in ("voice", "audio"):
@@ -365,7 +363,7 @@ index 6925658..92125db 100644
              return [path_str], [f"[{media_type}: {path_str}]"]
          except Exception as e:
              logger.warning("Failed to download message media: {}", e)
-@@ -940,30 +913,6 @@ class TelegramChannel(BaseChannel):
+@@ -940,30 +911,6 @@ class TelegramChannel(BaseChannel):
          if len(self._message_threads) > 1000:
              self._message_threads.pop(next(iter(self._message_threads)))
  
@@ -396,7 +394,7 @@ index 6925658..92125db 100644
      async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
          """Handle incoming messages (text, photos, voice, documents)."""
          if not update.message or not update.effective_user:
-@@ -997,9 +946,19 @@ class TelegramChannel(BaseChannel):
+@@ -997,9 +944,19 @@ class TelegramChannel(BaseChannel):
              lon = message.location.longitude
              content_parts.append(f"[location: {lat}, {lon}]")
  
@@ -417,7 +415,7 @@ index 6925658..92125db 100644
          )
          media_paths.extend(current_media_paths)
          content_parts.extend(current_media_parts)
-@@ -1010,7 +969,9 @@ class TelegramChannel(BaseChannel):
+@@ -1010,7 +967,9 @@ class TelegramChannel(BaseChannel):
          reply = getattr(message, "reply_to_message", None)
          if reply is not None:
              reply_ctx = await self._extract_reply_context(message)

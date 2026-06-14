@@ -756,8 +756,8 @@ class AgentLoop:
             await self.bus.publish_outbound(outbound)
             return
 
-        # Direct replies and MessageTool share the same neutral guard. Familia
-        # can park or deny sends without loop.py importing familia.policy.
+        # Direct replies and MessageTool share the same neutral guard. Adapters
+        # can park or deny sends without loop.py importing product policy.
         result = await self._outbound_guard(
             OutboundRequest(
                 action="message.send",

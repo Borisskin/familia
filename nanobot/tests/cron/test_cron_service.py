@@ -44,6 +44,42 @@ def test_add_job_accepts_valid_timezone(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_add_job_dedupe_keeps_distinct_delivery_and_visibility_payloads(tmp_path) -> None:
+    service = CronService(tmp_path / "cron" / "jobs.json", max_sleep_ms=10_000)
+    await service.start()
+    try:
+        schedule = CronSchedule(kind="cron", expr="0 9 * * *", tz="UTC")
+
+        first = service.add_job(
+            name="first",
+            schedule=schedule,
+            message="standup",
+            deliver=True,
+            channel="telegram",
+            to="chat-1",
+            delete_after_run=False,
+            created_by="principal_a",
+            tags=["topic:a"],
+        )
+        second = service.add_job(
+            name="second",
+            schedule=schedule,
+            message="standup",
+            deliver=False,
+            channel="telegram",
+            to="chat-1",
+            delete_after_run=True,
+            created_by="principal_b",
+            tags=["topic:b"],
+        )
+
+        assert second.id != first.id
+        assert {job.id for job in service.list_jobs()} == {first.id, second.id}
+    finally:
+        service.stop()
+
+
+@pytest.mark.asyncio
 async def test_execute_job_records_run_history(tmp_path) -> None:
     store_path = tmp_path / "cron" / "jobs.json"
     service = CronService(store_path, on_job=lambda _: asyncio.sleep(0))

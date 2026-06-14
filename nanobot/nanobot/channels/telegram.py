@@ -231,9 +231,8 @@ class TelegramChannel(BaseChannel):
     name = "telegram"
     display_name = "Telegram"
 
-    # No slash commands registered with Telegram's menu — see commit
-    # message for the rationale. Bot listens to natural language only;
-    # auto-compact + Dream handle session management without UI.
+    # No slash commands registered with Telegram's menu. Bot listens to
+    # natural language only; session lifecycle stays inside the runtime.
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
@@ -313,10 +312,9 @@ class TelegramChannel(BaseChannel):
 
         # Single message handler: every text/photo/voice/audio/document/
         # location update routes straight through the agent loop. No slash-
-        # command regexes — :class:`AgentLoop` no longer maintains a
-        # ``CommandRouter``; auto-compact and Dream handle session-level
-        # concerns without a UI affordance, and the LLM understands
-        # "забудь, давай заново" / "stop, не отвечай" in natural language.
+        # command regexes or command router; session-level concerns stay
+        # inside the runtime, and the LLM handles natural-language control
+        # requests as regular messages.
         self._app.add_handler(
             MessageHandler(
                 (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL | filters.LOCATION),
@@ -339,7 +337,7 @@ class TelegramChannel(BaseChannel):
 
         # Best-effort wipe of any commands previously registered with
         # BotFather / older versions of this code, so the in-app menu
-        # doesn't keep showing /new /stop /dream etc. Failure is fine —
+        # doesn't keep showing disabled runtime commands. Failure is fine —
         # the menu is cosmetic, the regex handlers were the actual
         # routing surface and they're already gone.
         try:

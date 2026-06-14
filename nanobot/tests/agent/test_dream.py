@@ -87,6 +87,15 @@ def test_dream_registers_injected_tool_installers(store, mock_provider) -> None:
     assert dream._tools.get("dream_memory_set").name == "dream_memory_set"
 
 
+def test_dream_without_installers_uses_standalone_tool_registry(store, mock_provider) -> None:
+    dream = Dream(store=store, provider=mock_provider, model="test-model")
+
+    assert dream._tools.get("read_file") is not None
+    assert dream._tools.get("edit_file") is not None
+    assert dream._tools.get("write_file") is not None
+    assert dream._tools.get("dream_memory_set") is None
+
+
 class TestDreamRun:
     async def test_noop_when_no_unprocessed_history(self, dream, mock_provider, mock_runner, store):
         """Dream should not call LLM when there's nothing to process."""

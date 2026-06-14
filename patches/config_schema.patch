@@ -2,13 +2,15 @@
 # upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
 
 diff --git a/nanobot/nanobot/config/schema.py b/nanobot/nanobot/config/schema.py
-index ac48619..2bf2792 100644
+index ac48619..0162994 100644
 --- a/nanobot/nanobot/config/schema.py
 +++ b/nanobot/nanobot/config/schema.py
-@@ -29,6 +29,15 @@ class ChannelsConfig(Base):
+@@ -28,7 +28,16 @@ class ChannelsConfig(Base):
+     send_progress: bool = True  # stream agent's text progress to the channel
      send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
      send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
-     transcription_provider: str = "groq"  # Voice transcription backend: "groq" or "openai"
+-    transcription_provider: str = "groq"  # Voice transcription backend: "groq" or "openai"
++    transcription_provider: str = "groq"  # Voice transcription backend: "groq", "openai", or "yandex"
 +    # Cap cumulative STT seconds per inbound turn (current message +
 +    # forwards + replied-to). Protects the user's STT quota when
 +    # someone forwards a long voice / replies to a long audio.
@@ -46,8 +48,8 @@ index ac48619..2bf2792 100644
 +    # Empty string falls back to "most recently active session on an enabled
 +    # channel" — appropriate for single-user installs but wrong for
 +    # multi-user setups, where heartbeat would otherwise hop to whoever
-+    # spoke last. Familia populates this from FAMILIA_OWNER_ACTOR when the
-+    # config leaves it blank.
++    # spoke last. Integrations may populate this from their owner actor
++    # configuration when the config leaves it blank.
 +    target_actor: str = ""
  
  

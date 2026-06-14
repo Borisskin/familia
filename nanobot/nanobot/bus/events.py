@@ -54,4 +54,3 @@ class CallbackEvent:
     timestamp: datetime = field(default_factory=datetime.now)
     actor: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-

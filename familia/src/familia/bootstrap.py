@@ -287,7 +287,7 @@ def install_tools(loop: Any) -> None:
             await _asyncio.sleep(24 * 60 * 60)
 
     try:
-        _asyncio.get_event_loop().create_task(_models_refresh_daemon())
+        _asyncio.get_running_loop().create_task(_models_refresh_daemon())
     except RuntimeError:
         # No running loop yet (called from a sync context). The CLI
         # path that spawns the gateway will set one up; this branch is
