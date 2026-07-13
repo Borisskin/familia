@@ -2,7 +2,7 @@
 # upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
 
 diff --git a/nanobot/nanobot/agent/context.py b/nanobot/nanobot/agent/context.py
-index f58baf0..cb9392a 100644
+index f58baf0..68ecd5a 100644
 --- a/nanobot/nanobot/agent/context.py
 +++ b/nanobot/nanobot/agent/context.py
 @@ -5,7 +5,7 @@ import mimetypes
@@ -10,11 +10,11 @@ index f58baf0..cb9392a 100644
  from importlib.resources import files as pkg_files
  from pathlib import Path
 -from typing import Any
-+from typing import Any, Protocol
++from typing import Any, Callable, Protocol
  
  from nanobot.agent.memory import MemoryStore
  from nanobot.agent.skills import SkillsLoader
-@@ -13,24 +13,57 @@ from nanobot.utils.helpers import build_assistant_message, current_time_str, det
+@@ -13,24 +13,59 @@ from nanobot.utils.helpers import build_assistant_message, current_time_str, det
  from nanobot.utils.prompt_templates import render_template
  
  
@@ -59,12 +59,14 @@ index f58baf0..cb9392a 100644
 +        timezone: str | None = None,
 +        disabled_skills: list[str] | None = None,
 +        context_extensions: list[ContextExtension] | None = None,
++        history_actor_validator: Callable[[str], bool] | None = None,
 +    ):
          self.workspace = workspace
          self.timezone = timezone
          self.memory = MemoryStore(workspace)
          self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 +        self.context_extensions = list(context_extensions or [])
++        self.history_actor_validator = history_actor_validator
  
      def build_system_prompt(
          self,
@@ -74,7 +76,7 @@ index f58baf0..cb9392a 100644
      ) -> str:
          """Build the system prompt from identity, bootstrap files, memory, and skills."""
          parts = [self._get_identity(channel=channel)]
-@@ -39,9 +72,26 @@ class ContextBuilder:
+@@ -39,9 +74,26 @@ class ContextBuilder:
          if bootstrap:
              parts.append(bootstrap)
  
@@ -104,7 +106,21 @@ index f58baf0..cb9392a 100644
  
          always_skills = self.skills.get_always_skills()
          if always_skills:
-@@ -62,6 +112,33 @@ class ContextBuilder:
+@@ -53,7 +105,12 @@ class ContextBuilder:
+         if skills_summary:
+             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
+ 
+-        entries = self.memory.read_unprocessed_history(since_cursor=self.memory.get_last_dream_cursor())
++        selection = self.memory.read_history_for_prompt(
++            since_cursor=self.memory.get_last_dream_cursor(),
++            actor=actor,
++            actor_validator=self.history_actor_validator,
++        )
++        entries = selection["entries"]
+         if entries:
+             capped = entries[-self._MAX_RECENT_HISTORY:]
+             parts.append("# Recent History\n\n" + "\n".join(
+@@ -62,6 +119,33 @@ class ContextBuilder:
  
          return "\n\n---\n\n".join(parts)
  
@@ -138,7 +154,7 @@ index f58baf0..cb9392a 100644
      def _get_identity(self, channel: str | None = None) -> str:
          """Get the core identity section."""
          workspace_path = str(self.workspace.expanduser().resolve())
-@@ -79,7 +156,7 @@ class ContextBuilder:
+@@ -79,7 +163,7 @@ class ContextBuilder:
      @staticmethod
      def _build_runtime_context(
          channel: str | None, chat_id: str | None, timezone: str | None = None,
@@ -147,7 +163,7 @@ index f58baf0..cb9392a 100644
      ) -> str:
          """Build untrusted runtime metadata block for injection before the user message."""
          lines = [f"Current Time: {current_time_str(timezone)}"]
-@@ -87,6 +164,9 @@ class ContextBuilder:
+@@ -87,6 +171,9 @@ class ContextBuilder:
              lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
          if session_summary:
              lines += ["", "[Resumed Session]", session_summary]
@@ -157,7 +173,7 @@ index f58baf0..cb9392a 100644
          return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines) + "\n" + ContextBuilder._RUNTIME_CONTEXT_END
  
      @staticmethod
-@@ -126,6 +206,39 @@ class ContextBuilder:
+@@ -126,6 +213,39 @@ class ContextBuilder:
              pass
          return False
  
@@ -197,7 +213,7 @@ index f58baf0..cb9392a 100644
      def build_messages(
          self,
          history: list[dict[str, Any]],
-@@ -136,9 +249,21 @@ class ContextBuilder:
+@@ -136,9 +256,21 @@ class ContextBuilder:
          chat_id: str | None = None,
          current_role: str = "user",
          session_summary: str | None = None,
@@ -220,7 +236,7 @@ index f58baf0..cb9392a 100644
          user_content = self._build_user_content(current_message, media)
  
          # Merge runtime context and user content into a single user message
-@@ -148,7 +273,12 @@ class ContextBuilder:
+@@ -148,7 +280,12 @@ class ContextBuilder:
          else:
              merged = [{"type": "text", "text": runtime_ctx}] + user_content
          messages = [

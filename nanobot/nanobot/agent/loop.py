@@ -190,6 +190,8 @@ class AgentLoop:
         tool_call_auditor: CallableABC[..., None] | None = None,
         cron_tool_options: dict[str, Any] | None = None,
         dream_tool_installers: list[CallableABC[[ToolRegistry, MemoryStore], None]] | None = None,
+        history_actor_validator: CallableABC[[str], bool] | None = None,
+        dream_turn_context: CallableABC[[], Any] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
@@ -239,6 +241,7 @@ class AgentLoop:
             timezone=timezone,
             disabled_skills=disabled_skills,
             context_extensions=context_extensions or [],
+            history_actor_validator=history_actor_validator,
         )
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
@@ -292,6 +295,7 @@ class AgentLoop:
             provider=provider,
             model=self.model,
             dream_tool_installers=self._dream_tool_installers,
+            dream_turn_context=dream_turn_context,
         )
         self._register_default_tools()
         if _tc.my.enable:

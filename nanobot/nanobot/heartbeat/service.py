@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Coroutine
+from typing import TYPE_CHECKING, Any, Callable, ContextManager, Coroutine
 
 from loguru import logger
 
@@ -61,6 +62,8 @@ class HeartbeatService:
         enabled: bool = True,
         timezone: str | None = None,
         source_reader: Callable[[], tuple[str | None, str | None]] | None = None,
+        target_actor: str | None = None,
+        execution_context: Callable[[], ContextManager[Any]] | None = None,
     ):
         self.workspace = workspace
         self.provider = provider
@@ -71,8 +74,37 @@ class HeartbeatService:
         self.enabled = enabled
         self.timezone = timezone
         self.source_reader = source_reader
+        reader_target = getattr(source_reader, "target_actor", None)
+        self.target_actor = (target_actor or reader_target or "").strip() or None
+        self.execution_context = execution_context or getattr(source_reader, "execution_context", None)
+        self._requires_explicit_actor = bool(
+            getattr(source_reader, "requires_explicit_actor", False)
+        )
+        self.last_error: str | None = None
         self._running = False
         self._task: asyncio.Task | None = None
+
+    def _execution_scope(self) -> ContextManager[Any]:
+        if self._requires_explicit_actor:
+            if not self.target_actor:
+                raise RuntimeError("heartbeat target actor is required")
+            if self.execution_context is None:
+                raise RuntimeError("heartbeat actor context hook is required")
+        if self.execution_context is None:
+            return nullcontext()
+        return self.execution_context()
+
+    async def _execute_tasks(self, tasks: str) -> str | None:
+        if not self.on_execute:
+            return None
+        try:
+            with self._execution_scope():
+                response = await self.on_execute(tasks)
+        except Exception as exc:
+            self.last_error = str(exc)
+            raise
+        self.last_error = None
+        return response
 
     @property
     def heartbeat_file(self) -> Path:
@@ -194,7 +226,7 @@ class HeartbeatService:
 
             logger.info("Heartbeat: tasks found, executing...")
             if self.on_execute:
-                response = await self.on_execute(tasks)
+                response = await self._execute_tasks(tasks)
 
                 if response:
                     should_notify = await evaluate_response(
@@ -216,4 +248,4 @@ class HeartbeatService:
         action, tasks = await self._decide(content)
         if action != "run" or not self.on_execute:
             return None
-        return await self.on_execute(tasks)
+        return await self._execute_tasks(tasks)

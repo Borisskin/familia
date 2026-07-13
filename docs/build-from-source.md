@@ -203,7 +203,7 @@ docker kill --signal=HUP familia-gateway
 Подробности: [`operations.md`](operations.md), раздел "Зеркала для ВМ с ограниченным исходящим доступом". Короткий список переменных окружения, которые читает `bootstrap.sh`:
 
 | Переменная окружения | Что переопределяет |
-|---|---|
+| --- | --- |
 | `APT_MIRROR` | `deb.debian.org` для apt внутри образа |
 | `PIP_INDEX_URL` | PyPI для `pip` / `uv` внутри образа |
 | `NPM_REGISTRY` | npm для сборки WhatsApp bridge |

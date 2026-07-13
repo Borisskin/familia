@@ -54,11 +54,11 @@ fi
 # Bypass: ``ALLOW_STALE_BACKEND_VERSION=1`` env var, for the rare
 # case where the change is genuinely no-op for the running gateway
 # (e.g. comment-only edits in nanobot/).
+backend_ver=$(grep -m1 -E '^version[[:space:]]*=' familia/pyproject.toml \
+              | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
 if [[ -z "${ALLOW_STALE_BACKEND_VERSION:-}" ]]; then
     BACKEND_PATHS=(nanobot familia/src familia/pyproject.toml memx \
                    Dockerfile docker-compose.yml admin/src-tauri/resources/bootstrap.sh)
-    backend_ver=$(grep -m1 -E '^version[[:space:]]*=' familia/pyproject.toml \
-                  | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
     # Most recent admin-release tag (vX.Y.Z) — skip the check on a
     # repo with no tags yet (first release).
     last_tag=$(git tag -l 'v*' --sort=-v:refname | head -1 || true)
@@ -92,12 +92,13 @@ echo "→ source-pack (embedded in .exe)"
 SRC_PACK_DIR="admin/src-tauri/resources"
 SRC_PACK="$SRC_PACK_DIR/familia-source.tar.gz"
 mkdir -p "$SRC_PACK_DIR"
-# build-source-pack writes ``familia-source-v<VER>.tar.gz`` to the
-# given output dir; we then rename to the fixed name include_bytes!
-# expects. tmp dir keeps the build-source-pack output predictable.
+# The archive content carries the independent backend version, while the
+# GitHub release asset below is named after the admin version because the
+# updater URL is derived from CARGO_PKG_VERSION. We first build the backend-
+# versioned archive, then embed it under the fixed include_bytes! filename.
 SRC_PACK_TMP=$(mktemp -d)
-bash bin/build-source-pack.sh "$VER" "$SRC_PACK_TMP"
-mv -f "$SRC_PACK_TMP/familia-source-v${VER}.tar.gz" "$SRC_PACK"
+bash bin/build-source-pack.sh "$backend_ver" "$SRC_PACK_TMP"
+mv -f "$SRC_PACK_TMP/familia-source-v${backend_ver}.tar.gz" "$SRC_PACK"
 rm -rf "$SRC_PACK_TMP"
 echo "  embedded: $SRC_PACK ($(du -h "$SRC_PACK" | cut -f1))"
 
@@ -149,7 +150,7 @@ echo "$DLL_SHA  WebView2Loader.dll" > "$DLL_OUT.sha256"
 # copy on failure. SHA must match what's baked into the .exe.
 SRC_PACK_VERSIONED="dist/admin/familia-source-v${VER}.tar.gz"
 cp -f "$SRC_PACK" "$SRC_PACK_VERSIONED"
-cp -f "$SRC_PACK.sha256" "$SRC_PACK_VERSIONED.sha256"
+echo "$SRC_PACK_SHA  $(basename "$SRC_PACK_VERSIONED")" > "$SRC_PACK_VERSIONED.sha256"
 
 echo "→ changelog"
 cat >> admin/CHANGELOG.md <<EOF

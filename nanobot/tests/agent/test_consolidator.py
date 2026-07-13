@@ -58,7 +58,7 @@ class TestConsolidatorSummarize:
         assert result is None  # no summary on raw dump fallback
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
-        assert "[RAW]" in entries[0]["content"]
+        assert entries[0]["content"].startswith("[RAW idempotency=")
 
     async def test_summarize_skips_empty_messages(self, consolidator):
         result = await consolidator.archive([])
@@ -85,7 +85,7 @@ class TestConsolidatorArchiveErrorHandling:
         assert result is None
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
-        assert "[RAW]" in entries[0]["content"]
+        assert entries[0]["content"].startswith("[RAW idempotency=")
         assert "Error:" not in entries[0]["content"]
 
     async def test_archive_preserves_summary_on_success(self, consolidator, mock_provider, store):
@@ -102,7 +102,7 @@ class TestConsolidatorArchiveErrorHandling:
         assert result == "User fixed a bug in the auth module."
         entries = store.read_unprocessed_history(since_cursor=0)
         assert len(entries) == 1
-        assert "[RAW]" not in entries[0]["content"]
+        assert not entries[0]["content"].startswith("[RAW")
 
 
 class TestConsolidatorTokenBudget:

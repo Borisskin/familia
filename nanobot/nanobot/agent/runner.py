@@ -640,6 +640,7 @@ class AgentRunner:
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
+        stop_after_error = False
         for batch in batches:
             if spec.concurrent_tools and len(batch) > 1:
                 tool_results.extend(await asyncio.gather(*(
@@ -648,7 +649,13 @@ class AgentRunner:
                 )))
             else:
                 for tool_call in batch:
-                    tool_results.append(await self._run_tool(spec, tool_call, external_lookup_counts))
+                    outcome = await self._run_tool(spec, tool_call, external_lookup_counts)
+                    tool_results.append(outcome)
+                    if spec.fail_on_tool_error and outcome[2] is not None:
+                        stop_after_error = True
+                        break
+            if stop_after_error:
+                break
 
         results: list[Any] = []
         events: list[dict[str, str]] = []
@@ -997,4 +1004,3 @@ class AgentRunner:
         if current:
             batches.append(current)
         return batches
-

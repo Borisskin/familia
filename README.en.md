@@ -124,7 +124,7 @@ into the wife's chat. By default, conversations don't leak.
 ## Who sees what
 
 | Who | Sees own chats | Sees spouse's chats | Sees child's chats |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Husband | ✓ | ✓ (if "spouse" link with wife) | ✓ (if guardian) |
 | Wife | ✓ | ✓ (if "spouse" link with husband) | ✓ (if guardian) |
 | Daughter | ✓ | — | ✓ (own only) |
@@ -199,7 +199,7 @@ About 5 minutes later the bot is replying in your family chat.
 ## How is this different from…
 
 | Alternative | What's missing |
-|---|---|
+| --- | --- |
 | A regular Telegram bot (Cleo and similar) | Doesn't separate memory between family members. Dad and son see the same answers. |
 | ChatGPT / Claude in a chat | Not tied to the family messenger. Cloud-hosted, conversations sit with OpenAI. |
 | Notes apps (Notion, Apple Notes, Google Keep) | Doesn't answer questions. Doesn't remember context. Doesn't reach out with reminders. |

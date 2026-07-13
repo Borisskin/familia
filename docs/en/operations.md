@@ -154,7 +154,7 @@ the message metadata in container logs.
 ## Common problems
 
 | Symptom | Likely cause |
-|---------|--------------|
+| --- | --- |
 | `unknown principal: telegram/12345` | Telegram chat not bound to a principal in `principals.json` |
 | Replies are generic, ignore your context | LLM key wrong / quota; `OPENAI_API_KEY` env not loaded into gateway |
 | `acl deny: scope=private:X:value:Y` | Cross-principal read without peer-edge — by design, see [`policy.md`](policy.md) |
@@ -176,7 +176,7 @@ The baked-in lists (intentionally short — one well-trusted mirror per
 region):
 
 | Resource | Auto-fallback chain |
-|----------|---------------------|
+| --- | --- |
 | PyPI | `pypi.tuna.tsinghua.edu.cn`, `mirrors.aliyun.com/pypi` |
 | Debian apt | `mirror.yandex.ru/debian`, `mirrors.tuna.tsinghua.edu.cn/debian` |
 | npm | `registry.npmmirror.com`, `mirrors.huaweicloud.com/repository/npm` |
@@ -188,7 +188,7 @@ mirror you'd rather use), set any of these env vars before bootstrap
 runs and they win unconditionally:
 
 | Env var | What it overrides | Example value |
-|---------|-------------------|---------------|
+| --- | --- | --- |
 | `APT_MIRROR` | `deb.debian.org` / `security.debian.org` inside the image | `https://mirror.yandex.ru/debian` |
 | `PIP_INDEX_URL` | PyPI index used by `pip` and `uv` inside the image | `https://pypi.tuna.tsinghua.edu.cn/simple` (or a self-hosted devpi) |
 | `NPM_REGISTRY` | npm registry used when building the WhatsApp bridge | `https://registry.npmmirror.com` |

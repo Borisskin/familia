@@ -20,6 +20,7 @@ Usage from the patched loop.py::
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from typing import Any
 
 from loguru import logger
@@ -81,6 +82,7 @@ def make_agent_loop_kwargs(workspace: Any) -> dict[str, Any]:
         "pending_inbound_handler": handle_pending_inbound,
         "direct_actor_resolver": make_direct_actor_resolver(),
         "current_actor_getter": get_current_actor,
+        "history_actor_validator": make_history_actor_validator(),
         "tool_call_auditor": audit.log_event,
         "cron_tool_options": {
             "to_validator": make_principal_chat_validator(),
@@ -89,6 +91,7 @@ def make_agent_loop_kwargs(workspace: Any) -> dict[str, Any]:
             "reachable_tags_getter": make_reachable_tags_getter(),
         },
         "dream_tool_installers": make_dream_tool_installers(),
+        "dream_turn_context": make_dream_turn_context(),
     }
 
 
@@ -104,6 +107,32 @@ def make_dream_tool_installers() -> list[Any]:
     from familia.nanobot_extension.cron import make_dream_tool_installers as _make
 
     return _make()
+
+
+def make_history_actor_validator() -> Any:
+    """Return the neutral validator used by actor-aware Recent History."""
+    from familia.principals import get_registry
+
+    def _is_known(actor: str) -> bool:
+        return bool(actor) and get_registry().get(actor) is not None
+
+    return _is_known
+
+
+def make_dream_turn_context() -> Any:
+    """Pin Dream's executor identity for one Phase 2 turn and restore it."""
+    from familia.tools.dream_memory import CONSOLIDATOR_ACTOR
+
+    @contextmanager
+    def _scope():
+        previous = get_current_actor()
+        set_current_actor(CONSOLIDATOR_ACTOR)
+        try:
+            yield
+        finally:
+            set_current_actor(previous)
+
+    return _scope
 
 
 def make_heartbeat_source_reader(target_actor: str | None) -> Any:

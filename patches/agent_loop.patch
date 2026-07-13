@@ -2,7 +2,7 @@
 # upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
 
 diff --git a/nanobot/nanobot/agent/loop.py b/nanobot/nanobot/agent/loop.py
-index 25af137..745972c 100644
+index 25af137..d5e2525 100644
 --- a/nanobot/nanobot/agent/loop.py
 +++ b/nanobot/nanobot/agent/loop.py
 @@ -7,6 +7,8 @@ import dataclasses
@@ -68,7 +68,7 @@ index 25af137..745972c 100644
          self._loop._set_tool_context(self._channel, self._chat_id, self._message_id)
  
      async def after_iteration(self, context: AgentHookContext) -> None:
-@@ -161,6 +178,18 @@ class AgentLoop:
+@@ -161,6 +178,20 @@ class AgentLoop:
          unified_session: bool = False,
          disabled_skills: list[str] | None = None,
          tools_config: ToolsConfig | None = None,
@@ -84,10 +84,12 @@ index 25af137..745972c 100644
 +        tool_call_auditor: CallableABC[..., None] | None = None,
 +        cron_tool_options: dict[str, Any] | None = None,
 +        dream_tool_installers: list[CallableABC[[ToolRegistry, MemoryStore], None]] | None = None,
++        history_actor_validator: CallableABC[[str], bool] | None = None,
++        dream_turn_context: CallableABC[[], Any] | None = None,
      ):
          from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
  
-@@ -193,8 +222,24 @@ class AgentLoop:
+@@ -193,8 +224,25 @@ class AgentLoop:
          self._start_time = time.time()
          self._last_usage: dict[str, int] = {}
          self._extra_hooks: list[AgentHook] = hooks or []
@@ -110,15 +112,17 @@ index 25af137..745972c 100644
 +            timezone=timezone,
 +            disabled_skills=disabled_skills,
 +            context_extensions=context_extensions or [],
++            history_actor_validator=history_actor_validator,
 +        )
          self.sessions = session_manager or SessionManager(workspace)
          self.tools = ToolRegistry()
          self.runner = AgentRunner(provider)
-@@ -246,14 +291,13 @@ class AgentLoop:
+@@ -246,14 +294,14 @@ class AgentLoop:
              store=self.context.memory,
              provider=provider,
              model=self.model,
 +            dream_tool_installers=self._dream_tool_installers,
++            dream_turn_context=dream_turn_context,
          )
          self._register_default_tools()
          if _tc.my.enable:
@@ -130,7 +134,7 @@ index 25af137..745972c 100644
  
      def _register_default_tools(self) -> None:
          """Register the default set of tools."""
-@@ -272,6 +316,27 @@ class AgentLoop:
+@@ -272,6 +320,27 @@ class AgentLoop:
              self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
          self.tools.register(NotebookEditTool(workspace=self.workspace, allowed_dir=allowed_dir))
          if self.exec_config.enable:
@@ -158,7 +162,7 @@ index 25af137..745972c 100644
              self.tools.register(
                  ExecTool(
                      working_dir=str(self.workspace),
-@@ -287,11 +352,26 @@ class AgentLoop:
+@@ -287,11 +356,26 @@ class AgentLoop:
                  WebSearchTool(config=self.web_config.search, proxy=self.web_config.proxy)
              )
              self.tools.register(WebFetchTool(proxy=self.web_config.proxy))
@@ -187,7 +191,7 @@ index 25af137..745972c 100644
              )
  
      async def _connect_mcp(self) -> None:
-@@ -321,7 +401,7 @@ class AgentLoop:
+@@ -321,7 +405,7 @@ class AgentLoop:
          # Compute the effective session key (accounts for unified sessions)
          # so that subagent results route to the correct pending queue.
          effective_key = UNIFIED_SESSION_KEY if self._unified_session else f"{channel}:{chat_id}"
@@ -196,7 +200,7 @@ index 25af137..745972c 100644
              if tool := self.tools.get(name):
                  if hasattr(tool, "set_context"):
                      if name == "spawn":
-@@ -345,36 +425,6 @@ class AgentLoop:
+@@ -345,36 +429,6 @@ class AgentLoop:
  
          return format_tool_hints(tool_calls)
  
@@ -233,7 +237,7 @@ index 25af137..745972c 100644
      def _effective_session_key(self, msg: InboundMessage) -> str:
          """Return the session key used for task routing and mid-turn injections."""
          if self._unified_session and not msg.session_key_override:
-@@ -506,26 +556,11 @@ class AgentLoop:
+@@ -506,26 +560,11 @@ class AgentLoop:
                  logger.warning("Error consuming inbound message: {}, continuing...", e)
                  continue
  
@@ -260,7 +264,7 @@ index 25af137..745972c 100644
                  pending_msg = msg
                  if effective_key != msg.session_key:
                      pending_msg = dataclasses.replace(
-@@ -604,12 +639,15 @@ class AgentLoop:
+@@ -604,12 +643,15 @@ class AgentLoop:
                              ))
                              stream_segment += 1
  
@@ -280,7 +284,7 @@ index 25af137..745972c 100644
                      elif msg.channel == "cli":
                          await self.bus.publish_outbound(OutboundMessage(
                              channel=msg.channel, chat_id=msg.chat_id,
-@@ -641,6 +679,15 @@ class AgentLoop:
+@@ -641,6 +683,15 @@ class AgentLoop:
                              exc_info=True,
                          )
                      raise
@@ -296,7 +300,7 @@ index 25af137..745972c 100644
                  except Exception:
                      logger.exception("Error processing message for session {}", session_key)
                      await self.bus.publish_outbound(OutboundMessage(
-@@ -690,6 +737,62 @@ class AgentLoop:
+@@ -690,6 +741,62 @@ class AgentLoop:
          self._running = False
          logger.info("Agent loop stopping")
  
@@ -359,7 +363,7 @@ index 25af137..745972c 100644
      async def _process_message(
          self,
          msg: InboundMessage,
-@@ -728,6 +831,8 @@ class AgentLoop:
+@@ -728,6 +835,8 @@ class AgentLoop:
              if is_subagent and self._persist_subagent_followup(session, msg):
                  self.sessions.save(session)
              self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
@@ -368,7 +372,7 @@ index 25af137..745972c 100644
              history = session.get_history(max_messages=0)
              current_role = "assistant" if is_subagent else "user"
  
-@@ -740,6 +845,7 @@ class AgentLoop:
+@@ -740,6 +849,7 @@ class AgentLoop:
                  chat_id=chat_id,
                  session_summary=pending,
                  current_role=current_role,
@@ -376,7 +380,7 @@ index 25af137..745972c 100644
              )
              final_content, _, all_msgs, _, _ = await self._run_agent_loop(
                  messages, session=session, channel=channel, chat_id=chat_id,
-@@ -755,6 +861,11 @@ class AgentLoop:
+@@ -755,6 +865,11 @@ class AgentLoop:
                  content=final_content or "Background task completed.",
              )
  
@@ -388,7 +392,7 @@ index 25af137..745972c 100644
          # Extract document text from media at the processing boundary so all
          # channels benefit without format-specific logic in ContextBuilder.
          if msg.media:
-@@ -773,18 +884,14 @@ class AgentLoop:
+@@ -773,18 +888,14 @@ class AgentLoop:
  
          session, pending = self.auto_compact.prepare_session(session, key)
  
@@ -409,7 +413,7 @@ index 25af137..745972c 100644
          if message_tool := self.tools.get("message"):
              if isinstance(message_tool, MessageTool):
                  message_tool.start_turn()
-@@ -798,6 +905,7 @@ class AgentLoop:
+@@ -798,6 +909,7 @@ class AgentLoop:
              media=msg.media if msg.media else None,
              channel=msg.channel,
              chat_id=msg.chat_id,
@@ -417,7 +421,7 @@ index 25af137..745972c 100644
          )
  
          async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
-@@ -814,16 +922,20 @@ class AgentLoop:
+@@ -814,16 +926,20 @@ class AgentLoop:
              )
  
          async def _on_retry_wait(content: str) -> None:
@@ -448,7 +452,7 @@ index 25af137..745972c 100644
  
          # Persist the triggering user message immediately, before running the
          # agent loop. If the process is killed mid-turn (OOM, SIGKILL, self-
-@@ -833,7 +945,11 @@ class AgentLoop:
+@@ -833,7 +949,11 @@ class AgentLoop:
          # makes recovery possible from the session log alone.
          user_persisted_early = False
          if isinstance(msg.content, str) and msg.content.strip():
@@ -461,7 +465,7 @@ index 25af137..745972c 100644
              self._mark_pending_user_turn(session)
              self.sessions.save(session)
              user_persisted_early = True
-@@ -1102,15 +1218,27 @@ class AgentLoop:
+@@ -1102,15 +1222,27 @@ class AgentLoop:
          channel: str = "cli",
          chat_id: str = "direct",
          media: list[str] | None = None,

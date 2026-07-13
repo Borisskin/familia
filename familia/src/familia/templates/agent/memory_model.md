@@ -15,20 +15,18 @@ adult with symmetric trust, child role excluded).
 
 ## Three scopes
 
-- **`private`** — by default, a record I write here is **readable by
-  the owner and by every peer-edge principal** (spouse, guardian).
-  Children with `guardian_of` edges do not get peer access — they only
-  see what their guardians explicitly share with them. Tag a private
-  record with **`secret`** to narrow it back to owner-only; peers see
-  neither the value nor the key name.
-- **`shared`** — visible to every family member. Use for facts that
-  concern the whole household (calendar, household rules). Per-record
-  tags can further narrow access via graph reachability.
-- **`pair:<other_id>`** — visible to exactly two named principals.
+- **`private`** — stored under its explicit owner and readable by that
+  owner's peer-edge principals by default. The `secret` tag narrows a
+  record back to owner-only without revealing its existence to peers.
+- **`shared`** — visible only where the family relationship policy allows.
+  Use for household facts such as calendars and shared rules. Tags may
+  narrow this scope but never bypass the relationship policy.
+- **`pair:<other_id>`** — uses the sorted underscore namespace from
+  origin/main and is visible to exactly two named principals.
   Use for joint records that don't belong in shared (a couple's
   vacation plan, a one-on-one agreement).
 
-## Reserved slots follow the same family-by-default rule
+## Reserved slots are private too
 
 Three keys in private scope are *reserved* — they hold per-principal
 core context:
@@ -38,27 +36,16 @@ core context:
   principal.
 - `value:heartbeat` — that principal's running watch/todo list.
 
-These slots are peer-readable by default, same as custom private
-keys: a spouse or guardian can fetch a peer's `value:memory` via
-`memory_get(scope='private', actor='<peer_id>', key='value:memory')`.
-To narrow a specific reserved record back to owner-only, the owner
-writes it with `tags=['secret']` — peers then see "no value stored".
+These slots follow the same private rules as custom keys: a peer-edge
+principal may fetch them unless the owner stored the record with `secret`.
+Non-peers and children excluded by peer policy remain denied.
 
 ## What I see across principals at the prompt level
 
-When a peer is connected to the current actor by an edge, I receive
-in my system prompt:
-
-- the peer's **`value:user_profile`** (their public family-facing
-  bio), if accessible to me;
-- an **index of names** of the peer's custom `private:` and `shared:`
-  keys (no values, just names), with secret-tagged entries omitted;
-- the peer's USER block, wrapped as untrusted metadata.
-
-To actually read a peer's value, I call
-`memory_get(scope='private', actor='<their_id>', key='<name>')`.
-The `secret` tag on a record makes that call return "no value stored"
-even though the record exists.
+Prompts may include values from `shared` under relationship policy, from
+an underscore `pair` containing the current actor, and permitted peer
+private context. Secret-tagged or otherwise denied lookups are
+indistinguishable from missing values.
 
 ## Writes
 
@@ -82,7 +69,7 @@ original wording stays understandable; only the time anchor changes.
 when said.
 
 | User wrote | Save as |
-|---|---|
+| --- | --- |
 | "ближайшие выходные" / "this weekend" | "17–18 мая 2026" |
 | "в эту субботу" / "next Saturday" | "23 мая 2026 (сб)" |
 | "завтра", "послезавтра" | "14 мая 2026", "15 мая 2026" |
@@ -94,7 +81,7 @@ when said.
 rules — they need a starting point, not expansion.
 
 | User wrote | Save as |
-|---|---|
+| --- | --- |
 | "каждые две недели" | "каждые две недели" *(unchanged)* |
 | "по понедельникам" | "по понедельникам" *(unchanged)* |
 | "раз в месяц" | "раз в месяц" *(unchanged)* |
@@ -116,25 +103,18 @@ clarifying question before saving — don't guess silently.
 
 ## How to answer common user questions
 
-- *"Can my partner see this?"* — Default yes for `private:` records
-  in my scope; no if I tag the record `secret` (or if it lives in a
-  reserved value:* slot). Explicitly confirm the choice when the user
-  cares.
-- *"Is this private?"* — "Private" here means *owner-readable by
-  default*. Peers in the family graph can read it unless tagged
-  `secret`. If the user wants real privacy, I add the `secret` tag.
-- *"What does the graph give me?"* — It defines who counts as family
-  and who is a peer. Peers see my non-secret private records by name
-  and value; non-peers see nothing of my private namespace.
+- *"Can my partner see this?"* — A peer-edge principal can read an
+  untagged private record. Add `secret` when it must remain owner-only.
+- *"Is this private?"* — It belongs to the named owner; peer visibility
+  depends on the family graph and the `secret` opt-out tag.
+- *"What does the graph give me?"* — It controls shared visibility and
+  peer-private access; it never adds a third member to `pair`.
 - *"What about children?"* — Children (role `child` + `guardian_of`
   edges) do not get peer access to a parent's private records. Adults
   see what their guardians shared explicitly via `shared:` or
   `pair:`.
-- *"Will my partner see my journal entries?"* — Yes, by default —
-  `value:memory` and the other reserved slots flow through the same
-  rule. Tag specific entries `secret` when writing, or write them to
-  a separate custom key with the `secret` tag, to keep them
-  owner-only.
+- *"Will my partner see my journal entries?"* — A peer may read an
+  untagged `value:memory`; use `secret` for an owner-only entry.
 
 Be honest. If asked about a specific record's visibility, say
 truthfully whether it has the `secret` tag, who can see it, and offer

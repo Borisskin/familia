@@ -95,7 +95,7 @@ moment of decision, but multi-thread writes can interleave). Common
 event types:
 
 | Event | When |
-|-------|------|
+| --- | --- |
 | `policy_decision` | every `allow` or `deny` from `policy.yaml` |
 | `tag_acl_decision` | a tag-write or tag-read goes through reachability |
 | `graph_edit` | `familia` CLI mutates a graph |

@@ -23,20 +23,41 @@ BASE_IMAGE="ghcr.io/astral-sh/uv:python3.12-bookworm-slim@sha256:e5b65587bce7de5
 
 OUT="familia/requirements.lock"
 
-echo "+ resolving deps via $BASE_IMAGE → $OUT"
-docker run --rm \
-  -v "$REPO_ROOT":/work -w /work \
-  --entrypoint /bin/sh \
-  "$BASE_IMAGE" \
-  -c '
-    set -e
-    # Compile the union of nanobot + familia direct deps. uv pip
-    # compile reads pyproject.toml [project] tables natively.
-    uv pip compile \
-        --generate-hashes \
-        --output-file '"$OUT"' \
-        nanobot/pyproject.toml familia/pyproject.toml
-  '
+compile_with_uv() {
+  local uv_bin="$1"
+  "$uv_bin" pip compile \
+      --python-version 3.12 \
+      --python-platform x86_64-manylinux_2_36 \
+      --generate-hashes \
+      --output-file "$OUT" \
+      nanobot/pyproject.toml familia/pyproject.toml
+}
+
+if [[ -n "${UV_BIN:-}" ]]; then
+  echo "+ resolving deps via $UV_BIN → $OUT"
+  compile_with_uv "$UV_BIN"
+elif command -v uv >/dev/null 2>&1; then
+  echo "+ resolving deps via local uv → $OUT"
+  compile_with_uv uv
+elif command -v docker >/dev/null 2>&1; then
+  echo "+ resolving deps via $BASE_IMAGE → $OUT"
+  docker run --rm \
+    -v "$REPO_ROOT":/work -w /work \
+    --entrypoint /bin/sh \
+    "$BASE_IMAGE" \
+    -c '
+      set -e
+      uv pip compile \
+          --python-version 3.12 \
+          --python-platform x86_64-manylinux_2_36 \
+          --generate-hashes \
+          --output-file '"$OUT"' \
+          nanobot/pyproject.toml familia/pyproject.toml
+    '
+else
+  echo "error: install uv, set UV_BIN, or install Docker to regenerate $OUT" >&2
+  exit 1
+fi
 
 echo "+ wrote $OUT ($(wc -l < "$OUT") lines)"
 echo "  commit alongside the pyproject change that triggered the regen."

@@ -116,7 +116,62 @@ class TestDreamRun:
         mock_runner.run.assert_called_once()
         spec = mock_runner.run.call_args[0][0]
         assert spec.max_iterations == 10
-        assert spec.fail_on_tool_error is False
+        assert spec.fail_on_tool_error is True
+
+    async def test_failed_required_write_keeps_cursor_and_history(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        store.append_history("private finding", actor="actor_a")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="[PRIVATE:actor_a] sensitive fact",
+        )
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{
+                "name": "dream_memory_set",
+                "status": "error",
+                "detail": "Error: updated:false",
+            }],
+        ))
+
+        result = await dream.run()
+
+        assert result is False
+        assert store.get_last_dream_cursor() == 0
+        assert len(store.read_unprocessed_history(since_cursor=0)) == 1
+
+    async def test_incomplete_scoped_plan_keeps_cursor(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        store.append_history("private finding", actor="actor_a")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="[PRIVATE:actor_a] sensitive fact",
+        )
+        mock_runner.run = AsyncMock(return_value=_make_run_result(tool_events=[]))
+
+        result = await dream.run()
+
+        assert result is False
+        assert store.get_last_dream_cursor() == 0
+
+    async def test_successful_scoped_batch_advances_cursor_once(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        store.append_history("private finding", actor="actor_a")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="[PRIVATE:actor_a] sensitive fact",
+        )
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{
+                "name": "dream_memory_set",
+                "status": "ok",
+                "detail": "Stored at private:actor_a:fact",
+            }],
+        ))
+
+        assert await dream.run() is True
+        assert store.get_last_dream_cursor() == 1
+        assert await dream.run() is False
+        assert store.get_last_dream_cursor() == 1
 
     async def test_advances_dream_cursor(self, dream, mock_provider, mock_runner, store):
         """Dream should advance the cursor after processing."""

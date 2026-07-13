@@ -7,6 +7,7 @@ from familia.policy.engine import (
     PolicyEngine,
     PolicyRule,
     get_engine,
+    is_explicit_deny,
     reload_engine,
 )
 from familia.policy.pending import (
@@ -34,6 +35,7 @@ __all__ = [
     "gate_outbound_send",
     "get_engine",
     "get_pending_store",
+    "is_explicit_deny",
     "reload_engine",
     "request_approval",
 ]

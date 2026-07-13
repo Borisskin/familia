@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerate patches/*.patch against the pinned nanobot 0.1.5.post2 baseline.
+# Regenerate the exact deterministic patch set against pinned nanobot.
 #
 # Usage:
 #   ./patches/regenerate.sh
@@ -25,11 +25,15 @@ fi
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-tmp_win="$(cd "$tmp" && pwd -W | tr '\\' '/')"
+if tmp_win="$(cd "$tmp" && pwd -W 2>/dev/null)"; then
+    tmp_win="$(printf '%s' "$tmp_win" | tr '\\' '/')"
+else
+    tmp_win="$tmp"
+fi
 
 mkdir -p "$tmp/up/raw" "$tmp/up/nanobot/nanobot" "$tmp/current/nanobot"
 git -c "safe.directory=$UPSTREAM_REPO" -C "$UPSTREAM_REPO" archive "$UPSTREAM" nanobot pyproject.toml README.md \
-    | tar -x -C "$tmp/up/raw"
+    | /usr/bin/tar -x -C "$tmp/up/raw"
 cp -a "$tmp/up/raw/nanobot/." "$tmp/up/nanobot/nanobot/"
 cp "$tmp/up/raw/pyproject.toml" "$tmp/up/nanobot/pyproject.toml"
 cp "$tmp/up/raw/README.md" "$tmp/up/nanobot/README.md"
@@ -38,7 +42,7 @@ cp -a nanobot/nanobot "$tmp/current/nanobot/"
 cp nanobot/pyproject.toml "$tmp/current/nanobot/pyproject.toml"
 cp nanobot/README.md "$tmp/current/nanobot/README.md"
 
-find patches -maxdepth 1 -type f -name '*.patch' -delete
+/usr/bin/find patches -maxdepth 1 -type f -name '*.patch' -delete
 
 patch_name_for() {
     local rel="$1"
@@ -92,10 +96,10 @@ emit_patch() {
 mapfile -t rels < <(
     {
         cd "$tmp/up/nanobot"
-        find . -type f | sed 's|^\./||'
+        /usr/bin/find . -type f | sed 's|^\./||'
         cd "$tmp/current/nanobot"
-        find . -type f | sed 's|^\./||'
-    } | grep -v '__pycache__' | sort -u
+        /usr/bin/find . -type f | sed 's|^\./||'
+    } | grep -v '__pycache__' | /usr/bin/sort -u
 )
 
 echo "-> regenerating patches against nanobot $UPSTREAM_VERSION ($UPSTREAM)"
@@ -109,5 +113,19 @@ for rel in "${rels[@]}"; do
     fi
     emit_patch "$rel"
 done
+
+python_repo="$REPO"
+python_upstream_repo="$UPSTREAM_REPO"
+if command -v cygpath >/dev/null 2>&1; then
+    python_repo="$(cygpath -w "$REPO")"
+    python_upstream_repo="$(cygpath -w "$UPSTREAM_REPO")"
+fi
+
+echo "-> proving exact path/blob/mode reconstruction and ownership closure"
+python patches/check_exact_reconstruction.py \
+    --repo "$python_repo" \
+    --upstream-repo "$python_upstream_repo" \
+    --upstream "$UPSTREAM" \
+    --version "$UPSTREAM_VERSION"
 
 echo "-> done. Review with: git diff -- patches/"

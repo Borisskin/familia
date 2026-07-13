@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://familia.invalid/schemas/memory-migration-1.0.0.json",
+  "title": "Familia RP-090 migration plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "migration_id",
+    "created_at",
+    "status",
+    "dry_run",
+    "source",
+    "target",
+    "actions",
+    "summary"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0.0" },
+    "migration_id": { "$ref": "#/$defs/sha256" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["planned", "blocked_needs_review"] },
+    "dry_run": { "const": true },
+    "source": { "$ref": "#/$defs/source" },
+    "target": { "$ref": "#/$defs/target" },
+    "actions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/action" }
+    },
+    "summary": { "$ref": "#/$defs/summary" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nullableString": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 2048
+    },
+    "nullableInteger": {
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
+    "dreamCursor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["observed", "sha256", "used_for_selection"],
+      "properties": {
+        "observed": { "type": ["string", "null"], "maxLength": 128 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "used_for_selection": { "const": false }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "snapshot_id",
+        "snapshot_schema_version",
+        "snapshot_format_version",
+        "contract_version",
+        "dream_cursor"
+      ],
+      "properties": {
+        "snapshot_id": { "$ref": "#/$defs/sha256" },
+        "snapshot_schema_version": { "const": "1.0.0" },
+        "snapshot_format_version": { "const": "1.0.0" },
+        "contract_version": { "const": "1.0.0" },
+        "dream_cursor": { "$ref": "#/$defs/dreamCursor" }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_id", "isolated"],
+      "properties": {
+        "target_id": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "isolated": { "const": true }
+      }
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action_id",
+        "phase",
+        "component",
+        "source_identity",
+        "source_sha256",
+        "source_bytes",
+        "source_order",
+        "actor",
+        "actor_order",
+        "cursor",
+        "destination",
+        "disposition",
+        "reason",
+        "writes"
+      ],
+      "properties": {
+        "action_id": { "$ref": "#/$defs/sha256" },
+        "phase": { "enum": ["phase_a", "phase_b"] },
+        "component": {
+          "enum": [
+            "user_profile",
+            "memory",
+            "heartbeat",
+            "history",
+            "legacy_pair_key",
+            "scheduler"
+          ]
+        },
+        "source_identity": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "source_sha256": { "$ref": "#/$defs/sha256" },
+        "source_bytes": { "type": "integer", "minimum": 0 },
+        "source_order": { "$ref": "#/$defs/nullableInteger" },
+        "actor": { "$ref": "#/$defs/nullableString" },
+        "actor_order": { "$ref": "#/$defs/nullableInteger" },
+        "cursor": { "$ref": "#/$defs/nullableInteger" },
+        "destination": { "$ref": "#/$defs/nullableString" },
+        "disposition": {
+          "enum": [
+            "write",
+            "skip",
+            "conflict",
+            "dirty_legacy",
+            "llm_required",
+            "quarantine_needs_review"
+          ]
+        },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "writes": { "type": "integer", "minimum": 0, "maximum": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "disposition": { "const": "write" } } },
+          "then": {
+            "properties": {
+              "writes": { "const": 1 },
+              "destination": { "type": "string", "minLength": 1 }
+            }
+          },
+          "else": { "properties": { "writes": { "const": 0 } } }
+        }
+      ]
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "write",
+        "skip",
+        "conflict",
+        "dirty_legacy",
+        "llm_required",
+        "quarantine_needs_review"
+      ],
+      "properties": {
+        "write": { "type": "integer", "minimum": 0 },
+        "skip": { "type": "integer", "minimum": 0 },
+        "conflict": { "type": "integer", "minimum": 0 },
+        "dirty_legacy": { "type": "integer", "minimum": 0 },
+        "llm_required": { "type": "integer", "minimum": 0 },
+        "quarantine_needs_review": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

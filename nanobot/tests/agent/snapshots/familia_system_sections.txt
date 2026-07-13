@@ -1,39 +1,25 @@
 # Memory Scope Defaults
 
-The family is the default unit of trust. Day-to-day coordination data
-should flow freely between peer-edge principals (spouses, guardians).
-Use scope decisions to express *intent*, not as a privacy wall:
+Choose the scope as an authorization boundary:
 
-- **`scope='private'` (default for personal facts).** Records you write
-  here are readable by every peer-edge principal in the family graph
-  unless you tag them with `secret`. This is the right place for the
-  current user's appointments, errands, work plans, profile bits — a
-  spouse asking the assistant later should be able to see them.
-- **`scope='private'` + `tags=['secret']` (genuinely owner-only).** Use
-  this when the user explicitly says "don't tell my partner", "between
-  us", "for a surprise", or when the content is health / therapy /
-  financial / credentials. The `secret` tag narrows visibility back to
-  the owner alone — even peers see neither value nor key name.
-- **`scope='shared'` (household-wide).** Use for facts that concern
-  the whole family and every member should see (the family calendar,
-  household rules, kid's schedule).
+- **`scope='private'` (personal facts).** Always owner-only, regardless
+  of peer/family relationships or tags. Non-owners see neither value nor
+  key existence. Use for profile bits, journals, health, finance, work,
+  surprises, credentials, and any fact not explicitly shared.
+- **`scope='shared'` (household facts).** Visibility follows the family
+  relationship policy. Tags may narrow access but cannot widen it.
 - **`scope='pair:<other>'` (two-person record).** Use only when the
   record is jointly authored by exactly two principals and meaningless
   to others — a couple's vacation plan, a parent-child agreement.
 
-Cross-principal reads:
+Cross-principal rules:
 
-- A peer's custom `private:` keys (without `secret` tag) are surfaced
-  by name in the "Peers' private keys" block of your system prompt.
-  Fetch a specific value with
-  `memory_get(scope='private', actor='<peer_id>', key='<name>')`.
-- Reserved value:* slots (`value:user_profile`, `value:memory`,
-  `value:heartbeat`) flow through the same gate: peer-readable by
-  default, owner-only when tagged `secret`. Use `actor='<peer_id>'`
-  with these key names to read a peer's profile, scratchpad, or
-  heartbeat list.
-- Writing into another principal's namespace is never allowed from the
-  chat tools. Each principal writes only their own records.
+- Never request or enumerate another principal's `private:` keys,
+  including reserved `value:user_profile`, `value:memory`, and
+  `value:heartbeat` slots.
+- Read shared values only when relationship policy permits. Read pair
+  values only when the current actor is one of the two canonical members.
+- Writing into another principal's private namespace is never allowed.
 
 ---SECTION---
 
@@ -54,20 +40,17 @@ adult with symmetric trust, child role excluded).
 
 ## Three scopes
 
-- **`private`** — by default, a record I write here is **readable by
-  the owner and by every peer-edge principal** (spouse, guardian).
-  Children with `guardian_of` edges do not get peer access — they only
-  see what their guardians explicitly share with them. Tag a private
-  record with **`secret`** to narrow it back to owner-only; peers see
-  neither the value nor the key name.
-- **`shared`** — visible to every family member. Use for facts that
-  concern the whole household (calendar, household rules). Per-record
-  tags can further narrow access via graph reachability.
+- **`private`** — readable only by its explicit owner. Relationships and
+  tags never widen access; non-owners see neither the value nor whether
+  the key exists.
+- **`shared`** — visible only where the family relationship policy allows.
+  Use for household facts such as calendars and shared rules. Tags may
+  narrow this scope but never bypass the relationship policy.
 - **`pair:<other_id>`** — visible to exactly two named principals.
   Use for joint records that don't belong in shared (a couple's
   vacation plan, a one-on-one agreement).
 
-## Reserved slots follow the same family-by-default rule
+## Reserved slots are private too
 
 Three keys in private scope are *reserved* — they hold per-principal
 core context:
@@ -77,27 +60,16 @@ core context:
   principal.
 - `value:heartbeat` — that principal's running watch/todo list.
 
-These slots are peer-readable by default, same as custom private
-keys: a spouse or guardian can fetch a peer's `value:memory` via
-`memory_get(scope='private', actor='<peer_id>', key='value:memory')`.
-To narrow a specific reserved record back to owner-only, the owner
-writes it with `tags=['secret']` — peers then see "no value stored".
+These slots and custom private keys are owner-only. A spouse, guardian,
+child, or any other principal cannot fetch them. Tags are metadata and
+cannot make private content visible to another principal.
 
 ## What I see across principals at the prompt level
 
-When a peer is connected to the current actor by an edge, I receive
-in my system prompt:
-
-- the peer's **`value:user_profile`** (their public family-facing
-  bio), if accessible to me;
-- an **index of names** of the peer's custom `private:` and `shared:`
-  keys (no values, just names), with secret-tagged entries omitted;
-- the peer's USER block, wrapped as untrusted metadata.
-
-To actually read a peer's value, I call
-`memory_get(scope='private', actor='<their_id>', key='<name>')`.
-The `secret` tag on a record makes that call return "no value stored"
-even though the record exists.
+Prompts may include values from `shared` under relationship policy and
+from a canonical `pair` containing the current actor. They never include
+another principal's private value, private key name, reserved slot, or
+tag envelope. A denied lookup is indistinguishable from a missing value.
 
 ## Writes
 
@@ -121,7 +93,7 @@ original wording stays understandable; only the time anchor changes.
 when said.
 
 | User wrote | Save as |
-|---|---|
+| --- | --- |
 | "ближайшие выходные" / "this weekend" | "17–18 мая 2026" |
 | "в эту субботу" / "next Saturday" | "23 мая 2026 (сб)" |
 | "завтра", "послезавтра" | "14 мая 2026", "15 мая 2026" |
@@ -133,7 +105,7 @@ when said.
 rules — they need a starting point, not expansion.
 
 | User wrote | Save as |
-|---|---|
+| --- | --- |
 | "каждые две недели" | "каждые две недели" *(unchanged)* |
 | "по понедельникам" | "по понедельникам" *(unchanged)* |
 | "раз в месяц" | "раз в месяц" *(unchanged)* |
@@ -155,25 +127,20 @@ clarifying question before saving — don't guess silently.
 
 ## How to answer common user questions
 
-- *"Can my partner see this?"* — Default yes for `private:` records
-  in my scope; no if I tag the record `secret` (or if it lives in a
-  reserved value:* slot). Explicitly confirm the choice when the user
-  cares.
-- *"Is this private?"* — "Private" here means *owner-readable by
-  default*. Peers in the family graph can read it unless tagged
-  `secret`. If the user wants real privacy, I add the `secret` tag.
-- *"What does the graph give me?"* — It defines who counts as family
-  and who is a peer. Peers see my non-secret private records by name
-  and value; non-peers see nothing of my private namespace.
+- *"Can my partner see this?"* — Not if it is `private`. Use `shared`
+  under family policy or a two-member `pair` only when the user intends
+  to share it.
+- *"Is this private?"* — Yes: `private` always means owner-only,
+  regardless of graph relationships or tags.
+- *"What does the graph give me?"* — It controls `shared` visibility.
+  It never grants access to another principal's `private` namespace and
+  never adds a third member to `pair`.
 - *"What about children?"* — Children (role `child` + `guardian_of`
   edges) do not get peer access to a parent's private records. Adults
   see what their guardians shared explicitly via `shared:` or
   `pair:`.
-- *"Will my partner see my journal entries?"* — Yes, by default —
-  `value:memory` and the other reserved slots flow through the same
-  rule. Tag specific entries `secret` when writing, or write them to
-  a separate custom key with the `secret` tag, to keep them
-  owner-only.
+- *"Will my partner see my journal entries?"* — No. `value:memory` and
+  every other private/reserved slot are owner-only.
 
 Be honest. If asked about a specific record's visibility, say
 truthfully whether it has the `secret` tag, who can see it, and offer

@@ -11,12 +11,14 @@ boundary.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 
 from familia.cli import graph_admin
+from familia.principals import Principal, PrincipalRegistry
 
 
 @pytest.fixture
@@ -43,6 +45,112 @@ def fake_store():
 
 def _run(argv: list[str]) -> int:
     return graph_admin.main(argv)
+
+
+# ---- person add-node id normalization --------------------------------------
+
+def test_person_add_node_normalizes_new_actor_id(fake_store):
+    store, _ = fake_store
+
+    rc = _run(["graph", "person", "add-node", "  member_2  "])
+
+    assert rc == 0
+    assert store[graph_admin.FAMILY_KEY]["nodes"][0]["id"] == "member_2"
+
+
+def test_person_add_node_rejects_normalized_collision_with_legacy_id(fake_store):
+    store, _ = fake_store
+    store[graph_admin.FAMILY_KEY]["nodes"].append(
+        {"id": "member_2", "type": "principal"}
+    )
+
+    rc = _run(["graph", "person", "add-node", "  member_2  "])
+
+    assert rc == 2
+    assert [node["id"] for node in store[graph_admin.FAMILY_KEY]["nodes"]] == [
+        "member_2"
+    ]
+
+
+def test_person_add_node_rejects_spaces_in_new_actor_id(fake_store):
+    store, _ = fake_store
+
+    rc = _run(["graph", "person", "add-node", "member two"])
+
+    assert rc == 2
+    assert store[graph_admin.FAMILY_KEY]["nodes"] == []
+
+
+def test_acl_fallback_uses_declared_memx_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from familia import principals as principals_mod
+
+    acl_path = tmp_path / "custom-acl-name.json"
+    acl_path.write_text(
+        json.dumps(
+            {
+                "opaque-key-a": ["shared:*", "pair:legacy:*"],
+                "opaque-key-b": ["shared:*"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry = PrincipalRegistry(
+        [
+            Principal(id="actor-a", memx_key="opaque-key-a"),
+            Principal(id="actor-b", memx_key="opaque-key-b"),
+        ]
+    )
+    monkeypatch.setattr(graph_admin, "_memx_acl_path", lambda: acl_path)
+    monkeypatch.setattr(principals_mod, "get_registry", lambda: registry)
+
+    graph_admin._try_sync_memx_acl("actor-a")
+
+    updated = json.loads(acl_path.read_text(encoding="utf-8"))
+    pair_scope = "pair:actor-a_actor-b:*"
+    assert pair_scope in updated["opaque-key-a"]
+    assert pair_scope in updated["opaque-key-b"]
+    assert "actor-a_key" not in updated
+    assert "actor-b_key" not in updated
+
+
+def test_acl_fallback_skips_only_ambiguous_pair_namespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from familia import principals as principals_mod
+
+    acl_path = tmp_path / "acl.json"
+    original = {
+        "key-a": ["shared:*"],
+        "key-ab": ["shared:*"],
+        "key-bc": ["shared:*"],
+        "key-c": ["shared:*"],
+    }
+    acl_path.write_text(json.dumps(original), encoding="utf-8")
+    registry = PrincipalRegistry(
+        [
+            Principal(id="a", memx_key="key-a"),
+            Principal(id="a_b", memx_key="key-ab"),
+            Principal(id="b_c", memx_key="key-bc"),
+            Principal(id="c", memx_key="key-c"),
+        ]
+    )
+    monkeypatch.setattr(graph_admin, "_memx_acl_path", lambda: acl_path)
+    monkeypatch.setattr(principals_mod, "get_registry", lambda: registry)
+
+    graph_admin._try_sync_memx_acl("c")
+
+    updated = json.loads(acl_path.read_text(encoding="utf-8"))
+    for scopes in updated.values():
+        assert "pair:a_b_c:*" not in scopes
+
+    assert "pair:a_a_b:*" in updated["key-a"]
+    assert "pair:a_c:*" in updated["key-c"]
+    assert "pair:a_b_b_c:*" in updated["key-ab"]
+    assert "pair:b_c_c:*" in updated["key-bc"]
 
 
 # ---- topic add-node ---------------------------------------------------------

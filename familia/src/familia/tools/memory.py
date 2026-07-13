@@ -33,8 +33,13 @@ from familia.acl.graph_io import resolve_admin_key
 from familia.acl.peers import is_peer
 from familia.acl.reachable import reachable_tag_ids
 from familia.memx_client import memx_base_url
-from familia.policy import Decision, PolicyContext, get_engine
-from familia.principals import get_current_actor, get_registry
+from familia.policy import Decision, PolicyContext, get_engine, is_explicit_deny
+from familia.principals import (
+    ambiguous_pair_namespaces,
+    get_current_actor,
+    get_registry,
+    pair_namespace_token,
+)
 from familia.roles import get_effective_roles
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
@@ -253,25 +258,40 @@ def _resolve_full_key(
         if raw == actor_id:
             return None, "Error: pair scope must name a different principal"
         reg = get_registry()
+        if reg.get(actor_id) is None:
+            return None, f"Error: unknown current principal '{actor_id}' for pair scope"
         other: str | None = None
         if reg.get(raw) is not None:
             other = raw
         else:
             # Maybe already-canonical "pair:<a>_<b>" — find the matching peer.
+            matches: list[str] = []
             for pid in reg.ids:
                 if pid == actor_id:
                     continue
-                a, b = sorted([actor_id, pid])
-                if f"{a}_{b}" == raw:
-                    other = pid
-                    break
+                if pair_namespace_token(actor_id, pid) == raw:
+                    matches.append(pid)
+            if len(matches) == 1:
+                other = matches[0]
+            elif len(matches) > 1:
+                return None, f"Error: ambiguous pair scope: '{raw}'"
         if other is None:
             return None, (
                 f"Error: unknown principal in pair scope: '{raw}'. "
                 "Use 'pair:<other_id>'."
             )
-        a, b = sorted([actor_id, other])
-        return f"pair:{a}_{b}:{key}", None
+        if not is_peer(actor_id, other):
+            return None, (
+                "Error: pair scope requires an allowed peer relationship "
+                f"between '{actor_id}' and '{other}'"
+            )
+        pair_token = pair_namespace_token(actor_id, other)
+        if pair_token in ambiguous_pair_namespaces(reg.ids):
+            return None, (
+                f"Error: ambiguous pair namespace 'pair:{pair_token}' is shared "
+                "by multiple actor pairs"
+            )
+        return f"pair:{pair_token}:{key}", None
     return None, (
         f"Error: unknown scope '{scope}'. Use 'shared', 'private', or 'pair:<other_id>'."
     )
@@ -403,10 +423,16 @@ class MemoryGetTool(Tool):
                 peer_id=target_actor,
                 full_key=full_key,
             )
+        # Pair access has already passed the exact registry + graph gate in
+        # _resolve_full_key. Evaluate policy for audit and explicit operator
+        # denies; tolerate only the unmatched fallback from older deployed
+        # policies that predate a pair:* coarse-allow rule.
         decision = get_engine().evaluate(
             PolicyContext(action="memory.read", actor=actor_id, to_chat=full_key)
         )
-        if decision.decision is Decision.DENY:
+        if decision.decision is Decision.DENY and (
+            not full_key.startswith("pair:") or is_explicit_deny(decision)
+        ):
             reason = decision.reason or "policy denied"
             return f"Policy denied memory.read на '{full_key}': {reason}"
         try:
@@ -671,10 +697,33 @@ class MemorySetTool(Tool):
                 f"limit is {_MAX_VALUE_BYTES} bytes. Split into multiple "
                 "keys or summarize."
             )
+        index_update: dict[str, Any] | None = None
+        if not _is_reserved_value_key(key):
+            index_suffix: str | None = None
+            index_limit = _PRIVATE_INDEX_MAX_ENTRIES
+            if scope == "shared":
+                index_suffix = "value:shared_index"
+                index_limit = _SHARED_INDEX_MAX_ENTRIES
+            elif scope == "private":
+                index_suffix = "value:private_index"
+            if index_suffix is not None:
+                index_update = {
+                    "key": f"private:{actor_id}:{index_suffix}",
+                    "entry": {
+                        "name": key,
+                        "tags": sorted(tag_set) if tag_set else [],
+                    },
+                    "max_entries": index_limit,
+                }
+        # _resolve_full_key already applied the exact registry + peer-edge
+        # gate for pair routes. Evaluate policy for audit and explicit denies;
+        # tolerate only an unmatched fallback from a legacy policy.
         decision = get_engine().evaluate(
             PolicyContext(action="memory.write", actor=actor_id, to_chat=full_key)
         )
-        if decision.decision is Decision.DENY:
+        if decision.decision is Decision.DENY and (
+            not full_key.startswith("pair:") or is_explicit_deny(decision)
+        ):
             reason = decision.reason or "policy denied"
             return f"Policy denied memory.write на '{full_key}': {reason}"
         try:
@@ -682,62 +731,42 @@ class MemorySetTool(Tool):
                 r = await client.post(
                     f"{self._base_url_override or memx_base_url()}/set",
                     headers={"x-api-key": api_key},
-                    json={"key": full_key, "value": stored_value},
+                    json={
+                        "key": full_key,
+                        "value": stored_value,
+                        "index_update": index_update,
+                    },
                 )
         except httpx.HTTPError as exc:
             return f"Error: memX unreachable ({type(exc).__name__}: {exc})"
         if r.status_code == 403:
-            return f"Error: access denied by memX ACL for key '{full_key}'"
+            return "denied_invalid: memX ACL rejected the write"
         if r.status_code >= 400:
-            return f"Error: memX {r.status_code}: {r.text[:200]}"
-        # On a successful write to ``shared:<key>``, append <key> to the
-        # actor's personal key-index so the LLM rediscovers what it
-        # stashed across channel switches. Best-effort: a failure here
-        # doesn't roll back the write — worst case the index lacks one
-        # entry, which the LLM can re-add next turn.
-        # Two parallel indexes:
-        #   * shared writes  → private:<actor>:value:shared_index
-        #   * private writes → private:<actor>:value:private_index
-        # In both cases the index itself lives in private scope so peers
-        # can't enumerate what this actor wrote.
-        # Skip indexing the four reserved ``value:*`` keys — those are
-        # auto-loaded into the system prompt directly (or are the index
-        # itself), so listing them under "custom keys" is noise that
-        # also creates a write-loop risk for ``value:*_index``.
-        if not _is_reserved_value_key(key):
-            if scope == "shared":
-                # Pass tags so the cross-principal peer-index surface
-                # (context.py) can hide entries whose tags don't
-                # intersect with the viewing actor's reachable set.
-                # Without this filter, names like "secret_journal"
-                # would leak to every family member who has any edge
-                # in the family graph, even when tag-ACL would deny
-                # the actual read.
-                await _append_to_index(
-                    actor_id=actor_id,
-                    api_key=api_key,
-                    base_url=self._base_url_override or memx_base_url(),
-                    index_suffix="value:shared_index",
-                    written_key=key,
-                    tags=sorted(tag_set) if tag_set else [],
-                )
-            elif scope == "private":
-                # Private index isn't surfaced cross-principal at the
-                # same fidelity (peer-edge gating is the only check
-                # there — children/non-peers see nothing). Tag-list
-                # carried for symmetry; no consumer reads it today.
-                await _append_to_index(
-                    actor_id=actor_id,
-                    api_key=api_key,
-                    base_url=self._base_url_override or memx_base_url(),
-                    index_suffix="value:private_index",
-                    written_key=key,
-                    tags=sorted(tag_set) if tag_set else [],
-                )
+            return f"error: memX transport status {r.status_code}: {r.text[:200]}"
+        try:
+            payload = r.json()
+        except (TypeError, ValueError):
+            return "error: memX returned a non-JSON semantic result"
+        if not isinstance(payload, dict):
+            return "error: memX returned a non-object semantic result"
+        status = payload.get("status")
+        if (
+            status == "committed"
+            and payload.get("committed") is True
+            and payload.get("updated") is True
+            and payload.get("retryable") is False
+        ):
+            pass
+        elif status == "denied_invalid":
+            return "denied_invalid: memX rejected the mutation"
+        elif payload.get("retryable") is True or status == "not_updated":
+            return f"retryable_failure: memX semantic state '{status or 'unknown'}'"
+        else:
+            return f"error: memX returned inconsistent semantic state '{status}'"
         if tag_set:
             tag_str = ", ".join(sorted(tag_set))
-            return f"Stored at '{full_key}' (теги: {tag_str})"
-        return f"Stored at '{full_key}'"
+            return f"committed: Stored at '{full_key}' (теги: {tag_str})"
+        return f"committed: Stored at '{full_key}'"
 
 
 # Maximum number of entries we keep in each per-actor key-index.
@@ -776,78 +805,7 @@ async def _append_to_index(
     written_key: str,
     tags: list[str] | None = None,
 ) -> None:
-    """Append ``written_key`` to ``private:<actor_id>:<index_suffix>``.
-
-    Two encodings are accepted on read for backward compatibility:
-
-    * legacy: ``["a", "b", ...]`` — bare key names, no tag info.
-    * current: ``[{"name": "a", "tags": ["x", "y"]}, ...]`` — name +
-      its record's tag list at write-time. Used by the cross-principal
-      peer-index surface so the context builder can hide entries whose
-      tags don't intersect with the viewing actor's reachable tag-set
-      ("don't surface a name we wouldn't let them read").
-
-    Writes always emit the dict form. ``tags=None`` becomes ``[]`` —
-    legacy behaviour: no tag-filter on the surface side.
-
-    Idempotent on ``written_key`` (existing entries are removed and
-    re-appended at the tail so MRU eviction keeps the freshest set).
-    Best-effort: GET/POST failures are logged at WARNING and swallowed.
-    """
-    index_full = f"private:{actor_id}:{index_suffix}"
-    tag_list = sorted({t for t in (tags or []) if isinstance(t, str) and t})
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            existing = await client.get(
-                f"{base_url}/get",
-                headers={"x-api-key": api_key},
-                params={"key": index_full},
-            )
-            entries: list[dict[str, Any]] = []
-            if existing.status_code == 200:
-                try:
-                    payload = existing.json()
-                except ValueError:
-                    payload = None
-                value = (
-                    payload.get("value")
-                    if isinstance(payload, dict)
-                    else payload
-                )
-                if isinstance(value, str) and value:
-                    try:
-                        decoded = json.loads(value)
-                    except json.JSONDecodeError:
-                        # Legacy / corrupted — start fresh; old content
-                        # will be lost but that's strictly better than
-                        # propagating bad JSON forward.
-                        decoded = []
-                    if isinstance(decoded, list):
-                        for item in decoded:
-                            if isinstance(item, str) and item:
-                                entries.append({"name": item, "tags": []})
-                            elif isinstance(item, dict) and isinstance(item.get("name"), str):
-                                entries.append({
-                                    "name": item["name"],
-                                    "tags": [
-                                        t for t in (item.get("tags") or [])
-                                        if isinstance(t, str) and t
-                                    ],
-                                })
-            # Drop any prior entry with the same name (MRU re-append).
-            entries = [e for e in entries if e.get("name") != written_key]
-            entries.append({"name": written_key, "tags": tag_list})
-            if len(entries) > _SHARED_INDEX_MAX_ENTRIES:
-                entries = entries[-_SHARED_INDEX_MAX_ENTRIES:]
-            new_value = json.dumps(entries, ensure_ascii=False)
-            await client.post(
-                f"{base_url}/set",
-                headers={"x-api-key": api_key},
-                json={"key": index_full, "value": new_value},
-            )
-    except httpx.HTTPError as exc:
-        from loguru import logger
-        logger.warning(
-            "key index update failed for {} ({}): {}",
-            actor_id, index_suffix, exc,
-        )
+    """Legacy API intentionally disabled: index mutation must be atomic."""
+    raise RuntimeError(
+        "deprecated non-atomic index mutation; use memX set(index_update=...)"
+    )

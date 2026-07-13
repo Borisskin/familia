@@ -92,12 +92,12 @@ class CronService:
 
     def _load_jobs(self) -> tuple[list[CronJob], int]:
         jobs = []
-        version = 1
+        version = CronStore().version
         if self.store_path.exists():
             try:
                 data = json.loads(self.store_path.read_text(encoding="utf-8"))
                 jobs = []
-                version = data.get("version", 1)
+                version = max(data.get("version", 1), CronStore().version)
                 for j in data.get("jobs", []):
                     jobs.append(CronJob(
                         id=j["id"],
@@ -118,6 +118,10 @@ class CronService:
                             to=j["payload"].get("to"),
                             created_by=j["payload"].get("createdBy"),
                             tags=list(j["payload"].get("tags") or []),
+                            creator_actor=j["payload"].get(
+                                "creatorActor", j["payload"].get("createdBy")
+                            ),
+                            target_actor=j["payload"].get("targetActor"),
                         ),
                         state=CronJobState(
                             next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
@@ -221,6 +225,8 @@ class CronService:
                         "to": j.payload.to,
                         "createdBy": j.payload.created_by,
                         "tags": list(j.payload.tags or []),
+                        "creatorActor": j.payload.creator_actor,
+                        "targetActor": j.payload.target_actor,
                     },
                     "state": {
                         "nextRunAtMs": j.state.next_run_at_ms,
@@ -392,6 +398,8 @@ class CronService:
         delete_after_run: bool = False,
         created_by: str | None = None,
         tags: list[str] | None = None,
+        creator_actor: str | None = None,
+        target_actor: str | None = None,
     ) -> CronJob:
         """Add a new job (idempotent on full delivery payload).
 
@@ -405,6 +413,8 @@ class CronService:
         """
         _validate_schedule_for_add(schedule)
         now = _now_ms()
+        effective_creator_actor = creator_actor if creator_actor is not None else created_by
+        legacy_created_by = created_by if created_by is not None else effective_creator_actor
 
         store = self._load_store() if self._running else None
         if store is not None:
@@ -421,8 +431,10 @@ class CronService:
                 channel or "",
                 to or "",
                 delete_after_run,
-                created_by or "",
+                legacy_created_by or "",
                 tuple(sorted(tags or [])),
+                effective_creator_actor or "",
+                target_actor or "",
             )
             for existing in store.jobs:
                 if not existing.enabled:
@@ -444,6 +456,8 @@ class CronService:
                     existing.delete_after_run,
                     ep.created_by or "",
                     tuple(sorted(ep.tags or [])),
+                    ep.creator_actor or "",
+                    ep.target_actor or "",
                 )
                 if existing_sig == payload_sig:
                     logger.info(
@@ -464,8 +478,10 @@ class CronService:
                 deliver=deliver,
                 channel=channel,
                 to=to,
-                created_by=created_by,
+                created_by=legacy_created_by,
                 tags=list(tags or []),
+                creator_actor=effective_creator_actor,
+                target_actor=target_actor,
             ),
             state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
             created_at_ms=now,

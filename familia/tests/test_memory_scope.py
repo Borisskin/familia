@@ -16,6 +16,7 @@ import pytest
 
 from familia import principals as principals_mod
 from familia.principals import Identity, Principal, PrincipalRegistry
+from familia.tools import memory as memory_mod
 from familia.tools.memory import _resolve_full_key
 
 
@@ -32,6 +33,7 @@ def registry(monkeypatch: pytest.MonkeyPatch) -> PrincipalRegistry:
                   memx_key="k3", roles=[]),
     ])
     monkeypatch.setattr(principals_mod, "_registry", reg)
+    monkeypatch.setattr(memory_mod, "is_peer", lambda _a, _b: True)
     return reg
 
 
@@ -98,6 +100,23 @@ def test_pair_random_underscored_string_rejected(registry):
     _, err = _resolve_full_key("pair:a_b_c", "x", "member_a")
     assert err is not None
     assert "unknown principal" in err.lower()
+
+
+def test_actual_pair_namespace_collision_is_rejected(monkeypatch):
+    reg = PrincipalRegistry([
+        Principal(id="a", memx_key="ka"),
+        Principal(id="a_b", memx_key="kab"),
+        Principal(id="b_c", memx_key="kbc"),
+        Principal(id="c", memx_key="kc"),
+    ])
+    monkeypatch.setattr(principals_mod, "_registry", reg)
+    monkeypatch.setattr("familia.tools.memory.is_peer", lambda _a, _b: True)
+
+    full, err = _resolve_full_key("pair:b_c", "x", "a")
+
+    assert full is None
+    assert err is not None
+    assert "ambiguous pair namespace" in err.lower()
 
 
 def test_pair_empty_other_rejected(registry):

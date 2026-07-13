@@ -37,6 +37,10 @@ class CronPayload:
     # intersection with that reachable set, in addition to the legacy
     # creator/addressee match.
     tags: list[str] = field(default_factory=list)
+    # Neutral multi-principal identity fields. Standalone nanobot leaves them
+    # unset; product adapters may require them and fail closed when absent.
+    creator_actor: str | None = None
+    target_actor: str | None = None
 
 
 @dataclass
@@ -87,5 +91,5 @@ class CronJob:
 @dataclass
 class CronStore:
     """Persistent store for cron jobs."""
-    version: int = 1
+    version: int = 2
     jobs: list[CronJob] = field(default_factory=list)

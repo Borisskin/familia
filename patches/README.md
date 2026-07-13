@@ -28,7 +28,7 @@ UPSTREAM_VERSION=0.1.5.post2 \
 bash patches/regenerate.sh
 ```
 
-Validate metadata and patch headers:
+Validate metadata, applicability, ownership closure, and exact reconstruction:
 
 ```bash
 bash patches/validate_baseline.sh
@@ -37,8 +37,17 @@ bash patches/validate_baseline.sh
 ## Scope
 
 Patch files are generated for runtime nanobot package deltas and
-`nanobot/pyproject.toml`. They are an upgrade/audit aid, not an instruction
-to blindly apply every hunk.
+`nanobot/pyproject.toml`; `nanobot/README.md` is also inside the declared
+comparison scope and currently matches the pinned baseline. The checker proves
+that the sorted patch set reconstructs the current non-ignored worktree scope
+with the exact path set, blob bytes, and Git modes. Patch applicability alone is
+reported separately and is not accepted as equality.
+
+`ownership.yaml` is JSON-compatible YAML with one row per current delta path.
+Every patch hunk has a category (`familia-invariant`, `upstream-alignment`,
+`generated-noise`, or `unknown`) and an explicit release decision owner. The
+checker rejects missing/stale paths, missing hunk coverage, filename drift, and
+direct imports of Familia from nanobot core.
 
 Phase 10 must still do hunk-by-hunk review:
 
@@ -50,9 +59,14 @@ Phase 10 must still do hunk-by-hunk review:
 ## Notable baseline deltas
 
 | Patch area | Meaning against `0.1.5.post2` |
-|------------|--------------------------------|
+| --- | --- |
 | `command___init__.patch` | Disables package-level slash-command re-exports while keeping upstream command implementation modules physically present. |
 | `runtime_adapters.patch` | Current familia tree adds neutral runtime adapter discovery for optional product wiring. |
 | `agent_outbound.patch`, `channels_inbound.patch`, `bus_callbacks.patch` | Current familia tree adds neutral extension point modules that are absent in upstream `0.1.5.post2`. |
 | `agent_context.patch`, `agent_loop.patch`, `agent_memory.patch`, `agent_tools_message.patch`, `channels_base.patch`, `cli_commands.patch` | Core behavioral deltas that need Phase 10 hunk-by-hunk audit. |
 | `pyproject.patch` | Fork/version/dependency delta against upstream `0.1.5.post2`; audit before changing package metadata. |
+
+`command_builtin.patch` records the known one-blank-line normalization in
+`nanobot/nanobot/command/builtin.py`. Its hunk is explicitly categorized as
+generated noise in `ownership.yaml`; keeping the deterministic patch avoids the
+former contradiction where regeneration produced an uncommitted extra file.

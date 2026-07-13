@@ -2,7 +2,7 @@
 # upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
 
 diff --git a/nanobot/pyproject.toml b/nanobot/pyproject.toml
-index 1e4ca97..bc7c847 100644
+index 1e4ca97..be0f5fd 100644
 --- a/nanobot/pyproject.toml
 +++ b/nanobot/pyproject.toml
 @@ -118,6 +118,13 @@ include = [

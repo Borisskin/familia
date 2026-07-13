@@ -12,7 +12,7 @@ nanobot agent loop.
 The thin layer that turns nanobot from a single-user agent into a
 multi-principal one.
 
-```
+```list
 familia/src/familia/
   identity_resolver.py   binds inbound messages to principal_id
   principals.py          loads/validates principals.json
@@ -76,7 +76,7 @@ in the system — see [`security.md`](security.md).
 Two storage planes that intentionally don't mix:
 
 | Plane | Purpose | Keyed by |
-|-------|---------|----------|
+| --- | --- | --- |
 | **Hybrid memX** (per principal) | identity-bound facts: USER profile, MEMORY entries, HEARTBEAT | `principal_id` |
 | **Shared files** (workspace) | bot's persona / tool docs / agent docs | none — single shared truth |
 

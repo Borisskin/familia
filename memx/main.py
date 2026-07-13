@@ -1,7 +1,13 @@
 from fastapi import FastAPI, WebSocket, Request, HTTPException
-from store import get_value, set_value
+from store import CorruptRecordError, get_value, set_value
 from pubsub import subscribe, publish
-from schema import register_schema, validate_schema, get_schema, delete_schema
+from schema import (
+    CorruptSchemaError,
+    delete_schema,
+    get_schema,
+    register_schema,
+    validate_schema,
+)
 import asyncio
 import jsonschema
 import validate_api
@@ -12,7 +18,18 @@ app = FastAPI()
 async def get(key: str, request: Request):
     await validate_api.validate_api_key(request, key, action="read")
     namespaced_key = getattr(request.state, "namespaced_key", key)
-    return get_value(namespaced_key)
+    try:
+        return get_value(namespaced_key)
+    except CorruptRecordError as exc:
+        raise HTTPException(
+            409,
+            detail={
+                "status": "corruption_needs_repair",
+                "committed": False,
+                "retryable": False,
+                "message": str(exc),
+            },
+        ) from exc
 
 @app.post("/set")
 async def set(request: Request):
@@ -27,16 +44,50 @@ async def set(request: Request):
         validate_schema(namespaced_key, value)
     except jsonschema.exceptions.ValidationError as e:
         raise HTTPException(400, detail=str(e))
+    except CorruptSchemaError as exc:
+        raise HTTPException(
+            409,
+            detail={
+                "status": "corruption_needs_repair",
+                "committed": False,
+                "retryable": False,
+                "message": str(exc),
+            },
+        ) from exc
 
-    updated = set_value(namespaced_key, value)
-    if updated:
+    try:
+        set_kwargs = {"index_update": body.get("index_update")}
+        if "expected_ts" in body:
+            set_kwargs["expected_ts"] = body["expected_ts"]
+        result = set_value(namespaced_key, value, **set_kwargs)
+    except ValueError as exc:
+        raise HTTPException(
+            400,
+            detail={
+                "status": "denied_invalid",
+                "committed": False,
+                "retryable": False,
+                "message": str(exc),
+            },
+        ) from exc
+    except CorruptRecordError as exc:
+        raise HTTPException(
+            409,
+            detail={
+                "status": "corruption_needs_repair",
+                "committed": False,
+                "retryable": False,
+                "message": str(exc),
+            },
+        ) from exc
+    if result.committed:
         await publish(
             namespaced_key,
             {"event": "value", "key": namespaced_key, "value": value},
             event="value",
         )
 
-    return {"ok": True, "updated": updated}
+    return result.as_payload()
 
 @app.websocket("/subscribe/{key}")
 async def websocket_endpoint(websocket: WebSocket, key: str):
@@ -77,7 +128,13 @@ async def set_schema(request: Request):
 async def fetch_schema(key: str, request: Request):
     await validate_api.validate_api_key(request, key, action="read")
     namespaced_key = getattr(request.state, "namespaced_key", key)
-    schema = get_schema(namespaced_key)
+    try:
+        schema = get_schema(namespaced_key)
+    except CorruptSchemaError as exc:
+        raise HTTPException(
+            409,
+            detail={"status": "corruption_needs_repair", "message": str(exc)},
+        ) from exc
     if not schema:
         raise HTTPException(404, detail="Schema not found")
     return {"key": key, "schema": schema}

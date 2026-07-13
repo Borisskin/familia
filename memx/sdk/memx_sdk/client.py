@@ -4,6 +4,42 @@ import websockets
 import threading
 import json
 import os
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass(frozen=True)
+class SemanticWriteResult:
+    status: str
+    committed: bool
+    updated: bool
+    retryable: bool
+    raw: dict[str, Any]
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> "SemanticWriteResult":
+        if not isinstance(payload, dict):
+            raise ValueError("memX returned a non-object semantic result")
+        status = payload.get("status")
+        committed = payload.get("committed")
+        updated = payload.get("updated")
+        retryable = payload.get("retryable")
+        if (
+            not isinstance(status, str)
+            or not isinstance(committed, bool)
+            or not isinstance(updated, bool)
+            or not isinstance(retryable, bool)
+        ):
+            raise ValueError("memX returned an incomplete semantic result")
+        if committed != (status == "committed" and updated):
+            raise ValueError("memX returned a contradictory semantic result")
+        return cls(
+            status=status,
+            committed=committed,
+            updated=updated,
+            retryable=retryable,
+            raw=dict(payload),
+        )
 
 class memxContext:
     def __init__(self, api_key, base_url=None):
@@ -19,7 +55,7 @@ class memxContext:
             json={"key": key, "value": value}
         )
         res.raise_for_status()
-        return res.json()
+        return SemanticWriteResult.from_payload(res.json())
 
     def get(self, key):
         res = httpx.get(

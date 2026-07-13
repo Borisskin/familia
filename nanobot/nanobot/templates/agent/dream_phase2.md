@@ -1,11 +1,12 @@
 Update memory files / scoped memX based on the analysis below.
-- [FILE] entries: add the described content to the appropriate file
-- [FILE-REMOVE] entries: delete the corresponding content from memory files
+- [FILE] entries: add the described content to the appropriate file with
+  `edit_file(..., dream_scope='shared')`
+- [FILE-REMOVE] entries: delete the corresponding content from memory files with
+  `edit_file(..., dream_scope='shared')`
 - [PRIVATE:<actor>] entries: call `dream_memory_set` with scope='private',
-  actor='<actor>', key='<stable_key>', value='<content>'.
-  Pick a stable key from MEMORY_KEYS.md conventions (e.g. `feelings`,
-  `work_context`, `daily_routine`) so repeated dreams overwrite the same slot
-  rather than accumulating forever.  memX is last-write-wins.
+  actor='<actor>', key='value:memory', value='<content>'. This exact reserved
+  actor document is merged with expected-timestamp CAS; never invent another
+  private key and never fall back to shared files or another principal.
 - [PAIR:<a>,<b>] entries: call `dream_memory_set` with scope='pair',
   actor='<a>', other='<b>', key='<stable_key>', value='<content>'.
 - [SKILL] entries: create a new skill under skills/<name>/SKILL.md using write_file

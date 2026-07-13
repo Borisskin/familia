@@ -135,7 +135,7 @@ tail -n 50 /opt/familia/audit.jsonl
 ## Типовые проблемы
 
 | Симптом | Вероятная причина |
-|---------|-------------------|
+| --- | --- |
 | `unknown principal: telegram/12345` | Telegram-чат не привязан к участнику в `principals.json` |
 | Ответы общие, без учета вашего контекста | Неверный ключ LLM или исчерпана квота; `OPENAI_API_KEY` не попал в окружение gateway |
 | `acl deny: scope=private:X:value:Y` | Чтение другого участника без связи доступа — так задумано, см. [`policy.md`](policy.md) |
@@ -150,7 +150,7 @@ tail -n 50 /opt/familia/audit.jsonl
 Встроенные списки намеренно короткие: одно хорошо известное зеркало на регион.
 
 | Ресурс | Цепочка автоматического отката |
-|--------|--------------------------------|
+| --- | --- |
 | PyPI | `pypi.tuna.tsinghua.edu.cn`, `mirrors.aliyun.com/pypi` |
 | Debian apt | `mirror.yandex.ru/debian`, `mirrors.tuna.tsinghua.edu.cn/debian` |
 | npm | `registry.npmmirror.com`, `mirrors.huaweicloud.com/repository/npm` |
@@ -160,7 +160,7 @@ tail -n 50 /opt/familia/audit.jsonl
 Чтобы **переопределить** автоматический выбор, например при наличии корпоративного внутреннего зеркала, задайте любую из этих переменных окружения до запуска bootstrap. Они побеждают без условий:
 
 | Переменная окружения | Что переопределяет | Пример значения |
-|----------------------|--------------------|-----------------|
+| --- | --- | --- |
 | `APT_MIRROR` | `deb.debian.org` / `security.debian.org` внутри образа | `https://mirror.yandex.ru/debian` |
 | `PIP_INDEX_URL` | индекс PyPI, который используют `pip` и `uv` внутри образа | `https://pypi.tuna.tsinghua.edu.cn/simple` или свой devpi |
 | `NPM_REGISTRY` | npm registry для сборки WhatsApp bridge | `https://registry.npmmirror.com` |

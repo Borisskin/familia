@@ -1,0 +1,404 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "version": "0.1.5.post2",
+    "commit": "950dddec499fbbe0353e997158c99808f0bb41e1",
+    "repository": "D:/chat/nanobot"
+  },
+  "scope": {
+    "upstream": ["nanobot/**", "pyproject.toml", "README.md"],
+    "target": ["nanobot/nanobot/**", "nanobot/pyproject.toml", "nanobot/README.md"],
+    "source": "tracked and non-ignored current worktree files",
+    "comparison": ["path-set", "blob-bytes", "git-mode"]
+  },
+  "categories": [
+    "familia-invariant",
+    "upstream-alignment",
+    "generated-noise",
+    "unknown"
+  ],
+  "deltas": [
+    {
+      "catalog_id": "D-HB-001",
+      "path": "nanobot/nanobot/agent/__init__.py",
+      "patch": "agent___init__.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "neutral ContextExtension API remains exported"
+    },
+    {
+      "catalog_id": "D-HB-002",
+      "path": "nanobot/nanobot/agent/context.py",
+      "patch": "agent_context.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "prompt assembly remains extensible and actor-filtered before limiting"
+    },
+    {
+      "catalog_id": "D-HB-003",
+      "path": "nanobot/nanobot/agent/loop.py",
+      "patch": "agent_loop.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "neutral adapters and Dream failure propagation remain wired without product imports"
+    },
+    {
+      "catalog_id": "D-HB-004",
+      "path": "nanobot/nanobot/agent/memory.py",
+      "patch": "agent_memory.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "actor-safe versioned durable history, quarantine, idempotent fallback, and cursor-last Dream commit"
+    },
+    {
+      "catalog_id": "D-HB-005",
+      "path": "nanobot/nanobot/agent/outbound.py",
+      "patch": "agent_outbound.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "neutral outbound authorization hook remains available"
+    },
+    {
+      "catalog_id": "D-HB-006",
+      "path": "nanobot/nanobot/agent/runner.py",
+      "patch": "agent_runner.patch",
+      "owner": "familia-release",
+      "category": "unknown",
+      "hunks": [{"range": "all", "category": "unknown"}],
+      "invariant": "inherited provider-error UX retained for release pending upgrade re-decision"
+    },
+    {
+      "catalog_id": "D-HB-007",
+      "path": "nanobot/nanobot/agent/tools/cron.py",
+      "patch": "agent_tools_cron.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "cron tool preserves explicit actor, target, tags, and direct delivery"
+    },
+    {
+      "catalog_id": "D-HB-008",
+      "path": "nanobot/nanobot/agent/tools/message.py",
+      "patch": "agent_tools_message.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "message sends pass the neutral outbound guard"
+    },
+    {
+      "catalog_id": "D-HB-009",
+      "path": "nanobot/nanobot/bus/__init__.py",
+      "patch": "bus___init__.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "callback bus API remains exported"
+    },
+    {
+      "catalog_id": "D-HB-010",
+      "path": "nanobot/nanobot/bus/callbacks.py",
+      "patch": "bus_callbacks.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "optional neutral callback dispatch remains available"
+    },
+    {
+      "catalog_id": "D-HB-011",
+      "path": "nanobot/nanobot/bus/events.py",
+      "patch": "bus_events.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "bus events retain actor and callback metadata"
+    },
+    {
+      "catalog_id": "D-HB-012",
+      "path": "nanobot/nanobot/bus/queue.py",
+      "patch": "bus_queue.patch",
+      "owner": "familia-release",
+      "category": "unknown",
+      "hunks": [{"range": "all", "category": "unknown"}],
+      "invariant": "inherited callback queue topology retained pending upgrade re-decision"
+    },
+    {
+      "catalog_id": "D-HB-013",
+      "path": "nanobot/nanobot/channels/base.py",
+      "patch": "channels_base.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "all channels pass neutral inbound enrichment and transcription boundaries"
+    },
+    {
+      "catalog_id": "D-HB-014",
+      "path": "nanobot/nanobot/channels/discord.py",
+      "patch": "channels_discord.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "Discord uses inbound policy and has no automatic command wiring"
+    },
+    {
+      "catalog_id": "D-HB-015",
+      "path": "nanobot/nanobot/channels/inbound.py",
+      "patch": "channels_inbound.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "neutral inbound gate and enricher protocol remains available"
+    },
+    {
+      "catalog_id": "D-HB-016",
+      "path": "nanobot/nanobot/channels/manager.py",
+      "patch": "channels_manager.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "runtime channel registry accepts neutral classes and enrichers"
+    },
+    {
+      "catalog_id": "D-HB-017",
+      "path": "nanobot/nanobot/channels/matrix.py",
+      "patch": "channels_matrix.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "Matrix inbound events pass the shared gate"
+    },
+    {
+      "catalog_id": "D-HB-018",
+      "path": "nanobot/nanobot/channels/mochat.py",
+      "patch": "channels_mochat.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "Mochat uses the semantic inbound-drop contract"
+    },
+    {
+      "catalog_id": "D-HB-019",
+      "path": "nanobot/nanobot/channels/msteams.py",
+      "patch": "channels_msteams.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "Teams uses the semantic inbound-drop contract"
+    },
+    {
+      "catalog_id": "D-HB-020",
+      "path": "nanobot/nanobot/channels/telegram.py",
+      "patch": "channels_telegram.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "Telegram media, audio, inbound policy, and disabled command menu remain explicit"
+    },
+    {
+      "catalog_id": "D-HB-021",
+      "path": "nanobot/nanobot/channels/websocket.py",
+      "patch": "channels_websocket.patch",
+      "owner": "familia-release",
+      "category": "unknown",
+      "hunks": [{"range": "all", "category": "unknown"}],
+      "invariant": "inherited WebSocket handshake behavior retained pending upgrade re-decision"
+    },
+    {
+      "catalog_id": "D-HB-022",
+      "path": "nanobot/nanobot/cli/commands.py",
+      "patch": "cli_commands.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "CLI lifecycle starts neutral adapters, heartbeat, maintenance, and web surfaces"
+    },
+    {
+      "catalog_id": "D-HB-023",
+      "path": "nanobot/nanobot/command/__init__.py",
+      "patch": "command___init__.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "slash-command modules remain physically present but are not package-wired"
+    },
+    {
+      "catalog_id": "D-HB-040",
+      "path": "nanobot/nanobot/command/builtin.py",
+      "patch": "command_builtin.patch",
+      "owner": "upstream",
+      "category": "generated-noise",
+      "hunks": [{"range": "all", "category": "generated-noise"}],
+      "invariant": "the known blank-line normalization has no behavioral effect and remains explicitly reconstructable"
+    },
+    {
+      "catalog_id": "D-HB-024",
+      "path": "nanobot/nanobot/config/schema.py",
+      "patch": "config_schema.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "optional transcription and heartbeat ownership fields remain schema-visible"
+    },
+    {
+      "catalog_id": "D-HB-025",
+      "path": "nanobot/nanobot/cron/service.py",
+      "patch": "cron_service.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "job identity includes actor, target, delivery, and tags without false dedupe"
+    },
+    {
+      "catalog_id": "D-HB-026",
+      "path": "nanobot/nanobot/cron/types.py",
+      "patch": "cron_types.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "cron persistence carries explicit creator, actor, target, and tags"
+    },
+    {
+      "catalog_id": "D-HB-027",
+      "path": "nanobot/nanobot/heartbeat/service.py",
+      "patch": "heartbeat_service.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "adapter-owned heartbeat selection fails closed and never falls back across principals"
+    },
+    {
+      "catalog_id": "D-HB-028",
+      "path": "nanobot/nanobot/nanobot.py",
+      "patch": "nanobot.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "facade passes neutral runtime adapter arguments"
+    },
+    {
+      "catalog_id": "D-HB-029",
+      "path": "nanobot/nanobot/providers/base.py",
+      "patch": "providers_base.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "provider retry timing remains release-approved"
+    },
+    {
+      "catalog_id": "D-HB-030",
+      "path": "nanobot/nanobot/providers/openai_codex_provider.py",
+      "patch": "providers_openai_codex_provider.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "provider timeouts and structured retry metadata remain failure-visible"
+    },
+    {
+      "catalog_id": "D-HB-031",
+      "path": "nanobot/nanobot/providers/openai_compat_provider.py",
+      "patch": "providers_openai_compat_provider.patch",
+      "owner": "familia-release",
+      "category": "unknown",
+      "hunks": [{"range": "all", "category": "unknown"}],
+      "invariant": "inherited compatibility kwarg choice retained pending upgrade re-decision"
+    },
+    {
+      "catalog_id": "D-HB-032",
+      "path": "nanobot/nanobot/providers/transcription.py",
+      "patch": "providers_transcription.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "selected speech-to-text capability remains available"
+    },
+    {
+      "catalog_id": "D-HB-033",
+      "path": "nanobot/pyproject.toml",
+      "patch": "pyproject.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "vendored package includes required web distribution artifacts"
+    },
+    {
+      "catalog_id": "D-HB-034",
+      "path": "nanobot/nanobot/runtime_adapters.py",
+      "patch": "runtime_adapters.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "product adapters load through neutral entry points without direct imports"
+    },
+    {
+      "catalog_id": "D-HB-035",
+      "path": "nanobot/nanobot/templates/AGENTS.md",
+      "patch": "templates_AGENTS.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "scheduled cron reminders remain distinct from heartbeat context"
+    },
+    {
+      "catalog_id": "D-HB-036",
+      "path": "nanobot/nanobot/templates/agent/conversation_rules.md",
+      "patch": "templates_agent_conversation_rules.patch",
+      "owner": "familia-release",
+      "category": "unknown",
+      "hunks": [{"range": "all", "category": "unknown"}],
+      "invariant": "inherited conversation continuity guidance retained pending upgrade re-decision"
+    },
+    {
+      "catalog_id": "D-HB-037",
+      "path": "nanobot/nanobot/templates/agent/dream_phase1.md",
+      "patch": "templates_agent_dream_phase1.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "Dream classifies FILE, PRIVATE, and PAIR findings explicitly"
+    },
+    {
+      "catalog_id": "D-HB-038",
+      "path": "nanobot/nanobot/templates/agent/dream_phase2.md",
+      "patch": "templates_agent_dream_phase2.patch",
+      "owner": "familia-release",
+      "category": "unknown",
+      "hunks": [{"range": "all", "category": "unknown"}],
+      "invariant": "inherited scoped-write prompt retained pending upgrade re-decision"
+    },
+    {
+      "catalog_id": "D-HB-039",
+      "path": "nanobot/nanobot/utils/maintenance.py",
+      "patch": "utils_maintenance.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "maintenance capability remains callable through the documented backend surface"
+    }
+  ],
+  "non_delta_decisions": [
+    {
+      "catalog_id": "D-HB-041",
+      "owner": "upstream",
+      "category": "upstream-alignment",
+      "paths": [
+        "nanobot/README.md",
+        "nanobot/nanobot/__init__.py",
+        "nanobot/nanobot/agent/tools/filesystem.py",
+        "nanobot/nanobot/channels/feishu.py",
+        "nanobot/nanobot/channels/vk.py",
+        "nanobot/nanobot/channels/wecom.py",
+        "nanobot/nanobot/command/router.py",
+        "nanobot/nanobot/config/__init__.py",
+        "nanobot/nanobot/templates/agent/memory_model.md",
+        "nanobot/nanobot/templates/agent/scope_defaults.md",
+        "nanobot/nanobot/templates/agent/shopping_vkusvill.md",
+        "nanobot/nanobot/utils/document.py"
+      ],
+      "decision": "keep byte-identical to pinned baseline"
+    }
+  ]
+}

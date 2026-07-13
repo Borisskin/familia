@@ -2,7 +2,7 @@
 # upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
 
 diff --git a/nanobot/nanobot/cron/service.py b/nanobot/nanobot/cron/service.py
-index 165ce54..e9d7cea 100644
+index 165ce54..a3907d8 100644
 --- a/nanobot/nanobot/cron/service.py
 +++ b/nanobot/nanobot/cron/service.py
 @@ -12,7 +12,14 @@ from typing import Any, Callable, Coroutine, Literal
@@ -21,30 +21,53 @@ index 165ce54..e9d7cea 100644
  
  
  def _now_ms() -> int:
-@@ -109,6 +116,8 @@ class CronService:
+@@ -85,12 +92,12 @@ class CronService:
+ 
+     def _load_jobs(self) -> tuple[list[CronJob], int]:
+         jobs = []
+-        version = 1
++        version = CronStore().version
+         if self.store_path.exists():
+             try:
+                 data = json.loads(self.store_path.read_text(encoding="utf-8"))
+                 jobs = []
+-                version = data.get("version", 1)
++                version = max(data.get("version", 1), CronStore().version)
+                 for j in data.get("jobs", []):
+                     jobs.append(CronJob(
+                         id=j["id"],
+@@ -109,6 +116,12 @@ class CronService:
                              deliver=j["payload"].get("deliver", False),
                              channel=j["payload"].get("channel"),
                              to=j["payload"].get("to"),
 +                            created_by=j["payload"].get("createdBy"),
 +                            tags=list(j["payload"].get("tags") or []),
++                            creator_actor=j["payload"].get(
++                                "creatorActor", j["payload"].get("createdBy")
++                            ),
++                            target_actor=j["payload"].get("targetActor"),
                          ),
                          state=CronJobState(
                              next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
-@@ -210,6 +219,8 @@ class CronService:
+@@ -210,6 +223,10 @@ class CronService:
                          "deliver": j.payload.deliver,
                          "channel": j.payload.channel,
                          "to": j.payload.to,
 +                        "createdBy": j.payload.created_by,
 +                        "tags": list(j.payload.tags or []),
++                        "creatorActor": j.payload.creator_actor,
++                        "targetActor": j.payload.target_actor,
                      },
                      "state": {
                          "nextRunAtMs": j.state.next_run_at_ms,
-@@ -379,11 +390,69 @@ class CronService:
+@@ -379,10 +396,76 @@ class CronService:
          channel: str | None = None,
          to: str | None = None,
          delete_after_run: bool = False,
 +        created_by: str | None = None,
 +        tags: list[str] | None = None,
++        creator_actor: str | None = None,
++        target_actor: str | None = None,
      ) -> CronJob:
 -        """Add a new job."""
 +        """Add a new job (idempotent on full delivery payload).
@@ -59,7 +82,9 @@ index 165ce54..e9d7cea 100644
 +        """
          _validate_schedule_for_add(schedule)
          now = _now_ms()
- 
++        effective_creator_actor = creator_actor if creator_actor is not None else created_by
++        legacy_created_by = created_by if created_by is not None else effective_creator_actor
++
 +        store = self._load_store() if self._running else None
 +        if store is not None:
 +            sched_sig = (
@@ -75,8 +100,10 @@ index 165ce54..e9d7cea 100644
 +                channel or "",
 +                to or "",
 +                delete_after_run,
-+                created_by or "",
++                legacy_created_by or "",
 +                tuple(sorted(tags or [])),
++                effective_creator_actor or "",
++                target_actor or "",
 +            )
 +            for existing in store.jobs:
 +                if not existing.enabled:
@@ -98,6 +125,8 @@ index 165ce54..e9d7cea 100644
 +                    existing.delete_after_run,
 +                    ep.created_by or "",
 +                    tuple(sorted(ep.tags or [])),
++                    ep.creator_actor or "",
++                    ep.target_actor or "",
 +                )
 +                if existing_sig == payload_sig:
 +                    logger.info(
@@ -106,16 +135,17 @@ index 165ce54..e9d7cea 100644
 +                        existing.name, existing.id,
 +                    )
 +                    return existing
-+
+ 
          job = CronJob(
              id=str(uuid.uuid4())[:8],
-             name=name,
-@@ -395,6 +464,8 @@ class CronService:
+@@ -395,6 +478,10 @@ class CronService:
                  deliver=deliver,
                  channel=channel,
                  to=to,
-+                created_by=created_by,
++                created_by=legacy_created_by,
 +                tags=list(tags or []),
++                creator_actor=effective_creator_actor,
++                target_actor=target_actor,
              ),
              state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
              created_at_ms=now,

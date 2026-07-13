@@ -30,6 +30,7 @@ Exit codes: ``0`` ok, ``2`` bad args / validation, ``1`` runtime error.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import sys
@@ -45,8 +46,6 @@ from familia.acl.schema import (
     ALLOWED_RELATIONS,
     TOPIC_KINDS,
 )
-
-
 FAMILY_KEY = "shared:family.graph"
 TOPICS_KEY = "shared:topics.graph"
 
@@ -388,9 +387,15 @@ def _print_graph(g: dict[str, Any]) -> None:
 def cmd_person_add_node(args: argparse.Namespace) -> int:
     family = load_graph_value(FAMILY_KEY)
     topics = load_graph_value(TOPICS_KEY)
-    node_id = args.id
-    if node_id in _all_known_ids(family, topics):
-        raise GraphIOError(f"id '{node_id}' already exists in some graph or principals.json")
+    from familia.principals import normalize_new_principal_id
+
+    try:
+        node_id = normalize_new_principal_id(
+            args.id,
+            existing_ids=_all_known_ids(family, topics),
+        )
+    except ValueError as exc:
+        raise GraphIOError(str(exc)) from exc
     aliases = args.aliases or []
     _validate_aliases(aliases)
     family.setdefault("nodes", []).append({
@@ -938,202 +943,119 @@ def cmd_memory_set(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_migrate_hybrid_storage(args: argparse.Namespace) -> int:
-    """Copy flat workspace files → per-principal memX namespaces.
+def _resolve_legacy_owner(args: argparse.Namespace) -> str | None:
+    """Resolve the one canonical owner used for unscoped legacy files.
 
-    For each principal in ``principals.json``, reads the workspace
-    files (USER.md, memory/MEMORY.md, HEARTBEAT.md) and writes their
-    bodies into:
-
-        private:<P>:value:user_profile
-        private:<P>:value:memory
-        private:<P>:value:heartbeat
-
-    On the first run all principals get the same content (because the
-    legacy files were one-per-stack); from there each principal's
-    namespace diverges as the agent updates them.
-
-    After successful write, the legacy files are renamed to
-    ``legacy/USER.md`` etc. so the fallback path in ContextBuilder
-    still works for one transitional release.
-
-    Idempotent: re-running checks if memX already has non-empty
-    content and skips that principal. Audit-event ``migrate_hybrid_storage``
-    fires on every invocation.
+    The admin writes ``FAMILIA_OWNER_ACTOR`` into the deployment env on the
+    initial install.  Reusing it here makes update/restore migrations
+    deterministic while keeping ``--legacy-owner`` as an operator override.
     """
-    from familia.acl.graph_io import get_raw, set_raw, GraphIOError
-    nanobot_home_env = os.environ.get("NANOBOT_HOME") or os.environ.get(
-        "FAMILIA_NANOBOT_HOME"
+    explicit = getattr(args, "legacy_owner", None)
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    configured = os.environ.get("FAMILIA_OWNER_ACTOR")
+    if isinstance(configured, str) and configured.strip():
+        return configured.strip()
+    return None
+
+
+def cmd_migrate_hybrid_storage(args: argparse.Namespace) -> int:
+    """Move legacy files/history into actor-owned memX memory without fan-out."""
+    import asyncio
+
+    from familia.acl.graph_io import get_raw
+    from familia.memory_migration import (
+        apply_legacy_transition_plan,
+        build_legacy_transition_plan,
+        make_configured_history_consolidator,
     )
-    if nanobot_home_env:
-        home = Path(nanobot_home_env)
+
+    if args.workspace:
+        workspace = args.workspace.expanduser().resolve(strict=True)
     else:
-        # Default: same dir as principals.json's parent.
-        path, _raw = _load_principals_json()
-        home = path.parent
-    workspace = home / "workspace"
-    user_md = workspace / "USER.md"
-    memory_md = workspace / "memory" / "MEMORY.md"
-    heartbeat_md = workspace / "HEARTBEAT.md"
-    legacy_dir = workspace / "legacy"
+        nanobot_home = os.environ.get("NANOBOT_HOME") or os.environ.get(
+            "FAMILIA_NANOBOT_HOME"
+        )
+        if nanobot_home:
+            workspace = Path(nanobot_home).expanduser().resolve(strict=True) / "workspace"
+        else:
+            principals_path, _ = _load_principals_json()
+            workspace = principals_path.parent / "workspace"
+        workspace = workspace.resolve(strict=True)
 
     _, raw = _load_principals_json()
-    principals = list(raw.get("principals") or [])
-    if not principals:
-        print("no principals — nothing to migrate")
-        return 0
+    known_actors = {
+        str(entry["id"]).strip()
+        for entry in (raw.get("principals") or [])
+        if isinstance(entry, dict) and str(entry.get("id") or "").strip()
+    }
+    if not known_actors:
+        raise ValueError("no principals found; refusing legacy memory migration")
 
-    # Identify which source files are pristine templates (just the
-    # nanobot-shipped boilerplate). We DON'T migrate those — copying
-    # "(your name)" stub into every principal's memX would just inject
-    # junk into prompts. Compare against the packaged templates.
-    def _is_template(content: str, template_subpath: str) -> bool:
-        try:
-            from importlib.resources import files as _pkg_files
-            tpl = _pkg_files("nanobot") / "templates" / template_subpath
-            if tpl.is_file():
-                return content.strip() == tpl.read_text(encoding="utf-8").strip()
-        except Exception:
-            pass
-        return False
-
-    plan: list[dict[str, Any]] = []
-    for entry in principals:
-        pid = entry.get("id")
-        if not pid:
-            continue
-        for suffix, src_path, tpl_name in (
-            ("value:user_profile", user_md, "USER.md"),
-            ("value:memory", memory_md, "memory/MEMORY.md"),
-            ("value:heartbeat", heartbeat_md, "HEARTBEAT.md"),
-        ):
-            full_key = f"private:{pid}:{suffix}"
-            try:
-                existing = get_raw(full_key)
-            except GraphIOError as exc:
-                print(f"warn: cannot probe {full_key}: {exc}")
-                existing = None
-            already_present = bool(existing and (
-                isinstance(existing, str) and existing.strip()
-            ))
-            if already_present:
-                plan.append({
-                    "principal": pid, "key": full_key,
-                    "action": "skip", "reason": "memX already non-empty",
-                })
-                continue
-            if not src_path.exists():
-                plan.append({
-                    "principal": pid, "key": full_key,
-                    "action": "skip", "reason": f"source missing: {src_path}",
-                })
-                continue
-            try:
-                content = src_path.read_text(encoding="utf-8")
-            except OSError as exc:
-                plan.append({
-                    "principal": pid, "key": full_key,
-                    "action": "error", "reason": f"read failed: {exc}",
-                })
-                continue
-            if not content.strip():
-                plan.append({
-                    "principal": pid, "key": full_key,
-                    "action": "skip", "reason": "source empty",
-                })
-                continue
-            if _is_template(content, tpl_name):
-                plan.append({
-                    "principal": pid, "key": full_key,
-                    "action": "skip", "reason": "source is unmodified template",
-                })
-                continue
-            plan.append({
-                "principal": pid, "key": full_key,
-                "action": "write", "src": str(src_path),
-                "bytes": len(content.encode("utf-8")),
-            })
-
+    plan = build_legacy_transition_plan(
+        workspace=workspace,
+        known_actors=known_actors,
+        get_value=get_raw,
+        legacy_owner=_resolve_legacy_owner(args),
+    )
     if args.dry_run:
         if getattr(args, "json", False):
-            print(json.dumps({"plan": plan, "dry_run": True}, ensure_ascii=False))
+            print(json.dumps(plan, ensure_ascii=False, sort_keys=True))
         else:
-            for item in plan:
-                print(f"  {item['action']:<5} {item['principal']:<12} {item['key']}"
-                      + (f"  ({item.get('reason') or ''})"
-                         if item['action'] != 'write'
-                         else f"  ({item.get('bytes', 0)} bytes from {item.get('src')})"))
-            print(f"\n{sum(1 for x in plan if x['action']=='write')} "
-                  "write(s) planned. Re-run with --apply to commit.")
+            needs_review = sum(
+                plan["summary"].get(name, 0)
+                for name in ("conflict", "quarantine_needs_review")
+            )
+            print(
+                f"migration={plan['status']} actions={len(plan['actions'])} "
+                f"llm_required={plan['summary'].get('llm_required', 0)} "
+                f"warnings={plan.get('warnings', 0)} needs_review={needs_review}"
+            )
+            print("Re-run with --apply after reviewing the JSON plan.")
         return 0
 
-    # Per-key write loop. Each successful write is independently audit-
-    # logged (SR-11). On the FIRST error we stop — partial-then-skip
-    # would leave a half-migrated state with no obvious recovery.
-    # Idempotency: re-run picks up where the previous one stopped
-    # because already-written keys are skip'd by the planning phase.
-    written = 0
-    errors: list[str] = []
-    written_per_principal: dict[str, int] = {}
-    for item in plan:
-        if item["action"] != "write":
-            continue
-        try:
-            content = Path(item["src"]).read_text(encoding="utf-8")
-            set_raw(item["key"], content)
-            written += 1
-            written_per_principal[item["principal"]] = (
-                written_per_principal.get(item["principal"], 0) + 1
-            )
-            audit.log_event(
-                "migrate_hybrid_storage_write",
-                principal=item["principal"],
-                key=item["key"],
-                bytes=len(content.encode("utf-8")),
-            )
-        except (OSError, GraphIOError) as exc:
-            errors.append(f"{item['key']}: {exc}")
-            break  # fail-fast on first per-key write failure
+    llm_required = any(
+        action.get("disposition") == "llm_required" for action in plan["actions"]
+    )
+    if llm_required:
+        consolidator = make_configured_history_consolidator(args.config)
+    else:
+        async def consolidator(
+            _actor: str, _records: list[dict[str, Any]], _existing: str
+        ) -> str:
+            raise RuntimeError("history consolidator called without an approved history action")
 
-    # Rename legacy files ONLY after a clean run. SR-17 atomicity:
-    # never half-rename across principals. The flat workspace files
-    # are shared (one USER.md for whole stack), so renaming them is
-    # a single global step done iff every planned write succeeded.
-    # On error, files stay in place — ContextBuilder's fallback
-    # path keeps reading them until the operator resolves the issue
-    # and re-runs --apply.
-    if written and not errors:
-        legacy_dir.mkdir(parents=True, exist_ok=True)
-        for src in (user_md, memory_md, heartbeat_md):
-            if not src.exists():
-                continue
-            dest = legacy_dir / src.name
-            try:
-                src.rename(dest)
-            except OSError as exc:
-                print(f"warn: failed to move {src} → {dest}: {exc}")
-
+    result = asyncio.run(
+        apply_legacy_transition_plan(
+            plan=plan,
+            workspace=workspace,
+            get_value=get_raw,
+            set_value=set_raw,
+            consolidate_history=consolidator,
+        )
+    )
     audit.log_event(
         "migrate_hybrid_storage",
-        principals_count=len(principals),
-        written=written,
-        errors=len(errors),
-        per_principal=dict(written_per_principal),
+        status=result["status"],
+        principals_count=len(known_actors),
+        applied_actions=result["applied_actions"],
+        written_keys=result["written_keys"],
+        failed_actors=result["failed_actors"],
+        needs_review=result["needs_review"],
+        warnings=result["warnings"],
+        dream_cursor_updated=result["dream_cursor_updated"],
     )
-
-    if errors:
-        for e in errors:
-            print(f"error: {e}", file=sys.stderr)
+    payload = {"plan": plan, "result": result}
+    if getattr(args, "json", False):
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
         print(
-            f"migration aborted on first error. {written} key(s) committed; "
-            "re-run after fixing memX. Legacy files NOT renamed.",
-            file=sys.stderr,
+            f"migration={result['status']} applied={result['applied_actions']} "
+            f"warnings={result['warnings']} needs_review={result['needs_review']} "
+            f"failed_actors="
+            f"{','.join(result['failed_actors']) or '-'}"
         )
-        return 1
-    print(f"migrated {written} key(s) into memX. "
-          f"Legacy files moved to {legacy_dir}.")
-    return 0
-
+    return 0 if result["status"] in {"success", "success_with_warnings"} else 1
 
 # ---------------------------------------------------------------------------
 # default-topic seed
@@ -1627,13 +1549,18 @@ def build_parser() -> argparse.ArgumentParser:
                        default=True)
     p_t2p.set_defaults(func=cmd_migrate_topic_to_principal)
 
-    # Hybrid storage migration: move per-principal USER/MEMORY/HEARTBEAT
-    # from flat workspace files into per-principal memX namespaces. Keep
-    # existing files renamed as ``legacy.*`` for fallback.
+    # Hybrid storage migration: classify flat legacy files, consolidate every
+    # actor-tagged history group, and write only actor-owned memX values.
     p_hyb = pm_sub.add_parser("hybrid-storage",
                               parents=[json_parent],
-                              help=("copy workspace USER.md/MEMORY.md/"
-                                    "HEARTBEAT.md → per-principal memX keys"))
+                              help="move legacy memory into actor-owned memX scopes")
+    p_hyb.add_argument("--workspace", type=Path,
+                       help="workspace override (defaults to configured NANOBOT_HOME)")
+    p_hyb.add_argument("--legacy-owner",
+                       help=("explicit owner for clean USER/MEMORY/HEARTBEAT files; "
+                             "defaults to FAMILIA_OWNER_ACTOR"))
+    p_hyb.add_argument("--config", type=Path,
+                       help="nanobot config used by the history LLM consolidator")
     p_hyb.add_argument("--apply", dest="dry_run", action="store_false",
                        default=True)
     p_hyb.set_defaults(func=cmd_migrate_hybrid_storage)
@@ -1904,17 +1831,14 @@ def cmd_pending_approve(args: argparse.Namespace) -> int:
     from familia.pending import store
     from familia import principals as principals_mod
 
-    import re
-
     if args.attach_to is not None:
         return _cmd_pending_attach(args, store, principals_mod)
 
-    new_id = args.as_id.strip()
-    # Pin the shape: starts with a letter, then [A-Za-z0-9_-], <=64
-    # chars. Refuses leading/trailing dashes/underscores so the id is
-    # safe in shell, URL, and graph-key contexts.
-    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", new_id):
-        print(f"error: bad principal id {new_id!r} (use letters/digits/_- starting with a letter)", file=sys.stderr)
+    raw_new_id = args.as_id or ""
+    try:
+        new_id = principals_mod.normalize_new_principal_id(raw_new_id)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
 
     # Cross-process exclusion around uniqueness-check → write → ack.
@@ -1940,19 +1864,22 @@ def cmd_pending_approve(args: argparse.Namespace) -> int:
         # both graphs). The graph nodes are id-strings too — collision
         # would create ambiguous lookups.
         registry = principals_mod.get_registry()
-        if registry.get(new_id) is not None:
-            print(f"error: principal id {new_id!r} already exists in principals.json",
-                  file=sys.stderr)
-            return 2
         family = load_graph_value("shared:family.graph")
-        if any((n.get("id") == new_id) for n in (family.get("nodes") or [])):
-            print(f"error: id {new_id!r} already used as family-graph node",
-                  file=sys.stderr)
-            return 2
         topics = load_graph_value("shared:topics.graph")
-        if any((n.get("id") == new_id) for n in (topics.get("nodes") or [])):
-            print(f"error: id {new_id!r} already used as topics-graph node",
-                  file=sys.stderr)
+        existing_ids = set(registry.ids)
+        for graph in (family, topics):
+            existing_ids.update(
+                node["id"]
+                for node in (graph.get("nodes") or [])
+                if isinstance(node, dict) and isinstance(node.get("id"), str)
+            )
+        try:
+            new_id = principals_mod.normalize_new_principal_id(
+                raw_new_id,
+                existing_ids=existing_ids,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
             return 2
 
         # Order of mutations is intentional and matches a
@@ -2263,16 +2190,64 @@ def cmd_identity_remove(args: argparse.Namespace) -> int:
 # Post-approve hooks (acl.json sync + welcome message)
 # ---------------------------------------------------------------------------
 
-# Per-principal scope grants for memX. Mirrors the pattern used by
-# admin-side sync_acl_for_principal so both code paths produce
-# byte-identical entries.
-def _scopes_for_principal(pid: str) -> list[str]:
-    return [
-        "shared:*",
-        f"private:{pid}:*",
-        f"pair:*:{pid}:*",
-        f"pair:{pid}:*",
-    ]
+# Per-principal scope grants for memX. PAIR grants use the established exact
+# ``pair:<left>_<right>:*`` namespace; wildcard grants are never emitted.
+def _pair_scope_grant(member_a: str, member_b: str) -> str:
+    left, right = sorted((member_a, member_b))
+    return f"pair:{left}_{right}:*"
+
+
+def _ambiguous_pair_scope_grants(
+    principal_ids: set[str],
+) -> dict[str, tuple[tuple[str, str], ...]]:
+    from familia.principals import ambiguous_pair_namespaces  # noqa: PLC0415
+
+    return {
+        f"pair:{token}:*": pairs
+        for token, pairs in ambiguous_pair_namespaces(principal_ids).items()
+    }
+
+
+def _scopes_for_principal(
+    pid: str,
+    *,
+    principal_ids: set[str] | None = None,
+    excluded_pair_scopes: set[str] | None = None,
+) -> list[str]:
+    if principal_ids is None:
+        try:
+            from familia.principals import get_registry  # noqa: PLC0415
+
+            principal_ids = set(get_registry().ids)
+        except Exception:  # noqa: BLE001 - isolated CLI fixtures may lack a registry
+            principal_ids = {pid}
+    else:
+        principal_ids = set(principal_ids)
+    principal_ids.add(pid)
+    excluded_pair_scopes = excluded_pair_scopes or set()
+    pair_grants = sorted(
+        _pair_scope_grant(pid, other)
+        for other in principal_ids
+        if other != pid and _pair_scope_grant(pid, other) not in excluded_pair_scopes
+    )
+    return ["shared:*", f"private:{pid}:*", *pair_grants]
+
+
+def _reconcile_principal_scopes(
+    existing: list[str],
+    pid: str,
+    *,
+    principal_ids: set[str] | None = None,
+    excluded_pair_scopes: set[str] | None = None,
+) -> list[str]:
+    """Replace every legacy/current PAIR grant from the principal registry."""
+    non_pair = [scope for scope in existing if not scope.startswith("pair:")]
+    generated = _scopes_for_principal(
+        pid,
+        principal_ids=principal_ids,
+        excluded_pair_scopes=excluded_pair_scopes,
+    )
+    return list(dict.fromkeys([*non_pair, *generated]))
 
 
 def _memx_acl_path() -> Path | None:
@@ -2299,11 +2274,12 @@ def _memx_acl_path() -> Path | None:
 
 
 def _try_sync_memx_acl(new_id: str) -> None:
-    """Append a per-principal ACL entry to ``memx-config/acl.json``.
+    """Create/reconcile per-principal entries in ``memx-config/acl.json``.
 
     Only runs when the file is actually reachable from inside the
     gateway container (env override or one of the well-known fallback
-    paths). Idempotent: existing entries are left untouched.
+    paths). Non-pair custom grants are preserved; exact underscore PAIR grants
+    are regenerated for all registered principals.
     """
     path = _memx_acl_path()
     if path is None:
@@ -2313,20 +2289,67 @@ def _try_sync_memx_acl(new_id: str) -> None:
             "admin-side IPC will sync over SSH instead"
         )
         return
-    new_key = f"{new_id}_key"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        if new_key in data:
-            logger.debug("approve: {} already in {} — no-op", new_key, path)
+        try:
+            from familia.principals import get_registry  # noqa: PLC0415
+
+            registry = get_registry()
+            principal_ids = set(registry.ids)
+            principal_keys = {
+                pid: principal.memx_key.strip()
+                for pid in principal_ids
+                if (principal := registry.get(pid)) is not None
+                and principal.memx_key.strip()
+            }
+        except Exception:  # noqa: BLE001
+            principal_ids = set()
+            principal_keys = {}
+        principal_ids.add(new_id)
+        ambiguous_pair_scopes = _ambiguous_pair_scope_grants(principal_ids)
+        for scope, pairs in sorted(ambiguous_pair_scopes.items()):
+            logger.warning(
+                "approve: skipped ambiguous pair ACL scope {} shared by {}",
+                scope,
+                pairs,
+            )
+        excluded_pair_scopes = set(ambiguous_pair_scopes)
+        changed: list[str] = []
+        for pid in sorted(principal_ids):
+            acl_key = principal_keys.get(pid)
+            if not acl_key:
+                logger.warning(
+                    "approve: principal {} has no declared memx_key; "
+                    "admin-side ACL reconciliation must repair it",
+                    pid,
+                )
+                continue
+            if acl_key not in data and pid != new_id:
+                continue
+            existing = data.get(acl_key, [])
+            if not isinstance(existing, list) or not all(
+                isinstance(scope, str) for scope in existing
+            ):
+                raise ValueError(f"invalid ACL scope list for {acl_key}")
+            desired = _reconcile_principal_scopes(
+                existing,
+                pid,
+                principal_ids=principal_ids,
+                excluded_pair_scopes=excluded_pair_scopes,
+            )
+            if existing != desired:
+                data[acl_key] = desired
+                changed.append(acl_key)
+        if not changed:
+            logger.debug("approve: pair ACL entries already canonical in {}", path)
             return
-        data[new_key] = _scopes_for_principal(new_id)
         backup = path.with_suffix(path.suffix + f".bak.{int(time.time())}")
         backup.write_bytes(path.read_bytes())
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, path)
-        logger.info("approve: appended {} to {}", new_key, path)
-    except (OSError, json.JSONDecodeError) as exc:
+        logger.info("approve: reconciled {} in {}", ", ".join(changed), path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
         logger.warning(
             "approve: failed to update {} — admin app should retry over SSH ({})",
             path, exc,

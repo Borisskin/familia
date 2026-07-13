@@ -2,10 +2,46 @@
 # upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
 
 diff --git a/nanobot/nanobot/agent/memory.py b/nanobot/nanobot/agent/memory.py
-index 60bc9ac..5a5936f 100644
+index 60bc9ac..4f73952 100644
 --- a/nanobot/nanobot/agent/memory.py
 +++ b/nanobot/nanobot/agent/memory.py
-@@ -108,6 +108,12 @@ class MemoryStore:
+@@ -3,14 +3,19 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import hashlib
+ import json
++import os
+ import re
++import uuid
+ import weakref
++from contextlib import nullcontext
+ from datetime import datetime
+ from pathlib import Path
+-from typing import TYPE_CHECKING, Any, Callable, Iterator
++from typing import TYPE_CHECKING, Any, Callable, ContextManager, Iterator
+ 
+ from loguru import logger
++from filelock import FileLock
+ 
+ from nanobot.utils.prompt_templates import render_template
+ from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain, strip_think
+@@ -44,11 +49,14 @@ class MemoryStore:
+         self.memory_dir = ensure_dir(workspace / "memory")
+         self.memory_file = self.memory_dir / "MEMORY.md"
+         self.history_file = self.memory_dir / "history.jsonl"
++        self.history_quarantine_file = self.memory_dir / "history.quarantine.jsonl"
+         self.legacy_history_file = self.memory_dir / "HISTORY.md"
+         self.soul_file = workspace / "SOUL.md"
+         self.user_file = workspace / "USER.md"
+         self._cursor_file = self.memory_dir / ".cursor"
+         self._dream_cursor_file = self.memory_dir / ".dream_cursor"
++        self._history_lock = FileLock(str(self.memory_dir / ".history.lock"))
++        self._quarantine_lock = FileLock(str(self.memory_dir / ".history-quarantine.lock"))
+         self._corruption_logged = False  # rate-limit non-int cursor warning
+         self._git = GitStore(workspace, tracked_files=[
+             "SOUL.md", "USER.md", "memory/MEMORY.md",
+@@ -108,6 +116,12 @@ class MemoryStore:
              logger.exception("Failed to migrate legacy HISTORY.md")
  
      def _parse_legacy_history(self, text: str) -> list[dict[str, Any]]:
@@ -18,12 +54,34 @@ index 60bc9ac..5a5936f 100644
          normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
          if not normalized:
              return []
-@@ -221,9 +227,14 @@ class MemoryStore:
+@@ -127,9 +141,14 @@ class MemoryStore:
+                     content = remainder
+ 
+             entries.append({
++                "schema_version": 1,
+                 "cursor": cursor,
+                 "timestamp": timestamp,
+                 "content": content,
++                "provenance": {
++                    "source": "legacy_history_migration",
++                    "idempotency_key": None,
++                },
+             })
+         return entries
+ 
+@@ -221,9 +240,21 @@ class MemoryStore:
  
      # -- history.jsonl — append-only, JSONL format ---------------------------
  
 -    def append_history(self, entry: str) -> int:
-+    def append_history(self, entry: str, actor: str | None = None) -> int:
++    def append_history(
++        self,
++        entry: str,
++        actor: str | None = None,
++        *,
++        provenance_source: str = "runtime_history",
++        idempotency_key: str | None = None,
++    ) -> int:
          """Append *entry* to history.jsonl and return its auto-incrementing cursor.
  
 +        ``actor`` — optional principal id whose conversation the entry
@@ -34,18 +92,387 @@ index 60bc9ac..5a5936f 100644
          Entries are passed through `strip_think` to drop template-level leaks
          (e.g. unclosed `<think` prefixes, `<channel|>` markers) before being
          persisted. If the cleaned content is empty but the raw entry wasn't,
-@@ -241,7 +252,9 @@ class MemoryStore:
-                 "persisting empty content to avoid re-polluting context",
-                 cursor,
-             )
+@@ -231,21 +262,80 @@ class MemoryStore:
+         to the raw leak — otherwise `strip_think`'s guarantees would be
+         undone by history replay / consolidation downstream.
+         """
+-        cursor = self._next_cursor()
+-        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+         raw = entry.rstrip()
+         content = strip_think(raw)
+-        if raw and not content:
+-            logger.debug(
+-                "history entry {} stripped to empty (likely template leak); "
+-                "persisting empty content to avoid re-polluting context",
+-                cursor,
+-            )
 -        record = {"cursor": cursor, "timestamp": ts, "content": content}
-+        record: dict[str, Any] = {"cursor": cursor, "timestamp": ts, "content": content}
-+        if actor:
-+            record["actor"] = actor
-         with open(self.history_file, "a", encoding="utf-8") as f:
-             f.write(json.dumps(record, ensure_ascii=False) + "\n")
-         self._cursor_file.write_text(str(cursor), encoding="utf-8")
-@@ -368,19 +381,25 @@ class MemoryStore:
+-        with open(self.history_file, "a", encoding="utf-8") as f:
+-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+-        self._cursor_file.write_text(str(cursor), encoding="utf-8")
+-        return cursor
++        with self._history_lock:
++            if idempotency_key:
++                for existing, cursor in self._iter_valid_entries():
++                    provenance = existing.get("provenance")
++                    if (
++                        isinstance(provenance, dict)
++                        and provenance.get("idempotency_key") == idempotency_key
++                    ):
++                        return cursor
++
++            cursor = self._next_cursor()
++            if raw and not content:
++                logger.debug(
++                    "history entry {} stripped to empty (likely template leak); "
++                    "persisting empty content to avoid re-polluting context",
++                    cursor,
++                )
++            record: dict[str, Any] = {
++                "schema_version": 1,
++                "cursor": cursor,
++                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
++                "content": content,
++                "provenance": {
++                    "source": provenance_source,
++                    "idempotency_key": idempotency_key,
++                },
++            }
++            if actor:
++                record["actor"] = actor
++
++            # The durable record always precedes the counter publication. If
++            # either operation fails, .cursor can never claim an absent row.
++            self._append_record_durable(record)
++            self._atomic_write_text(self._cursor_file, str(cursor))
++            return cursor
++
++    @staticmethod
++    def _fsync_directory(path: Path) -> None:
++        try:
++            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
++            fd = os.open(path, flags)
++        except OSError:
++            return
++        try:
++            os.fsync(fd)
++        finally:
++            os.close(fd)
++
++    @classmethod
++    def _atomic_write_text(cls, path: Path, content: str) -> None:
++        temp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
++        try:
++            with open(temp, "w", encoding="utf-8") as handle:
++                handle.write(content)
++                handle.flush()
++                os.fsync(handle.fileno())
++            os.replace(temp, path)
++            cls._fsync_directory(path.parent)
++        finally:
++            temp.unlink(missing_ok=True)
++
++    @classmethod
++    def _append_jsonl_durable(cls, path: Path, record: dict[str, Any]) -> None:
++        payload = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
++        with open(path, "ab") as handle:
++            handle.write(payload)
++            handle.flush()
++            os.fsync(handle.fileno())
++        cls._fsync_directory(path.parent)
++
++    def _append_record_durable(self, record: dict[str, Any]) -> None:
++        self._append_jsonl_durable(self.history_file, record)
+ 
+     @staticmethod
+     def _valid_cursor(value: Any) -> int | None:
+@@ -264,45 +354,113 @@ class MemoryStore:
+             cursor = self._valid_cursor(raw)
+             if cursor is None:
+                 poisoned = raw
++                self._record_history_quarantine(
++                    reason="non_int_cursor",
++                    raw=json.dumps(entry, ensure_ascii=False),
++                )
+                 continue
+             yield entry, cursor
+         if poisoned is not None and not self._corruption_logged:
+             self._corruption_logged = True
+             logger.warning(
+-                "history.jsonl contains a non-int cursor ({!r}); dropping it. "
+-                "Usually caused by an external writer; further occurrences suppressed.",
++                "history.jsonl contains a non-int cursor ({!r}); it remains in "
++                "the source and is excluded via history quarantine. Further "
++                "occurrences are suppressed for this store.",
+                 poisoned,
+             )
+ 
+     def _next_cursor(self) -> int:
+-        """Read the current cursor counter and return the next value."""
+-        if self._cursor_file.exists():
+-            try:
+-                return int(self._cursor_file.read_text(encoding="utf-8").strip()) + 1
+-            except (ValueError, OSError):
+-                pass
+-        # Fast path: trust the tail when intact.  Otherwise scan the whole
+-        # file and take ``max`` — that stays correct even if the monotonic
+-        # invariant was broken by external writes.
+-        last = self._read_last_entry() or {}
+-        cursor = self._valid_cursor(last.get("cursor"))
+-        if cursor is not None:
+-            return cursor + 1
++        """Return one greater than the greatest durably persisted cursor.
++
++        ``.cursor`` is a published convenience counter, never the authority:
++        trusting a stale/high counter would skip unpersisted records.
++        Callers allocating a cursor hold ``_history_lock``.
++        """
+         return max((c for _, c in self._iter_valid_entries()), default=0) + 1
+ 
+     def read_unprocessed_history(self, since_cursor: int) -> list[dict[str, Any]]:
+         """Return history entries with a valid cursor > *since_cursor*."""
+-        return [e for e, c in self._iter_valid_entries() if c > since_cursor]
++        with self._history_lock:
++            return [e for e, c in self._iter_valid_entries() if c > since_cursor]
++
++    def read_history_for_prompt(
++        self,
++        since_cursor: int,
++        *,
++        actor: str | None = None,
++        actor_validator: Callable[[str], bool] | None = None,
++    ) -> dict[str, Any]:
++        """Select Recent History without crossing principal boundaries.
++
++        A missing validator denotes explicit standalone mode and preserves the
++        legacy local stream.  Supplying a validator enables multi-principal
++        mode: the current actor must be valid, filtering happens before the
++        caller applies its limit, and actorless/unknown rows receive a
++        versioned quarantine disposition without mutating persisted history.
++        """
++        entries = self.read_unprocessed_history(since_cursor=since_cursor)
++        quarantine: list[dict[str, Any]] = []
++        if actor_validator is None:
++            return {
++                "entries": entries,
++                "quarantine": {
++                    "version": "history-quarantine-v1",
++                    "records": quarantine,
++                },
++            }
++
++        def _is_known(candidate: str | None) -> bool:
++            if not candidate:
++                return False
++            try:
++                return bool(actor_validator(candidate))
++            except Exception:  # noqa: BLE001 - validation failure is deny
++                return False
++
++        current_actor_valid = _is_known(actor)
++        selected: list[dict[str, Any]] = []
++        for entry in entries:
++            entry_actor = entry.get("actor")
++            explicitly_safe = (
++                entry.get("prompt_scope") in {"shared", "system"}
++                and entry.get("prompt_safe_version") == "history-prompt-safe-v1"
++            )
++            if current_actor_valid and explicitly_safe:
++                selected.append(entry)
++                continue
++            if not entry_actor:
++                reason = "actorless_multi_principal"
++            elif not _is_known(entry_actor):
++                reason = "unknown_actor_multi_principal"
++            else:
++                if current_actor_valid and entry_actor == actor:
++                    selected.append(entry)
++                continue
++            quarantine.append({
++                "cursor": entry["cursor"],
++                "reason": reason,
++                "disposition": "quarantine_needs_review",
++                "writes": 0,
++            })
++
++        return {
++            "entries": selected,
++            "quarantine": {
++                "version": "history-quarantine-v1",
++                "records": quarantine,
++            },
++        }
+ 
+     def compact_history(self) -> None:
+         """Drop oldest entries if the file exceeds *max_history_entries*."""
+         if self.max_history_entries <= 0:
+             return
+-        entries = self._read_entries()
+-        if len(entries) <= self.max_history_entries:
+-            return
+-        kept = entries[-self.max_history_entries:]
+-        self._write_entries(kept)
++        with self._history_lock:
++            entries = self._read_entries()
++            if len(entries) <= self.max_history_entries:
++                return
++            kept = entries[-self.max_history_entries:]
++            self._replace_entries_durable(kept)
+ 
+     # -- JSONL helpers -------------------------------------------------------
+ 
+@@ -311,17 +469,118 @@ class MemoryStore:
+         entries: list[dict[str, Any]] = []
+         try:
+             with open(self.history_file, "r", encoding="utf-8") as f:
+-                for line in f:
++                for line_number, line in enumerate(f, start=1):
+                     line = line.strip()
+                     if line:
+                         try:
+-                            entries.append(json.loads(line))
++                            entry = json.loads(line)
+                         except json.JSONDecodeError:
++                            self._record_history_quarantine(
++                                reason="malformed_json",
++                                raw=line,
++                                line_number=line_number,
++                            )
++                            continue
++                        if not isinstance(entry, dict):
++                            self._record_history_quarantine(
++                                reason="record_not_object",
++                                raw=line,
++                                line_number=line_number,
++                            )
++                            continue
++                        version = entry.get("schema_version")
++                        if version is not None and (
++                            isinstance(version, bool)
++                            or not isinstance(version, int)
++                            or version != 1
++                        ):
++                            self._record_history_quarantine(
++                                reason="unknown_schema_version",
++                                raw=line,
++                                line_number=line_number,
++                            )
+                             continue
++                        if version == 1 and not self._current_record_shape_valid(entry):
++                            self._record_history_quarantine(
++                                reason="invalid_record_schema",
++                                raw=line,
++                                line_number=line_number,
++                            )
++                            continue
++                        entries.append(entry)
+         except FileNotFoundError:
+             pass
+         return entries
+ 
++    @staticmethod
++    def _current_record_shape_valid(entry: dict[str, Any]) -> bool:
++        provenance = entry.get("provenance")
++        actor = entry.get("actor")
++        return bool(
++            isinstance(entry.get("timestamp"), str)
++            and isinstance(entry.get("content"), str)
++            and isinstance(provenance, dict)
++            and isinstance(provenance.get("source"), str)
++            and (
++                provenance.get("idempotency_key") is None
++                or isinstance(provenance.get("idempotency_key"), str)
++            )
++            and (actor is None or isinstance(actor, str))
++        )
++
++    def _record_history_quarantine(
++        self,
++        *,
++        reason: str,
++        raw: str,
++        line_number: int | None = None,
++    ) -> None:
++        fingerprint = hashlib.sha256(
++            f"{reason}\0{raw}".encode("utf-8", errors="replace")
++        ).hexdigest()
++        with self._quarantine_lock:
++            existing = {
++                record.get("fingerprint")
++                for record in self._read_quarantine_unlocked()
++            }
++            if fingerprint in existing:
++                return
++            record = {
++                "schema_version": 1,
++                "kind": "history_quarantine",
++                "reason": reason,
++                "fingerprint": fingerprint,
++                "line_number": line_number,
++                "raw": raw,
++            }
++            self._append_jsonl_durable(self.history_quarantine_file, record)
++        logger.warning(
++            "history record quarantined: reason={}, fingerprint={}",
++            reason,
++            fingerprint[:12],
++        )
++
++    def _read_quarantine_unlocked(self) -> list[dict[str, Any]]:
++        records: list[dict[str, Any]] = []
++        try:
++            with open(self.history_quarantine_file, "r", encoding="utf-8") as handle:
++                for line in handle:
++                    try:
++                        record = json.loads(line)
++                    except json.JSONDecodeError:
++                        logger.error("history quarantine sidecar contains malformed JSON")
++                        continue
++                    if isinstance(record, dict):
++                        records.append(record)
++        except FileNotFoundError:
++            pass
++        return records
++
++    def read_history_quarantine(self) -> list[dict[str, Any]]:
++        """Return durable, versioned corruption dispositions."""
++        with self._quarantine_lock:
++            return self._read_quarantine_unlocked()
++
+     def _read_last_entry(self) -> dict[str, Any] | None:
+         """Read the last entry from the JSONL file efficiently."""
+         try:
+@@ -341,10 +600,16 @@ class MemoryStore:
+             return None
+ 
+     def _write_entries(self, entries: list[dict[str, Any]]) -> None:
+-        """Overwrite history.jsonl with the given entries."""
+-        with open(self.history_file, "w", encoding="utf-8") as f:
+-            for entry in entries:
+-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
++        """Atomically replace history.jsonl with durable serialized entries."""
++        with self._history_lock:
++            self._replace_entries_durable(entries)
++
++    def _replace_entries_durable(self, entries: list[dict[str, Any]]) -> None:
++        payload = "".join(
++            json.dumps(entry, ensure_ascii=False) + "\n"
++            for entry in entries
++        )
++        self._atomic_write_text(self.history_file, payload)
+ 
+     # -- dream cursor --------------------------------------------------------
+ 
+@@ -357,7 +622,7 @@ class MemoryStore:
+         return 0
+ 
+     def set_last_dream_cursor(self, cursor: int) -> None:
+-        self._dream_cursor_file.write_text(str(cursor), encoding="utf-8")
++        self._atomic_write_text(self._dream_cursor_file, str(cursor))
+ 
+     # -- message formatting utility ------------------------------------------
+ 
+@@ -368,19 +633,34 @@ class MemoryStore:
              if not message.get("content"):
                  continue
              tools = f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
@@ -60,13 +487,24 @@ index 60bc9ac..5a5936f 100644
          return "\n".join(lines)
  
 -    def raw_archive(self, messages: list[dict]) -> None:
+-        """Fallback: dump raw messages to history.jsonl without LLM summarization."""
 +    def raw_archive(self, messages: list[dict], actor: str | None = None) -> None:
-         """Fallback: dump raw messages to history.jsonl without LLM summarization."""
++        """Idempotently dump raw messages after a consolidation failure."""
++        canonical = json.dumps(
++            {"actor": actor, "messages": messages},
++            ensure_ascii=False,
++            sort_keys=True,
++            default=str,
++        )
++        idempotency_key = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
          self.append_history(
-             f"[RAW] {len(messages)} messages\n"
+-            f"[RAW] {len(messages)} messages\n"
 -            f"{self._format_messages(messages)}"
++            f"[RAW idempotency={idempotency_key}] {len(messages)} messages\n"
 +            f"{self._format_messages(messages)}",
 +            actor=actor,
++            provenance_source="raw_consolidation_fallback",
++            idempotency_key=idempotency_key,
          )
          logger.warning(
 -            "Memory consolidation degraded: raw-archived {} messages", len(messages)
@@ -75,7 +513,7 @@ index 60bc9ac..5a5936f 100644
          )
  
  
-@@ -486,13 +505,53 @@ class Consolidator:
+@@ -486,13 +766,53 @@ class Consolidator:
              self._get_tool_definitions(),
          )
  
@@ -130,7 +568,7 @@ index 60bc9ac..5a5936f 100644
          try:
              formatted = MemoryStore._format_messages(messages)
              response = await self.provider.chat_with_retry(
-@@ -513,11 +572,14 @@ class Consolidator:
+@@ -513,11 +833,14 @@ class Consolidator:
              if response.finish_reason == "error":
                  raise RuntimeError(f"LLM returned error: {response.content}")
              summary = response.content or "[no summary]"
@@ -148,23 +586,25 @@ index 60bc9ac..5a5936f 100644
              return None
  
      async def maybe_consolidate_by_tokens(
-@@ -656,6 +718,7 @@ class Dream:
+@@ -656,6 +979,8 @@ class Dream:
          max_iterations: int = 10,
          max_tool_result_chars: int = 16_000,
          annotate_line_ages: bool = True,
 +        dream_tool_installers: list[Callable[[ToolRegistry, MemoryStore], None]] | None = None,
++        dream_turn_context: Callable[[], ContextManager[Any]] | None = None,
      ):
          self.store = store
          self.provider = provider
-@@ -667,6 +730,7 @@ class Dream:
+@@ -667,6 +992,8 @@ class Dream:
          # Default True keeps the #3212 behavior; set False to feed MEMORY.md raw
          # (e.g. if a specific LLM reacts poorly to the `← Nd` suffix).
          self.annotate_line_ages = annotate_line_ages
 +        self._dream_tool_installers = dream_tool_installers or []
++        self._dream_turn_context = dream_turn_context
          self._runner = AgentRunner(provider)
          self._tools = self._build_tools()
  
-@@ -692,6 +756,10 @@ class Dream:
+@@ -692,6 +1019,10 @@ class Dream:
          skills_dir = workspace / "skills"
          skills_dir.mkdir(parents=True, exist_ok=True)
          tools.register(WriteFileTool(workspace=workspace, allowed_dir=skills_dir))
@@ -175,7 +615,7 @@ index 60bc9ac..5a5936f 100644
          return tools
  
      # -- skill listing --------------------------------------------------------
-@@ -785,10 +853,16 @@ class Dream:
+@@ -785,10 +1116,16 @@ class Dream:
              len(entries), last_cursor, batch[-1]["cursor"], len(batch),
          )
  
@@ -196,3 +636,99 @@ index 60bc9ac..5a5936f 100644
  
          # Current file contents + per-line age annotations (MEMORY.md only)
          current_date = datetime.now().strftime("%Y-%m-%d")
+@@ -861,14 +1198,20 @@ class Dream:
+         ]
+ 
+         try:
+-            result = await self._runner.run(AgentRunSpec(
+-                initial_messages=messages,
+-                tools=tools,
+-                model=self.model,
+-                max_iterations=self.max_iterations,
+-                max_tool_result_chars=self.max_tool_result_chars,
+-                fail_on_tool_error=False,
+-            ))
++            turn_context = (
++                self._dream_turn_context()
++                if self._dream_turn_context is not None
++                else nullcontext()
++            )
++            with turn_context:
++                result = await self._runner.run(AgentRunSpec(
++                    initial_messages=messages,
++                    tools=tools,
++                    model=self.model,
++                    max_iterations=self.max_iterations,
++                    max_tool_result_chars=self.max_tool_result_chars,
++                    fail_on_tool_error=True,
++                ))
+             logger.debug(
+                 "Dream Phase 2 complete: stop_reason={}, tool_events={}",
+                 result.stop_reason, len(result.tool_events),
+@@ -879,29 +1222,53 @@ class Dream:
+             logger.exception("Dream Phase 2 failed")
+             result = None
+ 
++        required_scoped_writes = sum(
++            1
++            for line in analysis.splitlines()
++            if line.strip().startswith(("[PRIVATE:", "[PAIR:"))
++        )
++        tool_events = result.tool_events if result else []
++        successful_scoped_writes = sum(
++            1
++            for event in tool_events
++            if event.get("name") == "dream_memory_set" and event.get("status") == "ok"
++        )
++        tool_failed = any(event.get("status") != "ok" for event in tool_events)
++        batch_succeeded = bool(
++            result
++            and result.stop_reason == "completed"
++            and not result.error
++            and not tool_failed
++            and successful_scoped_writes >= required_scoped_writes
++        )
++        if not batch_succeeded:
++            reason = result.stop_reason if result else "exception"
++            logger.warning(
++                "Dream incomplete ({}): cursor unchanged at {}; "
++                "scoped writes {}/{}",
++                reason,
++                last_cursor,
++                successful_scoped_writes,
++                required_scoped_writes,
++            )
++            return False
++
+         # Build changelog from tool events
+         changelog: list[str] = []
+-        if result and result.tool_events:
++        if result.tool_events:
+             for event in result.tool_events:
+                 if event["status"] == "ok":
+                     changelog.append(f"{event['name']}: {event['detail']}")
+ 
+-        # Advance cursor — always, to avoid re-processing Phase 1
++        # Cursor and compaction commit last, only after the complete Phase 2.
+         new_cursor = batch[-1]["cursor"]
+         self.store.set_last_dream_cursor(new_cursor)
+         self.store.compact_history()
+ 
+-        if result and result.stop_reason == "completed":
+-            logger.info(
+-                "Dream done: {} change(s), cursor advanced to {}",
+-                len(changelog), new_cursor,
+-            )
+-        else:
+-            reason = result.stop_reason if result else "exception"
+-            logger.warning(
+-                "Dream incomplete ({}): cursor advanced to {}",
+-                reason, new_cursor,
+-            )
++        logger.info(
++            "Dream done: {} change(s), cursor advanced to {}",
++            len(changelog), new_cursor,
++        )
+ 
+         # Git auto-commit (only when there are actual changes)
+         if changelog and self.store.git.is_initialized():

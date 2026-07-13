@@ -5,7 +5,7 @@ import mimetypes
 import platform
 from importlib.resources import files as pkg_files
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
@@ -52,12 +52,14 @@ class ContextBuilder:
         timezone: str | None = None,
         disabled_skills: list[str] | None = None,
         context_extensions: list[ContextExtension] | None = None,
+        history_actor_validator: Callable[[str], bool] | None = None,
     ):
         self.workspace = workspace
         self.timezone = timezone
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
         self.context_extensions = list(context_extensions or [])
+        self.history_actor_validator = history_actor_validator
 
     def build_system_prompt(
         self,
@@ -103,7 +105,12 @@ class ContextBuilder:
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 
-        entries = self.memory.read_unprocessed_history(since_cursor=self.memory.get_last_dream_cursor())
+        selection = self.memory.read_history_for_prompt(
+            since_cursor=self.memory.get_last_dream_cursor(),
+            actor=actor,
+            actor_validator=self.history_actor_validator,
+        )
+        entries = selection["entries"]
         if entries:
             capped = entries[-self._MAX_RECENT_HISTORY:]
             parts.append("# Recent History\n\n" + "\n".join(

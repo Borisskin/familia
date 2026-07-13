@@ -5,7 +5,7 @@
 ## Линии
 
 | Линия | Что требует поднять версию | Префикс тега | Куда публикуется |
-|-------|----------------------------|--------------|------------------|
+| --- | --- | --- | --- |
 | **Образ** | `familia/`, `nanobot/`, `memx/`, `Dockerfile` | `image-vX.Y.Z` | `ghcr.io/<owner>/familia-assistant:X.Y.Z`, `ghcr.io/<owner>/memx:X.Y.Z` |
 | **Админка** | интерфейс, IPC, мастер установки | `admin-vX.Y.Z` | GitHub Release: `FamiliaAdmin-vX.Y.Z.exe` + `WebView2Loader.dll` (+ оба `.sha256`) |
 

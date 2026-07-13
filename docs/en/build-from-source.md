@@ -202,7 +202,7 @@ If the signal path fails (container dead, Docker unavailable), fallback is `rest
 Detailed description: [`operations.md`](operations.md), *Mirror fallbacks*. Short list of environment variables read by `bootstrap.sh`:
 
 | Env var | Overrides |
-|---|---|
+| --- | --- |
 | `APT_MIRROR` | `deb.debian.org` (apt inside the image) |
 | `PIP_INDEX_URL` | PyPI for `pip` / `uv` inside the image |
 | `NPM_REGISTRY` | npm for building the WhatsApp bridge |
