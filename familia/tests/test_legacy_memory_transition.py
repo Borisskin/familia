@@ -592,7 +592,7 @@ class LegacyMemoryTransitionTests(unittest.TestCase):
         source = Path(graph_admin.__file__).read_text(encoding="utf-8")
         self.assertNotIn("memory_contract", source)
 
-    def test_cli_restore_accepts_warning_success_but_rejects_systemic_partial(
+    def test_cli_migration_allows_review_only_partial_but_rejects_fatal(
         self,
     ) -> None:
         plan = {
@@ -639,6 +639,27 @@ class LegacyMemoryTransitionTests(unittest.TestCase):
                     memory_migration,
                     "apply_legacy_transition_plan",
                     new=AsyncMock(return_value=warning_result),
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(graph_admin.cmd_migrate_hybrid_storage(args), 0)
+
+            review_only_result = {
+                **base_result,
+                "status": "partial",
+                "applied_actions": 2,
+                "failed_actors": [],
+                "failed_actions": [],
+                "fatal_failure": None,
+                "needs_review": 2,
+                "warnings": 0,
+                "dream_cursor_updated": True,
+            }
+            with (
+                patch.object(
+                    memory_migration,
+                    "apply_legacy_transition_plan",
+                    new=AsyncMock(return_value=review_only_result),
                 ),
                 redirect_stdout(io.StringIO()),
             ):

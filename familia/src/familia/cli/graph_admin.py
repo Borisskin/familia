@@ -1055,7 +1055,13 @@ def cmd_migrate_hybrid_storage(args: argparse.Namespace) -> int:
             f"failed_actors="
             f"{','.join(result['failed_actors']) or '-'}"
         )
-    return 0 if result["status"] in {"success", "success_with_warnings"} else 1
+    non_fatal_statuses = {
+        "success",
+        "success_with_warnings",
+        "partial",
+        "needs_review",
+    }
+    return 0 if result["status"] in non_fatal_statuses else 1
 
 # ---------------------------------------------------------------------------
 # default-topic seed
