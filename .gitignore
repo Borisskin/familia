@@ -54,3 +54,4 @@ __pycache__/
 # MCP code-index
 .code-index/
 .mcp.json
+AGENTS.md
