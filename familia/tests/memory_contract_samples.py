@@ -65,7 +65,7 @@ def principal_registry_sample() -> dict[str, Any]:
 def family_graph_sample() -> dict[str, Any]:
     return {
         "nodes": [
-            {"id": principal_id, "type": "person"}
+            {"id": principal_id, "type": "principal"}
             for principal_id in (
                 "principal_alpha",
                 "principal_beta",
