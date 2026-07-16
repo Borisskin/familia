@@ -35,7 +35,7 @@
   },
   "memory_contract": {
     "canonical_export": "familia.memory_contract.MEMORY_CONTRACT",
-    "contract_version": "1.0.0",
+    "contract_version": "2.0.0",
     "later_nanobot_upgrade_invariant_boundary": true
   }
 }

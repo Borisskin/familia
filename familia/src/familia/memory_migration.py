@@ -26,7 +26,12 @@ from typing import Any, Awaitable, Callable, Protocol
 MIGRATION_SCHEMA_VERSION = "1.0.0"
 SNAPSHOT_SCHEMA_VERSION = "1.0.0"
 SNAPSHOT_FORMAT_VERSION = "1.0.0"
-MEMORY_CONTRACT_VERSION = "1.0.0"
+MEMORY_CONTRACT_VERSION = "2.0.0"
+MEMORY_CONTRACT_MIGRATION_KINDS = {
+    "legacy-unversioned": "legacy_upgrade",
+    "1.0.0": "legacy_upgrade",
+    "2.0.0": "current_verify",
+}
 DISPOSITIONS = (
     "write",
     "skip",
@@ -83,6 +88,17 @@ class MigrationPreflightError(MigrationError):
 
 class MigrationBlockedError(MigrationError):
     """Plan contains unresolved actions and therefore cannot be applied."""
+
+
+def memory_contract_migration_kind(source_contract_version: str) -> str:
+    """Select the only migration path allowed for a recognized source contract."""
+
+    try:
+        return MEMORY_CONTRACT_MIGRATION_KINDS[source_contract_version]
+    except (KeyError, TypeError) as exc:
+        raise MigrationPreflightError(
+            f"unsupported memory contract version: {source_contract_version!r}"
+        ) from exc
 
 
 class MigrationTarget(Protocol):

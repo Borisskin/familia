@@ -27,7 +27,7 @@ def _marker(target: Path) -> dict:
         "non_production": True,
         "filesystem_root": str(target.resolve()),
         "snapshot_id": SNAPSHOT_ID,
-        "contract_version": "1.0.0",
+        "contract_version": "2.0.0",
     }
 
 

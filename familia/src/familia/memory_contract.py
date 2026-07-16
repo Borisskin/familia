@@ -1,0 +1,431 @@
+"""Canonical machine-readable Familia memory contract."""
+
+from __future__ import annotations
+
+from typing import Any, Final
+
+
+MEMORY_CONTRACT: Final[dict[str, Any]] = {
+    "contract_version": "2.0.0",
+    "authority": {
+        "canonical_export": "familia.memory_contract.MEMORY_CONTRACT",
+        "final_writer": "PrincipalMemoryIngestor",
+        "automatic_sources": [
+            "dream",
+            "conversation_consolidation",
+            "legacy_history_migration",
+            "memory_set",
+        ],
+        "automatic_scopes": ["private_profile", "private_atomic_memory"],
+        "owner_assignment": "server_only",
+        "model_may_select_owner": False,
+        "model_may_select_topic": False,
+    },
+    "identity": {
+        "principal_id": {
+            "canonical_regex": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+            "encoding": "UTF-8",
+            "normalization": "none",
+            "registered_required": True,
+        },
+        "multi_principal": {
+            "explicit_actor_required": True,
+            "actor_must_be_canonical": True,
+            "actor_must_be_registered": True,
+            "missing_or_invalid_outcome": "denied_invalid",
+        },
+        "executor_destination_owner_distinct": True,
+    },
+    "destination_registry": {
+        "version": "2.0.0",
+        "arbitrary_destinations_allowed": False,
+        "generic_file_fallback_allowed": False,
+    },
+    "pair_codec": {
+        "version": "pair-key-v1",
+        "implementation_status": "implemented_RP-040",
+        "principal_id_domain": {
+            "canonical_regex": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+            "encoding": "UTF-8",
+            "normalization": "none",
+        },
+        "member_cardinality": 2,
+        "members_distinct": True,
+        "ordering": "ascending_utf8_bytes",
+        "physical_grammar": (
+            "pair-v1/<decimal-utf8-byte-length>:<id>/"
+            "<decimal-utf8-byte-length>:<id>"
+        ),
+        "length_grammar": "base10_no_leading_zero_positive_integer",
+        "decode_rejection_rules": [
+            "invalid_prefix",
+            "invalid_or_noncanonical_length",
+            "invalid_utf8_or_principal_id",
+            "truncated_or_surplus_member_bytes",
+            "noncanonical_member_order",
+            "duplicate_members",
+            "trailing_bytes",
+        ],
+        "injective_over_full_id_domain": True,
+        "shared_by": ["value_keys", "acl_generation"],
+        "collision_vector": {
+            "left_members": ["a_b", "c"],
+            "right_members": ["a", "b_c"],
+            "left_encoding": "pair-v1/3:a_b/1:c",
+            "right_encoding": "pair-v1/1:a/3:b_c",
+            "must_differ": True,
+        },
+    },
+    "failure_rules": {
+        "unknown_scope": {
+            "outcome": "denied_invalid",
+            "destination_selected": False,
+            "writes": 0,
+        },
+        "invalid_actor_multi_principal": {
+            "cases": [
+                "missing",
+                "blank",
+                "malformed",
+                "non_canonical",
+                "unknown_to_registry",
+            ],
+            "outcome": "denied_invalid",
+            "destination_selected": False,
+            "writes": 0,
+            "prompt_assembly_allowed": False,
+        },
+        "malformed_pair": {
+            "cases": [
+                "missing_member",
+                "one_member",
+                "three_or_more_members",
+                "duplicate_members",
+                "invalid_member",
+                "noncanonical_order",
+            ],
+            "outcome": "denied_invalid",
+            "destination_selected": False,
+            "writes": 0,
+        },
+        "unregistered_destination": {
+            "outcome": "denied_invalid",
+            "fallback": "none",
+            "writes": 0,
+        },
+    },
+    "storage": {
+        "profile_key": "private:<principal>:value:user_profile",
+        "atomic_fact_key": "private:<principal>:memory:<fact_id>",
+        "legacy_combined_key": "private:<principal>:value:memory",
+        "legacy_combined_role": "migration_and_compatibility_input_only",
+        "transaction_candidate_key": "private:<principal>:history:<source_id>",
+        "pending_migration_key": "private:<principal>:pending_migration:<id>",
+        "fact_topics": {
+            "assigned_by": "server",
+            "homogeneous_reader_set": True,
+        },
+    },
+    "archive": {
+        "supported_private_sources": [
+            {
+                "channel": "vk",
+                "session_key": "vk:<chat_id>",
+                "required_proofs": ["private_mode", "peer_id_equals_from_id"],
+            },
+            {
+                "channel": "telegram",
+                "session_key": "telegram:<chat_id>",
+                "required_proofs": ["private_mode", "not_group", "no_topic"],
+            },
+        ],
+        "unsupported_topologies": ["group", "topic", "unified"],
+        "owner_resolution": {
+            "lookup": "(channel,chat_id)",
+            "result": "exactly_one_principal",
+            "user_actor_role": "cross_check_only",
+            "resolve_before": ["archive_sink", "llm", "legacy_archive_one"],
+        },
+        "archive_source": {
+            "immutable_fields": [
+                "source_kind",
+                "session_key",
+                "channel",
+                "chat_id",
+                "private_mode_proof",
+                "session_generation_id",
+                "message_seq_start",
+                "message_seq_end",
+                "trigger_reason",
+                "algorithm_version",
+            ],
+            "message_range": "absolute_half_open",
+        },
+        "range_identity": {
+            "range_id_fields": [
+                "source_kind",
+                "session_key",
+                "session_generation_id",
+                "message_seq_start",
+                "message_seq_end",
+            ],
+            "source_id_fields": ["range_id", "principal"],
+            "excluded_identity_fields": ["trigger_reason", "algorithm_version"],
+        },
+        "manifest": {
+            "persist_before_llm": True,
+            "frozen_fields": [
+                "principal",
+                "algorithm_version",
+                "source_id",
+                "parts",
+                "part_ids",
+            ],
+            "reuse_on_retry": True,
+        },
+        "transaction_candidate": {
+            "internal_only": True,
+            "immutable_fields": [
+                "principal",
+                "topic",
+                "session",
+                "source_id",
+                "manifest_ref",
+                "normalized_operations",
+                "original_revisions",
+                "expected_revisions",
+                "receipts",
+            ],
+            "excluded_from": ["memory_get", "indexes", "automatic_context"],
+            "close_after_canonical_writes": True,
+        },
+        "coverage": {
+            "required_before_range_release": True,
+            "parts": "terminal_non_overlapping_no_gaps",
+            "retryable_failure_is_terminal": False,
+        },
+        "fingerprint": {
+            "canonical_package": True,
+            "known_owner_only": True,
+            "collision_result": "integrity_conflict",
+            "forbidden_for_discarded_unknown": True,
+        },
+    },
+    "outcomes": {
+        "operation": {
+            "values": [
+                "applied",
+                "duplicate",
+                "awaiting_owner",
+                "denied_invalid",
+                "retryable_failure",
+            ],
+            "terminal": ["applied", "duplicate", "awaiting_owner", "denied_invalid"],
+        },
+        "part": {
+            "values": [
+                "complete",
+                "complete_with_denials",
+                "retryable_failure",
+                "integrity_conflict",
+            ],
+            "terminal": ["complete", "complete_with_denials"],
+        },
+        "private_source": {
+            "values": [
+                "complete",
+                "duplicate",
+                "retryable_failure",
+                "integrity_conflict",
+            ],
+            "terminal": ["complete", "duplicate"],
+        },
+        "unknown_private_source": {
+            "values": ["discarded_unknown"],
+            "terminal": ["discarded_unknown"],
+        },
+        "session_range": {
+            "values": [
+                "complete",
+                "retryable_failure",
+                "integrity_conflict",
+                "unsupported_topology",
+            ],
+            "terminal": ["complete"],
+        },
+        "legacy_row": {
+            "values": [
+                "imported",
+                "duplicate",
+                "awaiting_owner",
+                "discarded_unknown",
+                "retryable_failure",
+            ],
+            "terminal": [
+                "imported",
+                "duplicate",
+                "awaiting_owner",
+                "discarded_unknown",
+            ],
+        },
+        "migration_command": {
+            "plan": {
+                "values": ["planned", "blocked_needs_review"],
+                "terminal": ["planned", "blocked_needs_review"],
+            },
+            "apply": {
+                "values": ["complete", "partial", "failed"],
+                "terminal": ["complete", "partial", "failed"],
+            },
+        },
+        "semantics": {
+            "discarded_unknown": {
+                "only_for": "unknown_private_source",
+                "happens_before": ["llm", "fingerprint"],
+                "content_or_derived_copy_persisted": False,
+                "receipt_payload": ["server_coordinates", "reason_counter"],
+                "terminal": True,
+            },
+            "awaiting_owner": {
+                "only_for": "deterministic_conflict_known_owner",
+                "existing_value_replaced": False,
+                "pending_candidate_visibility": "owner_only_secret",
+                "excluded_from": [
+                    "memory_get_for_others",
+                    "indexes",
+                    "automatic_context",
+                ],
+                "notification_contains_fact_text": False,
+                "blocks_activation": False,
+                "terminal": True,
+            },
+            "denied_invalid": {
+                "only_for": "single_deterministically_invalid_operation",
+                "allowed_for_whole_model_response": False,
+                "terminal": True,
+            },
+            "unusable_whole_model_response": {
+                "outcome": "retryable_failure",
+                "terminal": False,
+                "grants_coverage": False,
+            },
+        },
+    },
+    "registry": {
+        "required_non_empty": True,
+        "unique_fields": ["principal.id", "memx_key"],
+        "exact_identity_key": "(channel,str(sender_id))",
+        "telegram_derived_alias": "numeric_user_id_before_first_pipe",
+        "effective_identity_keys_unique_between_principals": True,
+        "invalid_states": [
+            "missing",
+            "empty",
+            "malformed",
+            "duplicate_principal_id",
+            "duplicate_memx_key",
+            "exact_identity_collision",
+            "derived_identity_collision",
+        ],
+        "publish_after_full_validation": True,
+        "first_install_uses_same_validation": True,
+    },
+    "access": {
+        "decision_function": "decide_memory_read",
+        "stable_reason_required": True,
+        "owner_reads_own_valid_record": True,
+        "family_relation_kinds": [
+            "spouse_of",
+            "parent_of",
+            "owner_of",
+            "caregiver_of",
+            "guardian_of",
+        ],
+        "family_relation_direct_only": True,
+        "family_relation_direction_matters": False,
+        "common_topic_requires_family_relation": True,
+        "common_topic_ordinary_memory_overrides": [
+            "secret",
+            "explicit_deny",
+            "no_matching_static_rule",
+        ],
+        "legacy_untagged_memory_available_to_family": True,
+        "same_topic_without_family_relation": "deny",
+        "pair_scope": "exact_members_only",
+        "shared_scope": "family_relation_required",
+        "transaction_candidate_internal_only": True,
+        "service_keys_owner_only": True,
+    },
+    "unknown_content": {
+        "discard_before_model": True,
+        "allowed_persistence": ["reason_counters"],
+        "forbidden_persistence": [
+            "content",
+            "excerpt",
+            "plain_hash",
+            "cryptographic_hash",
+            "derived_copy",
+            "quarantine",
+            "manual_review_queue",
+        ],
+    },
+    "flat_memory": {
+        "paths": ["USER.md", "MEMORY.md", "memory/MEMORY.md"],
+        "may_be_memory_source": False,
+        "required_size_bytes_after_transition": 0,
+    },
+    "soul": {
+        "path": "SOUL.md",
+        "initial_template": "admin/src-tauri/resources/personality.template.txt",
+        "initial_creation": "atomic_create_if_absent",
+        "ordinary_writer": "Admin",
+        "restore_from_snapshot_is_only_exception": True,
+        "preserve_bytes_during": [
+            "dream",
+            "dream_restore",
+            "conversation_consolidation",
+            "version_update",
+            "legacy_transition",
+            "failed_restore",
+        ],
+        "missing_existing_state": "integrity_error",
+        "non_regular_file": "integrity_error",
+    },
+    "migration": {
+        "report_schema": "release/memory-migration.schema.json",
+        "source_contract_versions": ["legacy-unversioned", "1.0.0", "2.0.0"],
+        "target_contract_version": "2.0.0",
+        "migration_kinds": {
+            "legacy-unversioned": "legacy_upgrade",
+            "1.0.0": "legacy_upgrade",
+            "2.0.0": "current_verify",
+        },
+        "current_verify_imports_history": False,
+        "current_verify_calls_model": False,
+        "current_verify": {
+            "imports_history": False,
+            "calls_model": False,
+            "required_checks": [
+                "flat_files_empty",
+                "soul_verified",
+                "registry_verified",
+                "memx_verified",
+                "receipts_verified",
+                "target_invariants_verified",
+                "no_unfinished_rows",
+                "unknown_content_discarded",
+            ],
+        },
+        "plan_is_applied_evidence": False,
+        "exit_codes": {
+            "plan": {
+                "planned": 2,
+                "blocked_needs_review": 2,
+            },
+            "apply": {
+                "complete": 0,
+                "partial": 2,
+                "failed": 1,
+            },
+        },
+    },
+}

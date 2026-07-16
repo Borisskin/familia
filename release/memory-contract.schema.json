@@ -1,1092 +1,429 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://familia.local/schemas/memory-contract-1.0.0.json",
-  "title": "Familia authoritative memory contract",
+  "$id": "https://familia.invalid/schemas/memory-contract-2.0.0.json",
+  "title": "Familia authoritative memory contract 2.0.0",
   "type": "object",
-  "additionalProperties": false,
-  "required": [
-    "contract_version",
-    "authority",
-    "identity",
-    "routes",
-    "access_matrix",
-    "destination_registry",
-    "pair_codec",
-    "semantic_results",
-    "migration",
-    "legacy_compatibility",
-    "failure_rules",
-    "release_compatibility"
-  ],
+  "required": ["contract_version"],
   "properties": {
-    "contract_version": {
-      "const": "1.0.0"
-    },
+    "contract_version": { "const": "2.0.0" }
+  },
+  "const": {
+    "contract_version": "2.0.0",
     "authority": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["canonical_export", "ontology", "consumer_rule"],
-      "properties": {
-        "canonical_export": {
-          "const": "familia.memory_contract.MEMORY_CONTRACT"
-        },
-        "ontology": {
-          "const": "single"
-        },
-        "consumer_rule": {
-          "const": "derive_from_this_contract"
-        }
-      }
+      "canonical_export": "familia.memory_contract.MEMORY_CONTRACT",
+      "final_writer": "PrincipalMemoryIngestor",
+      "automatic_sources": [
+        "dream",
+        "conversation_consolidation",
+        "legacy_history_migration",
+        "memory_set"
+      ],
+      "automatic_scopes": ["private_profile", "private_atomic_memory"],
+      "owner_assignment": "server_only",
+      "model_may_select_owner": false,
+      "model_may_select_topic": false
     },
     "identity": {
-      "$ref": "#/$defs/identity"
-    },
-    "routes": {
-      "$ref": "#/$defs/routes"
-    },
-    "access_matrix": {
-      "$ref": "#/$defs/accessMatrix"
+      "principal_id": {
+        "canonical_regex": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+        "encoding": "UTF-8",
+        "normalization": "none",
+        "registered_required": true
+      },
+      "multi_principal": {
+        "explicit_actor_required": true,
+        "actor_must_be_canonical": true,
+        "actor_must_be_registered": true,
+        "missing_or_invalid_outcome": "denied_invalid"
+      },
+      "executor_destination_owner_distinct": true
     },
     "destination_registry": {
-      "$ref": "#/$defs/destinationRegistry"
+      "version": "2.0.0",
+      "arbitrary_destinations_allowed": false,
+      "generic_file_fallback_allowed": false
     },
     "pair_codec": {
-      "$ref": "#/$defs/pairCodec"
-    },
-    "semantic_results": {
-      "$ref": "#/$defs/semanticResults"
-    },
-    "migration": {
-      "$ref": "#/$defs/migration"
-    },
-    "legacy_compatibility": {
-      "$ref": "#/$defs/legacyCompatibility"
+      "version": "pair-key-v1",
+      "implementation_status": "implemented_RP-040",
+      "principal_id_domain": {
+        "canonical_regex": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+        "encoding": "UTF-8",
+        "normalization": "none"
+      },
+      "member_cardinality": 2,
+      "members_distinct": true,
+      "ordering": "ascending_utf8_bytes",
+      "physical_grammar": "pair-v1/<decimal-utf8-byte-length>:<id>/<decimal-utf8-byte-length>:<id>",
+      "length_grammar": "base10_no_leading_zero_positive_integer",
+      "decode_rejection_rules": [
+        "invalid_prefix",
+        "invalid_or_noncanonical_length",
+        "invalid_utf8_or_principal_id",
+        "truncated_or_surplus_member_bytes",
+        "noncanonical_member_order",
+        "duplicate_members",
+        "trailing_bytes"
+      ],
+      "injective_over_full_id_domain": true,
+      "shared_by": ["value_keys", "acl_generation"],
+      "collision_vector": {
+        "left_members": ["a_b", "c"],
+        "right_members": ["a", "b_c"],
+        "left_encoding": "pair-v1/3:a_b/1:c",
+        "right_encoding": "pair-v1/1:a/3:b_c",
+        "must_differ": true
+      }
     },
     "failure_rules": {
-      "$ref": "#/$defs/failureRules"
+      "unknown_scope": {
+        "outcome": "denied_invalid",
+        "destination_selected": false,
+        "writes": 0
+      },
+      "invalid_actor_multi_principal": {
+        "cases": [
+          "missing",
+          "blank",
+          "malformed",
+          "non_canonical",
+          "unknown_to_registry"
+        ],
+        "outcome": "denied_invalid",
+        "destination_selected": false,
+        "writes": 0,
+        "prompt_assembly_allowed": false
+      },
+      "malformed_pair": {
+        "cases": [
+          "missing_member",
+          "one_member",
+          "three_or_more_members",
+          "duplicate_members",
+          "invalid_member",
+          "noncanonical_order"
+        ],
+        "outcome": "denied_invalid",
+        "destination_selected": false,
+        "writes": 0
+      },
+      "unregistered_destination": {
+        "outcome": "denied_invalid",
+        "fallback": "none",
+        "writes": 0
+      }
     },
-    "release_compatibility": {
-      "$ref": "#/$defs/releaseCompatibility"
-    }
-  },
-  "$defs": {
-    "identity": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "principal_id",
-        "multi_principal",
-        "executor_destination_owner_distinct"
+    "storage": {
+      "profile_key": "private:<principal>:value:user_profile",
+      "atomic_fact_key": "private:<principal>:memory:<fact_id>",
+      "legacy_combined_key": "private:<principal>:value:memory",
+      "legacy_combined_role": "migration_and_compatibility_input_only",
+      "transaction_candidate_key": "private:<principal>:history:<source_id>",
+      "pending_migration_key": "private:<principal>:pending_migration:<id>",
+      "fact_topics": {
+        "assigned_by": "server",
+        "homogeneous_reader_set": true
+      }
+    },
+    "archive": {
+      "supported_private_sources": [
+        {
+          "channel": "vk",
+          "session_key": "vk:<chat_id>",
+          "required_proofs": ["private_mode", "peer_id_equals_from_id"]
+        },
+        {
+          "channel": "telegram",
+          "session_key": "telegram:<chat_id>",
+          "required_proofs": ["private_mode", "not_group", "no_topic"]
+        }
       ],
-      "properties": {
-        "principal_id": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "canonical_regex",
-            "encoding",
-            "normalization",
-            "registered_required"
+      "unsupported_topologies": ["group", "topic", "unified"],
+      "owner_resolution": {
+        "lookup": "(channel,chat_id)",
+        "result": "exactly_one_principal",
+        "user_actor_role": "cross_check_only",
+        "resolve_before": ["archive_sink", "llm", "legacy_archive_one"]
+      },
+      "archive_source": {
+        "immutable_fields": [
+          "source_kind",
+          "session_key",
+          "channel",
+          "chat_id",
+          "private_mode_proof",
+          "session_generation_id",
+          "message_seq_start",
+          "message_seq_end",
+          "trigger_reason",
+          "algorithm_version"
+        ],
+        "message_range": "absolute_half_open"
+      },
+      "range_identity": {
+        "range_id_fields": [
+          "source_kind",
+          "session_key",
+          "session_generation_id",
+          "message_seq_start",
+          "message_seq_end"
+        ],
+        "source_id_fields": ["range_id", "principal"],
+        "excluded_identity_fields": ["trigger_reason", "algorithm_version"]
+      },
+      "manifest": {
+        "persist_before_llm": true,
+        "frozen_fields": [
+          "principal",
+          "algorithm_version",
+          "source_id",
+          "parts",
+          "part_ids"
+        ],
+        "reuse_on_retry": true
+      },
+      "transaction_candidate": {
+        "internal_only": true,
+        "immutable_fields": [
+          "principal",
+          "topic",
+          "session",
+          "source_id",
+          "manifest_ref",
+          "normalized_operations",
+          "original_revisions",
+          "expected_revisions",
+          "receipts"
+        ],
+        "excluded_from": ["memory_get", "indexes", "automatic_context"],
+        "close_after_canonical_writes": true
+      },
+      "coverage": {
+        "required_before_range_release": true,
+        "parts": "terminal_non_overlapping_no_gaps",
+        "retryable_failure_is_terminal": false
+      },
+      "fingerprint": {
+        "canonical_package": true,
+        "known_owner_only": true,
+        "collision_result": "integrity_conflict",
+        "forbidden_for_discarded_unknown": true
+      }
+    },
+    "outcomes": {
+      "operation": {
+        "values": [
+          "applied",
+          "duplicate",
+          "awaiting_owner",
+          "denied_invalid",
+          "retryable_failure"
+        ],
+        "terminal": ["applied", "duplicate", "awaiting_owner", "denied_invalid"]
+      },
+      "part": {
+        "values": [
+          "complete",
+          "complete_with_denials",
+          "retryable_failure",
+          "integrity_conflict"
+        ],
+        "terminal": ["complete", "complete_with_denials"]
+      },
+      "private_source": {
+        "values": [
+          "complete",
+          "duplicate",
+          "retryable_failure",
+          "integrity_conflict"
+        ],
+        "terminal": ["complete", "duplicate"]
+      },
+      "unknown_private_source": {
+        "values": ["discarded_unknown"],
+        "terminal": ["discarded_unknown"]
+      },
+      "session_range": {
+        "values": [
+          "complete",
+          "retryable_failure",
+          "integrity_conflict",
+          "unsupported_topology"
+        ],
+        "terminal": ["complete"]
+      },
+      "legacy_row": {
+        "values": [
+          "imported",
+          "duplicate",
+          "awaiting_owner",
+          "discarded_unknown",
+          "retryable_failure"
+        ],
+        "terminal": [
+          "imported",
+          "duplicate",
+          "awaiting_owner",
+          "discarded_unknown"
+        ]
+      },
+      "migration_command": {
+        "plan": {
+          "values": ["planned", "blocked_needs_review"],
+          "terminal": ["planned", "blocked_needs_review"]
+        },
+        "apply": {
+          "values": ["complete", "partial", "failed"],
+          "terminal": ["complete", "partial", "failed"]
+        }
+      },
+      "semantics": {
+        "discarded_unknown": {
+          "only_for": "unknown_private_source",
+          "happens_before": ["llm", "fingerprint"],
+          "content_or_derived_copy_persisted": false,
+          "receipt_payload": ["server_coordinates", "reason_counter"],
+          "terminal": true
+        },
+        "awaiting_owner": {
+          "only_for": "deterministic_conflict_known_owner",
+          "existing_value_replaced": false,
+          "pending_candidate_visibility": "owner_only_secret",
+          "excluded_from": [
+            "memory_get_for_others",
+            "indexes",
+            "automatic_context"
           ],
-          "properties": {
-            "canonical_regex": {
-              "const": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
-            },
-            "encoding": {
-              "const": "UTF-8"
-            },
-            "normalization": {
-              "const": "none"
-            },
-            "registered_required": {
-              "const": true
-            }
-          }
-        },
-        "multi_principal": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "explicit_actor_required",
-            "actor_must_be_canonical",
-            "actor_must_be_registered",
-            "missing_or_invalid_outcome"
-          ],
-          "properties": {
-            "explicit_actor_required": {
-              "const": true
-            },
-            "actor_must_be_canonical": {
-              "const": true
-            },
-            "actor_must_be_registered": {
-              "const": true
-            },
-            "missing_or_invalid_outcome": {
-              "const": "denied_invalid"
-            }
-          }
-        },
-        "executor_destination_owner_distinct": {
-          "const": true
-        }
-      }
-    },
-    "routes": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["PRIVATE", "SHARED", "PAIR"],
-      "properties": {
-        "PRIVATE": {
-          "$ref": "#/$defs/privateRoute"
-        },
-        "SHARED": {
-          "$ref": "#/$defs/sharedRoute"
-        },
-        "PAIR": {
-          "$ref": "#/$defs/pairRoute"
-        }
-      }
-    },
-    "privateRoute": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["owner", "visibility", "destination"],
-      "properties": {
-        "owner": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["rule", "cardinality"],
-          "properties": {
-            "rule": {
-              "const": "explicit_principal"
-            },
-            "cardinality": {
-              "const": 1
-            }
-          }
-        },
-        "visibility": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["rule", "sensitivity_can_widen_access"],
-          "properties": {
-            "rule": {
-              "const": "owner_only"
-            },
-            "sensitivity_can_widen_access": {
-              "const": false
-            }
-          }
-        },
-        "destination": {
-          "$ref": "#/$defs/privateDestination"
-        }
-      }
-    },
-    "sharedRoute": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["owner", "visibility", "destination"],
-      "properties": {
-        "owner": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["rule", "cardinality", "writer_is_default"],
-          "properties": {
-            "rule": {
-              "const": "explicit_family_shared_namespace"
-            },
-            "cardinality": {
-              "const": 1
-            },
-            "writer_is_default": {
-              "const": false
-            }
-          }
-        },
-        "visibility": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["rule", "policy"],
-          "properties": {
-            "rule": {
-              "const": "relationship_policy"
-            },
-            "policy": {
-              "const": "familia_graph_v1"
-            }
-          }
-        },
-        "destination": {
-          "$ref": "#/$defs/sharedDestination"
-        }
-      }
-    },
-    "pairRoute": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["owner", "visibility", "destination"],
-      "properties": {
-        "owner": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "rule",
-            "cardinality",
-            "member_cardinality",
-            "members_distinct"
-          ],
-          "properties": {
-            "rule": {
-              "const": "canonical_unordered_pair"
-            },
-            "cardinality": {
-              "const": 1
-            },
-            "member_cardinality": {
-              "const": 2
-            },
-            "members_distinct": {
-              "const": true
-            }
-          }
-        },
-        "visibility": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "rule",
-            "member_cardinality",
-            "relationship_can_add_members"
-          ],
-          "properties": {
-            "rule": {
-              "const": "exact_members_only"
-            },
-            "member_cardinality": {
-              "const": 2
-            },
-            "relationship_can_add_members": {
-              "const": false
-            }
-          }
-        },
-        "destination": {
-          "$ref": "#/$defs/pairDestination"
-        }
-      }
-    },
-    "privateDestination": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["registry_id", "cardinality"],
-      "properties": {
-        "registry_id": {
-          "const": "private_principal_memory"
-        },
-        "cardinality": {
-          "const": 1
-        }
-      }
-    },
-    "sharedDestination": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["registry_id", "cardinality"],
-      "properties": {
-        "registry_id": {
-          "const": "shared_family_memory"
-        },
-        "cardinality": {
-          "const": 1
-        }
-      }
-    },
-    "pairDestination": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["registry_id", "cardinality"],
-      "properties": {
-        "registry_id": {
-          "const": "canonical_pair_memory"
-        },
-        "cardinality": {
-          "const": 1
-        }
-      }
-    },
-    "accessMatrix": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["relationship_policy", "PRIVATE", "SHARED", "PAIR"],
-      "properties": {
-        "relationship_policy": {
-          "const": "familia_graph_v1"
-        },
-        "PRIVATE": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "owner",
-            "non_owner",
-            "secret_or_other_tags_change_access"
-          ],
-          "properties": {
-            "owner": {
-              "const": "allow"
-            },
-            "non_owner": {
-              "const": "deny"
-            },
-            "secret_or_other_tags_change_access": {
-              "const": false
-            }
-          }
-        },
-        "SHARED": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["owner", "related", "unrelated", "unknown_relationship"],
-          "properties": {
-            "owner": {
-              "const": "allow"
-            },
-            "related": {
-              "const": "familia_graph_v1"
-            },
-            "unrelated": {
-              "const": "deny"
-            },
-            "unknown_relationship": {
-              "const": "deny"
-            }
-          }
-        },
-        "PAIR": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "member",
-            "outsider",
-            "relationship_to_member_changes_access"
-          ],
-          "properties": {
-            "member": {
-              "const": "allow"
-            },
-            "outsider": {
-              "const": "deny"
-            },
-            "relationship_to_member_changes_access": {
-              "const": false
-            }
-          }
-        }
-      }
-    },
-    "destinationRegistry": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "version",
-        "arbitrary_destinations_allowed",
-        "generic_file_fallback_allowed",
-        "entries"
-      ],
-      "properties": {
-        "version": {
-          "const": "1.0.0"
-        },
-        "arbitrary_destinations_allowed": {
-          "const": false
-        },
-        "generic_file_fallback_allowed": {
-          "const": false
-        },
-        "entries": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "private_principal_memory",
-            "shared_family_memory",
-            "canonical_pair_memory"
-          ],
-          "properties": {
-            "private_principal_memory": {
-              "$ref": "#/$defs/privateRegistryEntry"
-            },
-            "shared_family_memory": {
-              "$ref": "#/$defs/sharedRegistryEntry"
-            },
-            "canonical_pair_memory": {
-              "$ref": "#/$defs/pairRegistryEntry"
-            }
-          }
-        }
-      }
-    },
-    "privateRegistryEntry": {
-      "$ref": "#/$defs/registryEntry",
-      "properties": {
-        "scope": {
-          "const": "PRIVATE"
-        },
-        "owner_binding": {
-          "const": "explicit_principal"
-        }
-      }
-    },
-    "sharedRegistryEntry": {
-      "$ref": "#/$defs/registryEntry",
-      "properties": {
-        "scope": {
-          "const": "SHARED"
-        },
-        "owner_binding": {
-          "const": "explicit_family_shared_namespace"
-        }
-      }
-    },
-    "pairRegistryEntry": {
-      "$ref": "#/$defs/registryEntry",
-      "properties": {
-        "scope": {
-          "const": "PAIR"
-        },
-        "owner_binding": {
-          "const": "canonical_unordered_pair"
-        }
-      }
-    },
-    "registryEntry": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["scope", "owner_binding", "retrieval", "write_only_archive"],
-      "properties": {
-        "scope": {
-          "enum": ["PRIVATE", "SHARED", "PAIR"]
-        },
-        "owner_binding": {
-          "enum": [
-            "explicit_principal",
-            "explicit_family_shared_namespace",
-            "canonical_unordered_pair"
-          ]
-        },
-        "retrieval": {
-          "const": "intended_principal_next_turn"
-        },
-        "write_only_archive": {
-          "const": false
-        }
-      }
-    },
-    "pairCodec": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "version",
-        "implementation_status",
-        "principal_id_domain",
-        "member_cardinality",
-        "members_distinct",
-        "ordering",
-        "physical_grammar",
-        "length_grammar",
-        "decode_rejection_rules",
-        "injective_over_full_id_domain",
-        "shared_by",
-        "collision_vector",
-        "legacy"
-      ],
-      "properties": {
-        "version": {
-          "const": "pair-key-v1"
-        },
-        "implementation_status": {
-          "const": "implemented_RP-040"
-        },
-        "principal_id_domain": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["canonical_regex", "encoding", "normalization"],
-          "properties": {
-            "canonical_regex": {
-              "const": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
-            },
-            "encoding": {
-              "const": "UTF-8"
-            },
-            "normalization": {
-              "const": "none"
-            }
-          }
-        },
-        "member_cardinality": {
-          "const": 2
-        },
-        "members_distinct": {
-          "const": true
-        },
-        "ordering": {
-          "const": "ascending_utf8_bytes"
-        },
-        "physical_grammar": {
-          "const": "pair-v1/<decimal-utf8-byte-length>:<id>/<decimal-utf8-byte-length>:<id>"
-        },
-        "length_grammar": {
-          "const": "base10_no_leading_zero_positive_integer"
-        },
-        "decode_rejection_rules": {
-          "type": "array",
-          "minItems": 7,
-          "uniqueItems": true,
-          "items": {
-            "enum": [
-              "invalid_prefix",
-              "invalid_or_noncanonical_length",
-              "invalid_utf8_or_principal_id",
-              "truncated_or_surplus_member_bytes",
-              "noncanonical_member_order",
-              "duplicate_members",
-              "trailing_bytes"
-            ]
-          }
-        },
-        "injective_over_full_id_domain": {
-          "const": true
-        },
-        "shared_by": {
-          "const": ["value_keys", "acl_generation"]
-        },
-        "collision_vector": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "left_members",
-            "right_members",
-            "left_encoding",
-            "right_encoding",
-            "must_differ"
-          ],
-          "properties": {
-            "left_members": {
-              "const": ["a_b", "c"]
-            },
-            "right_members": {
-              "const": ["a", "b_c"]
-            },
-            "left_encoding": {
-              "const": "pair-v1/3:a_b/1:c"
-            },
-            "right_encoding": {
-              "const": "pair-v1/1:a/3:b_c"
-            },
-            "must_differ": {
-              "const": true
-            }
-          }
-        },
-        "legacy": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "delimiter_keys_are_current",
-            "translation",
-            "ambiguous_outcome",
-            "ambiguous_writes"
-          ],
-          "properties": {
-            "delimiter_keys_are_current": {
-              "const": false
-            },
-            "translation": {
-              "const": "manifest_required"
-            },
-            "ambiguous_outcome": {
-              "const": "quarantine_needs_review"
-            },
-            "ambiguous_writes": {
-              "const": 0
-            }
-          }
-        }
-      }
-    },
-    "semanticResults": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "committed",
-        "retryable_failure",
-        "denied_invalid",
-        "quarantine_needs_review",
-        "not_updated"
-      ],
-      "properties": {
-        "committed": {
-          "$ref": "#/$defs/committedResult"
-        },
-        "retryable_failure": {
-          "$ref": "#/$defs/retryableResult"
+          "notification_contains_fact_text": false,
+          "blocks_activation": false,
+          "terminal": true
         },
         "denied_invalid": {
-          "$ref": "#/$defs/deniedResult"
+          "only_for": "single_deterministically_invalid_operation",
+          "allowed_for_whole_model_response": false,
+          "terminal": true
         },
-        "quarantine_needs_review": {
-          "$ref": "#/$defs/quarantineResult"
-        },
-        "not_updated": {
-          "$ref": "#/$defs/notUpdatedResult"
+        "unusable_whole_model_response": {
+          "outcome": "retryable_failure",
+          "terminal": false,
+          "grants_coverage": false
         }
       }
     },
-    "resultShape": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "durably_committed",
-        "retryable",
-        "requires_review",
-        "transport_updated",
-        "cursor_may_advance"
+    "registry": {
+      "required_non_empty": true,
+      "unique_fields": ["principal.id", "memx_key"],
+      "exact_identity_key": "(channel,str(sender_id))",
+      "telegram_derived_alias": "numeric_user_id_before_first_pipe",
+      "effective_identity_keys_unique_between_principals": true,
+      "invalid_states": [
+        "missing",
+        "empty",
+        "malformed",
+        "duplicate_principal_id",
+        "duplicate_memx_key",
+        "exact_identity_collision",
+        "derived_identity_collision"
       ],
-      "properties": {
-        "durably_committed": {
-          "type": "boolean"
-        },
-        "retryable": {
-          "type": "boolean"
-        },
-        "requires_review": {
-          "type": "boolean"
-        },
-        "transport_updated": {
-          "type": ["boolean", "null"]
-        },
-        "cursor_may_advance": {
-          "type": "boolean"
-        }
-      }
+      "publish_after_full_validation": true,
+      "first_install_uses_same_validation": true
     },
-    "committedResult": {
-      "$ref": "#/$defs/resultShape",
-      "properties": {
-        "durably_committed": {"const": true},
-        "retryable": {"const": false},
-        "requires_review": {"const": false},
-        "transport_updated": {"const": true},
-        "cursor_may_advance": {"const": true}
-      }
+    "access": {
+      "decision_function": "decide_memory_read",
+      "stable_reason_required": true,
+      "owner_reads_own_valid_record": true,
+      "family_relation_kinds": [
+        "spouse_of",
+        "parent_of",
+        "owner_of",
+        "caregiver_of",
+        "guardian_of"
+      ],
+      "family_relation_direct_only": true,
+      "family_relation_direction_matters": false,
+      "common_topic_requires_family_relation": true,
+      "common_topic_ordinary_memory_overrides": [
+        "secret",
+        "explicit_deny",
+        "no_matching_static_rule"
+      ],
+      "legacy_untagged_memory_available_to_family": true,
+      "same_topic_without_family_relation": "deny",
+      "pair_scope": "exact_members_only",
+      "shared_scope": "family_relation_required",
+      "transaction_candidate_internal_only": true,
+      "service_keys_owner_only": true
     },
-    "retryableResult": {
-      "$ref": "#/$defs/resultShape",
-      "properties": {
-        "durably_committed": {"const": false},
-        "retryable": {"const": true},
-        "requires_review": {"const": false},
-        "transport_updated": {"const": null},
-        "cursor_may_advance": {"const": false}
-      }
+    "unknown_content": {
+      "discard_before_model": true,
+      "allowed_persistence": ["reason_counters"],
+      "forbidden_persistence": [
+        "content",
+        "excerpt",
+        "plain_hash",
+        "cryptographic_hash",
+        "derived_copy",
+        "quarantine",
+        "manual_review_queue"
+      ]
     },
-    "deniedResult": {
-      "$ref": "#/$defs/resultShape",
-      "properties": {
-        "durably_committed": {"const": false},
-        "retryable": {"const": false},
-        "requires_review": {"const": false},
-        "transport_updated": {"const": null},
-        "cursor_may_advance": {"const": false}
-      }
+    "flat_memory": {
+      "paths": ["USER.md", "MEMORY.md", "memory/MEMORY.md"],
+      "may_be_memory_source": false,
+      "required_size_bytes_after_transition": 0
     },
-    "quarantineResult": {
-      "$ref": "#/$defs/resultShape",
-      "properties": {
-        "durably_committed": {"const": false},
-        "retryable": {"const": false},
-        "requires_review": {"const": true},
-        "transport_updated": {"const": null},
-        "cursor_may_advance": {"const": false}
-      }
-    },
-    "notUpdatedResult": {
-      "$ref": "#/$defs/resultShape",
-      "properties": {
-        "durably_committed": {"const": false},
-        "retryable": {"const": true},
-        "requires_review": {"const": false},
-        "transport_updated": {"const": false},
-        "cursor_may_advance": {"const": false}
-      }
+    "soul": {
+      "path": "SOUL.md",
+      "initial_template": "admin/src-tauri/resources/personality.template.txt",
+      "initial_creation": "atomic_create_if_absent",
+      "ordinary_writer": "Admin",
+      "restore_from_snapshot_is_only_exception": true,
+      "preserve_bytes_during": [
+        "dream",
+        "dream_restore",
+        "conversation_consolidation",
+        "version_update",
+        "legacy_transition",
+        "failed_restore"
+      ],
+      "missing_existing_state": "integrity_error",
+      "non_regular_file": "integrity_error"
     },
     "migration": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "dispositions",
-        "ambiguous_provenance",
-        "legacy_input",
-        "delete"
-      ],
-      "properties": {
-        "dispositions": {
-          "const": [
-            "retain",
-            "rekey",
-            "deduplicate",
-            "quarantine",
-            "delete"
-          ]
+      "report_schema": "release/memory-migration.schema.json",
+      "source_contract_versions": ["legacy-unversioned", "1.0.0", "2.0.0"],
+      "target_contract_version": "2.0.0",
+      "migration_kinds": {
+        "legacy-unversioned": "legacy_upgrade",
+        "1.0.0": "legacy_upgrade",
+        "2.0.0": "current_verify"
+      },
+      "current_verify_imports_history": false,
+      "current_verify_calls_model": false,
+      "current_verify": {
+        "imports_history": false,
+        "calls_model": false,
+        "required_checks": [
+          "flat_files_empty",
+          "soul_verified",
+          "registry_verified",
+          "memx_verified",
+          "receipts_verified",
+          "target_invariants_verified",
+          "no_unfinished_rows",
+          "unknown_content_discarded"
+        ]
+      },
+      "plan_is_applied_evidence": false,
+      "exit_codes": {
+        "plan": {
+          "planned": 2,
+          "blocked_needs_review": 2
         },
-        "ambiguous_provenance": {
-          "$ref": "#/$defs/quarantineZeroWrites"
-        },
-        "legacy_input": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "classification_required",
-            "accepted_as_current_semantics"
-          ],
-          "properties": {
-            "classification_required": {
-              "const": true
-            },
-            "accepted_as_current_semantics": {
-              "const": false
-            }
-          }
-        },
-        "delete": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "performed_by_RP-000",
-            "record_level_approval_required"
-          ],
-          "properties": {
-            "performed_by_RP-000": {
-              "const": false
-            },
-            "record_level_approval_required": {
-              "const": true
-            }
-          }
-        }
-      }
-    },
-    "quarantineZeroWrites": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["outcome", "writes"],
-      "properties": {
-        "outcome": {
-          "const": "quarantine_needs_review"
-        },
-        "writes": {
-          "const": 0
-        }
-      }
-    },
-    "historyQuarantine": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["prompt_included", "outcome", "principal_graph_writes"],
-      "properties": {
-        "prompt_included": {
-          "const": false
-        },
-        "outcome": {
-          "const": "quarantine_needs_review"
-        },
-        "principal_graph_writes": {
-          "const": 0
-        }
-      }
-    },
-    "legacyCompatibility": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["history", "global_files", "pair_keys", "private_peer_read"],
-      "properties": {
-        "history": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "actorless_multi_principal",
-            "unknown_actor_multi_principal",
-            "actorless_explicit_standalone"
-          ],
-          "properties": {
-            "actorless_multi_principal": {
-              "$ref": "#/$defs/historyQuarantine"
-            },
-            "unknown_actor_multi_principal": {
-              "$ref": "#/$defs/historyQuarantine"
-            },
-            "actorless_explicit_standalone": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": [
-                "local_read_allowed",
-                "auto_promote_to_principal_graph",
-                "principal_graph_writes"
-              ],
-              "properties": {
-                "local_read_allowed": {
-                  "const": true
-                },
-                "auto_promote_to_principal_graph": {
-                  "const": false
-                },
-                "principal_graph_writes": {
-                  "const": 0
-                }
-              }
-            }
-          }
-        },
-        "global_files": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["names", "fan_out_allowed", "classification_required"],
-          "properties": {
-            "names": {
-              "const": ["USER.md", "MEMORY.md", "HEARTBEAT.md"]
-            },
-            "fan_out_allowed": {
-              "const": false
-            },
-            "classification_required": {
-              "const": true
-            }
-          }
-        },
-        "pair_keys": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["governed_by"],
-          "properties": {
-            "governed_by": {
-              "const": "pair_codec.legacy"
-            }
-          }
-        },
-        "private_peer_read": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "enabled_automatically",
-            "shared_reclassification_requires_manifest_and_approval"
-          ],
-          "properties": {
-            "enabled_automatically": {
-              "const": false
-            },
-            "shared_reclassification_requires_manifest_and_approval": {
-              "const": true
-            }
-          }
-        }
-      }
-    },
-    "failureRules": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "unknown_scope",
-        "invalid_actor_multi_principal",
-        "malformed_pair",
-        "unregistered_destination"
-      ],
-      "properties": {
-        "unknown_scope": {
-          "$ref": "#/$defs/deniedZeroWrites"
-        },
-        "invalid_actor_multi_principal": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "cases",
-            "outcome",
-            "destination_selected",
-            "writes",
-            "prompt_assembly_allowed"
-          ],
-          "properties": {
-            "cases": {
-              "const": [
-                "missing",
-                "blank",
-                "malformed",
-                "non_canonical",
-                "unknown_to_registry"
-              ]
-            },
-            "outcome": {
-              "const": "denied_invalid"
-            },
-            "destination_selected": {
-              "const": false
-            },
-            "writes": {
-              "const": 0
-            },
-            "prompt_assembly_allowed": {
-              "const": false
-            }
-          }
-        },
-        "malformed_pair": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["cases", "outcome", "destination_selected", "writes"],
-          "properties": {
-            "cases": {
-              "const": [
-                "missing_member",
-                "one_member",
-                "three_or_more_members",
-                "duplicate_members",
-                "invalid_member",
-                "noncanonical_order"
-              ]
-            },
-            "outcome": {
-              "const": "denied_invalid"
-            },
-            "destination_selected": {
-              "const": false
-            },
-            "writes": {
-              "const": 0
-            }
-          }
-        },
-        "unregistered_destination": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["outcome", "fallback", "writes"],
-          "properties": {
-            "outcome": {
-              "const": "denied_invalid"
-            },
-            "fallback": {
-              "const": "none"
-            },
-            "writes": {
-              "const": 0
-            }
-          }
-        }
-      }
-    },
-    "deniedZeroWrites": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["outcome", "destination_selected", "writes"],
-      "properties": {
-        "outcome": {
-          "const": "denied_invalid"
-        },
-        "destination_selected": {
-          "const": false
-        },
-        "writes": {
-          "const": 0
-        }
-      }
-    },
-    "releaseCompatibility": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["release_identity", "upgrade_boundary"],
-      "properties": {
-        "release_identity": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "backend_version",
-            "release_tag",
-            "release_scope",
-            "vendored_nanobot_version",
-            "nanobot_baseline_commit",
-            "included_components",
-            "excluded_components"
-          ],
-          "properties": {
-            "backend_version": {
-              "const": "0.4.0"
-            },
-            "release_tag": {
-              "const": "image-v0.4.0"
-            },
-            "release_scope": {
-              "const": "backend-only"
-            },
-            "vendored_nanobot_version": {
-              "const": "0.1.5.post2"
-            },
-            "nanobot_baseline_commit": {
-              "const": "950dddec499fbbe0353e997158c99808f0bb41e1"
-            },
-            "included_components": {
-              "const": [
-                "tracked backend",
-                "vendored nanobot baseline",
-                "Familia adapters",
-                "memX",
-                "bridge",
-                "Compose",
-                "memory migration and repair tooling",
-                "operator documentation"
-              ]
-            },
-            "excluded_components": {
-              "const": ["ignored local admin/"]
-            }
-          }
-        },
-        "upgrade_boundary": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "familia_owned_invariants",
-            "replaceable_upstream_details",
-            "behavioral_equivalence_claimed",
-            "later_nanobot_target_selected",
-            "version_synchronization_work_item"
-          ],
-          "properties": {
-            "familia_owned_invariants": {
-              "type": "array",
-              "minItems": 5,
-              "uniqueItems": true,
-              "items": {
-                "type": "string",
-                "minLength": 1
-              }
-            },
-            "replaceable_upstream_details": {
-              "type": "array",
-              "minItems": 4,
-              "uniqueItems": true,
-              "items": {
-                "type": "string",
-                "minLength": 1
-              }
-            },
-            "behavioral_equivalence_claimed": {
-              "const": false
-            },
-            "later_nanobot_target_selected": {
-              "const": false
-            },
-            "version_synchronization_work_item": {
-              "const": "RP-120"
-            }
-          }
+        "apply": {
+          "complete": 0,
+          "partial": 2,
+          "failed": 1
         }
       }
     }
