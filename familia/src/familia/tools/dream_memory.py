@@ -31,7 +31,7 @@ from loguru import logger
 
 from familia.acl.peers import is_peer
 from familia.memx_client import memx_base_url
-from familia.policy import Decision, PolicyContext, get_engine, is_explicit_deny
+from familia.policy import Decision, PolicyContext, get_engine
 from familia.principals import ambiguous_pair_namespaces, pair_namespace_token
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
@@ -226,21 +226,17 @@ class DreamMemorySetTool(Tool):
                     pair_token,
                 )
                 return "Skipped: pair namespace belongs to multiple actor pairs"
-        # The exact pair endpoint + graph gate above is authoritative. Always
-        # evaluate policy for audit and explicit operator denies; tolerate
-        # only the unmatched fallback from a legacy policy without pair:*.
-        decision = get_engine().evaluate(
-            PolicyContext(
-                action="memory.write",
-                actor=CONSOLIDATOR_ACTOR,
-                to_chat=full_key,
+        if resolved_scope != "pair":
+            decision = get_engine().evaluate(
+                PolicyContext(
+                    action="memory.write",
+                    actor=CONSOLIDATOR_ACTOR,
+                    to_chat=full_key,
+                )
             )
-        )
-        if decision.decision is Decision.DENY and (
-            resolved_scope != "pair" or is_explicit_deny(decision)
-        ):
-            reason = decision.reason or "policy denied"
-            return f"Error: Policy denied memory.write на '{full_key}' для {CONSOLIDATOR_ACTOR}: {reason}"
+            if decision.decision is Decision.DENY:
+                reason = decision.reason or "policy denied"
+                return f"Error: Policy denied memory.write на '{full_key}' для {CONSOLIDATOR_ACTOR}: {reason}"
         if resolved_scope == "private" and full_key.endswith(":value:memory"):
             return await self._merge_private_memory(full_key, value)
         return await self._write_value(full_key, value)

@@ -18,6 +18,12 @@ from familia.tools import memory as memory_mod
 from familia.tools.memory import MemoryGetTool, MemorySetTool, _resolve_full_key
 
 
+def _legacy_policy_must_not_run() -> None:
+    raise AssertionError(
+        "canonical pair routing must not consult the legacy default-deny policy"
+    )
+
+
 @pytest.fixture
 def registry(monkeypatch: pytest.MonkeyPatch) -> PrincipalRegistry:
     registry = PrincipalRegistry(
@@ -106,6 +112,30 @@ def test_principal_memory_restores_peer_private_read(
         "actor_zeta",
     })
     monkeypatch.setattr(graph_io, "resolve_admin_key", lambda: "admin-proxy-key")
+    family_graph = {
+        "nodes": [
+            {"id": "actor_alpha", "type": "principal"},
+            {"id": "actor_zeta", "type": "principal"},
+        ],
+        "edges": [
+            {
+                "from": "actor_alpha",
+                "to": "actor_zeta",
+                "rel": "spouse_of",
+            },
+        ],
+        "updated_at_ms": 1,
+    }
+    topics_graph = {"nodes": [], "edges": [], "updated_at_ms": 1}
+    monkeypatch.setattr(
+        graph_io,
+        "load_graph_value",
+        lambda key, **_kwargs: (
+            family_graph
+            if key == "shared:family.graph"
+            else topics_graph
+        ),
+    )
     monkeypatch.setattr(
         principal_memory_mod,
         "get_raw",
@@ -164,13 +194,7 @@ async def test_runtime_pair_read_bypasses_legacy_policy_after_graph_gate(
     monkeypatch.setattr(
         memory_mod,
         "get_engine",
-        lambda: SimpleNamespace(
-            evaluate=lambda _context: SimpleNamespace(
-                decision=Decision.DENY,
-                reason="no matching rule",
-                rule=SimpleNamespace(name="__default_deny__"),
-            )
-        ),
+        _legacy_policy_must_not_run,
     )
     monkeypatch.setattr(
         memory_mod.httpx,
@@ -192,7 +216,7 @@ async def test_runtime_pair_read_bypasses_legacy_policy_after_graph_gate(
 
 
 @pytest.mark.asyncio
-async def test_runtime_pair_read_honors_explicit_policy_deny(
+async def test_runtime_pair_read_ignores_legacy_policy_after_graph_gate(
     monkeypatch: pytest.MonkeyPatch,
     registry: PrincipalRegistry,
 ) -> None:
@@ -200,13 +224,7 @@ async def test_runtime_pair_read_honors_explicit_policy_deny(
     monkeypatch.setattr(
         memory_mod,
         "get_engine",
-        lambda: SimpleNamespace(
-            evaluate=lambda _context: SimpleNamespace(
-                decision=Decision.DENY,
-                reason="pair explicitly denied",
-                rule=SimpleNamespace(name="deny-pair"),
-            )
-        ),
+        _legacy_policy_must_not_run,
     )
     monkeypatch.setattr(
         memory_mod.httpx,
@@ -224,8 +242,7 @@ async def test_runtime_pair_read_honors_explicit_policy_deny(
         key="value:memory",
     )
 
-    assert result.startswith("Policy denied memory.read")
-    assert "pair explicitly denied" in result
+    assert result == "must-not-be-visible"
 
 
 @pytest.mark.asyncio
@@ -238,13 +255,7 @@ async def test_runtime_pair_write_bypasses_legacy_policy_after_graph_gate(
     monkeypatch.setattr(
         memory_mod,
         "get_engine",
-        lambda: SimpleNamespace(
-            evaluate=lambda _context: SimpleNamespace(
-                decision=Decision.DENY,
-                reason="no matching rule",
-                rule=SimpleNamespace(name="__default_deny__"),
-            )
-        ),
+        _legacy_policy_must_not_run,
     )
     monkeypatch.setattr(
         memory_mod.httpx,
@@ -276,7 +287,7 @@ async def test_runtime_pair_write_bypasses_legacy_policy_after_graph_gate(
 
 
 @pytest.mark.asyncio
-async def test_runtime_pair_write_honors_explicit_policy_deny(
+async def test_runtime_pair_write_ignores_legacy_policy_after_graph_gate(
     monkeypatch: pytest.MonkeyPatch,
     registry: PrincipalRegistry,
 ) -> None:
@@ -285,13 +296,7 @@ async def test_runtime_pair_write_honors_explicit_policy_deny(
     monkeypatch.setattr(
         memory_mod,
         "get_engine",
-        lambda: SimpleNamespace(
-            evaluate=lambda _context: SimpleNamespace(
-                decision=Decision.DENY,
-                reason="pair explicitly denied",
-                rule=SimpleNamespace(name="deny-pair"),
-            )
-        ),
+        _legacy_policy_must_not_run,
     )
     monkeypatch.setattr(
         memory_mod.httpx,
@@ -299,7 +304,15 @@ async def test_runtime_pair_write_honors_explicit_policy_deny(
         lambda **_kwargs: _RecordingClient(
             requests,
             get_response=_Response(500),
-            post_response=_Response(200, {"status": "committed"}),
+            post_response=_Response(
+                200,
+                {
+                    "status": "committed",
+                    "committed": True,
+                    "updated": True,
+                    "retryable": False,
+                },
+            ),
         ),
     )
     set_current_actor("actor_zeta")
@@ -310,9 +323,8 @@ async def test_runtime_pair_write_honors_explicit_policy_deny(
         value="pair fact",
     )
 
-    assert result.startswith("Policy denied memory.write")
-    assert "pair explicitly denied" in result
-    assert requests == []
+    assert result == "committed: Stored at 'pair:actor_alpha_actor_zeta:value:memory'"
+    assert requests[0]["key"] == "pair:actor_alpha_actor_zeta:value:memory"
 
 
 @pytest.mark.asyncio
@@ -370,13 +382,7 @@ async def test_dream_pair_bypasses_legacy_policy_after_graph_gate(
     monkeypatch.setattr(
         dream_memory_mod,
         "get_engine",
-        lambda: SimpleNamespace(
-            evaluate=lambda _context: SimpleNamespace(
-                decision=Decision.DENY,
-                reason="no matching rule",
-                rule=SimpleNamespace(name="__default_deny__"),
-            )
-        ),
+        _legacy_policy_must_not_run,
     )
     monkeypatch.setattr(
         dream_memory_mod.httpx,
@@ -411,7 +417,7 @@ async def test_dream_pair_bypasses_legacy_policy_after_graph_gate(
 
 
 @pytest.mark.asyncio
-async def test_dream_pair_honors_explicit_policy_deny(
+async def test_dream_pair_ignores_legacy_policy_after_graph_gate(
     monkeypatch: pytest.MonkeyPatch,
     registry: PrincipalRegistry,
 ) -> None:
@@ -420,13 +426,7 @@ async def test_dream_pair_honors_explicit_policy_deny(
     monkeypatch.setattr(
         dream_memory_mod,
         "get_engine",
-        lambda: SimpleNamespace(
-            evaluate=lambda _context: SimpleNamespace(
-                decision=Decision.DENY,
-                reason="pair explicitly denied",
-                rule=SimpleNamespace(name="deny-pair"),
-            )
-        ),
+        _legacy_policy_must_not_run,
     )
     monkeypatch.setattr(
         dream_memory_mod.httpx,
@@ -434,7 +434,16 @@ async def test_dream_pair_honors_explicit_policy_deny(
         lambda **_kwargs: _RecordingClient(
             requests,
             get_response=_Response(500),
-            post_response=_Response(200, {"status": "committed"}),
+            post_response=_Response(
+                200,
+                {
+                    "ok": True,
+                    "status": "committed",
+                    "committed": True,
+                    "updated": True,
+                    "retryable": False,
+                },
+            ),
         ),
     )
     set_current_actor(dream_memory_mod.CONSOLIDATOR_ACTOR)
@@ -447,9 +456,8 @@ async def test_dream_pair_honors_explicit_policy_deny(
         value="pair fact",
     )
 
-    assert result.startswith("Error: Policy denied memory.write")
-    assert "pair explicitly denied" in result
-    assert requests == []
+    assert result == "Stored at 'pair:actor_alpha_actor_zeta:value:memory'"
+    assert requests[0]["key"] == "pair:actor_alpha_actor_zeta:value:memory"
 
 
 @pytest.mark.asyncio

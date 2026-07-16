@@ -207,16 +207,18 @@ Custom ``shared:`` keys written by other family members. Read with ``memory_get`
 ## principal_b (Principal B)
 - shared_legacy_peer
 - shared_visible_topic
+- shared_secret_topic
 
 ---SECTION---
 
 # Peers' private keys
 
-Custom ``private:`` keys of your peers. Read with ``memory_get(scope='private', actor='<their_id>', key='<name>')``. Records the peer tagged ``secret`` are filtered from this list and remain owner-only.
+Custom ``private:`` keys of your peers. Read with ``memory_get(scope='private', actor='<their_id>', key='<name>')``. Each listed name passed the same canonical memory-read decision as the value itself.
 
 ## principal_b (Principal B)
 - private_legacy_peer
 - private_visible_note
+- private_secret_note
 
 ---SECTION---
 

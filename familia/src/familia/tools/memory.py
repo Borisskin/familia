@@ -30,10 +30,14 @@ from loguru import logger
 from familia import audit
 from familia.acl import codec, schema as acl_schema
 from familia.acl.graph_io import resolve_admin_key
+from familia.acl.principal_memory import (
+    _NO_MATCHING_STATIC_POLICY,
+    decide_memory_read,
+)
 from familia.acl.peers import is_peer
 from familia.acl.reachable import reachable_tag_ids
 from familia.memx_client import memx_base_url
-from familia.policy import Decision, PolicyContext, get_engine, is_explicit_deny
+from familia.policy import Decision, PolicyContext, get_engine
 from familia.principals import (
     ambiguous_pair_namespaces,
     get_current_actor,
@@ -90,7 +94,15 @@ def _is_reserved_structural_key(full_key: str) -> bool:
 # Both graphs are read with the actor's own memx_key — they're public-ish
 # (every principal can read shared:family.graph and shared:topics.graph
 # per current policy).
-async def _fetch_graph(api_key: str, key: str, base_url: str) -> acl_schema.Graph:
+def _empty_graph_mapping() -> dict[str, Any]:
+    return {"nodes": [], "edges": [], "updated_at_ms": 0}
+
+
+async def _fetch_raw_graph(
+    api_key: str,
+    key: str,
+    base_url: str,
+) -> dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             r = await client.get(
@@ -100,18 +112,18 @@ async def _fetch_graph(api_key: str, key: str, base_url: str) -> acl_schema.Grap
             )
     except httpx.HTTPError as exc:
         logger.warning("memX graph {} unreachable: {}", key, exc)
-        return acl_schema.Graph()
+        return _empty_graph_mapping()
     if r.status_code == 404 or r.status_code == 403:
-        return acl_schema.Graph()
+        return _empty_graph_mapping()
     if r.status_code >= 400:
         logger.warning("memX graph {} {}: {}", key, r.status_code, r.text[:200])
-        return acl_schema.Graph()
+        return _empty_graph_mapping()
     try:
         payload = r.json()
     except ValueError:
-        return acl_schema.Graph()
+        return _empty_graph_mapping()
     if payload is None:
-        return acl_schema.Graph()
+        return _empty_graph_mapping()
     raw = payload.get("value", payload) if isinstance(payload, dict) else payload
     if isinstance(raw, str):
         try:
@@ -119,8 +131,46 @@ async def _fetch_graph(api_key: str, key: str, base_url: str) -> acl_schema.Grap
         except ValueError:
             # SR-10: fail-closed.
             logger.warning("memX graph {} value is malformed JSON", key)
-            return acl_schema.Graph()
-    return acl_schema.Graph.from_dict(raw if isinstance(raw, dict) else None)
+            return _empty_graph_mapping()
+    if not isinstance(raw, dict):
+        logger.warning("memX graph {} value is not an object", key)
+        return _empty_graph_mapping()
+    raw.setdefault("nodes", [])
+    raw.setdefault("edges", [])
+    raw.setdefault("updated_at_ms", 0)
+    return raw
+
+
+async def _fetch_graph(api_key: str, key: str, base_url: str) -> acl_schema.Graph:
+    return acl_schema.Graph.from_dict(
+        await _fetch_raw_graph(api_key, key, base_url)
+    )
+
+
+def _decision_graph(graph: acl_schema.Graph) -> dict[str, Any]:
+    """Convert the canonical typed graph into the pure decider's mapping."""
+    return {
+        "nodes": [
+            {
+                "id": node.id,
+                "type": node.type,
+                "display_name": node.display_name,
+                "aliases": list(node.aliases),
+                "kind": node.kind,
+            }
+            for node in graph.nodes
+        ],
+        "edges": [
+            {
+                "from": edge.src,
+                "to": edge.dst,
+                "rel": edge.rel,
+                "concerns_as": edge.concerns_as,
+            }
+            for edge in graph.edges
+        ],
+        "updated_at_ms": graph.updated_at_ms,
+    }
 
 
 def _principal_role_map() -> dict[str, frozenset[str]]:
@@ -354,22 +404,15 @@ class MemoryGetTool(Tool):
     def description(self) -> str:
         return (
             "Read a value from scoped family memory (memX).\n\n"
-            "Scopes:\n"
-            "  • 'private' — by default the current actor's own "
-            "namespace. With the optional 'actor' parameter set to a "
-            "peer principal's id, reads ANY of that peer's private "
-            "records — custom keys AND reserved value:* slots "
-            "(value:memory, value:user_profile, value:heartbeat). "
-            "Records the owner tagged 'secret' are filtered "
-            "(returned as 'no value stored').\n"
-            "  • 'shared' — keys visible to every family member.\n\n"
-            "Family-by-default: every `private:` record is peer-"
-            "readable unless tagged 'secret'. When a user asks about a "
-            "peer's plans, schedule, notes, profile — TRY "
-            "memory_get(scope='private', actor='<peer_id>', "
-            "key='value:memory') first (the peer's running scratchpad "
-            "where most coordination data lives) before reporting "
-            "'nothing found'.\n\n"
+            "Private owner reads are always self-access. Cross-owner "
+            "private reads require a family relation plus an exact "
+            "common topic, or a legacy untagged record. Secret and "
+            "static deny do not override canonical common-topic allow; "
+            "the same topic without a family relation is denied. "
+            "Service records are owner-only service data, and history "
+            "records are internal transaction data.\n"
+            "Shared values are visible to the family. Pair values are "
+            "limited to the exact members of the pair.\n\n"
             "Your own custom keys appear in the 'Private/Shared keys "
             "you've written' system-prompt blocks; peers' custom keys "
             "appear in the cross-principal index blocks. Reserved "
@@ -402,39 +445,22 @@ class MemoryGetTool(Tool):
             and target_actor != actor_id
         )
         if is_peer_read:
-            # Peer read: gate at tool layer via is_peer (graph-based,
-            # excludes child role). No policy lookup — policy.yaml only
-            # carries scope-level rules, the cross-actor decision is
-            # graph-driven by design.
-            if not is_peer(actor_id, target_actor):
-                try:
-                    audit.log_event(
-                        "peer_private_read", actor=actor_id,
-                        peer=target_actor, key=full_key,
-                        decision="deny", reason="not_peer",
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-                # Fail-closed: don't leak whether the principal exists
-                # or whether they have such a key.
+            if get_registry().get(target_actor) is None:
                 return f"(no value stored at '{full_key}')"
             return await self._read_peer_private(
                 actor_id=actor_id,
                 peer_id=target_actor,
                 full_key=full_key,
+                key=key,
+                api_key=api_key,
             )
-        # Pair access has already passed the exact registry + graph gate in
-        # _resolve_full_key. Evaluate policy for audit and explicit operator
-        # denies; tolerate only the unmatched fallback from older deployed
-        # policies that predate a pair:* coarse-allow rule.
-        decision = get_engine().evaluate(
-            PolicyContext(action="memory.read", actor=actor_id, to_chat=full_key)
-        )
-        if decision.decision is Decision.DENY and (
-            not full_key.startswith("pair:") or is_explicit_deny(decision)
-        ):
-            reason = decision.reason or "policy denied"
-            return f"Policy denied memory.read на '{full_key}': {reason}"
+        if not full_key.startswith("pair:"):
+            decision = get_engine().evaluate(
+                PolicyContext(action="memory.read", actor=actor_id, to_chat=full_key)
+            )
+            if decision.decision is Decision.DENY:
+                reason = decision.reason or "policy denied"
+                return f"Policy denied memory.read на '{full_key}': {reason}"
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 r = await client.get(
@@ -499,21 +525,10 @@ class MemoryGetTool(Tool):
         actor_id: str,
         peer_id: str,
         full_key: str,
+        key: str,
+        api_key: str,
     ) -> str:
-        """Fetch ``private:<peer_id>:<key>`` through the admin proxy key.
-
-        Caller has already passed the is_peer gate. We use the
-        admin/proxy key (``resolve_admin_key``) instead of the caller's
-        per-actor narrow key, because per-principal memX
-        keys only grant ``private:<self>:*`` — they cannot reach a
-        peer's namespace directly. The proxy path keeps acl.json
-        minimal and lets the family graph be the single source of
-        truth for peer permissions.
-
-        Defense-in-depth: even with the proxy key, records tagged
-        ``SECRET_TAG`` are filtered here, fail-closed (no value, no hint
-        about existence).
-        """
+        """Fetch, decode and authorize one cross-principal private read."""
         try:
             proxy_key = resolve_admin_key()
         except Exception as exc:  # noqa: BLE001
@@ -527,6 +542,12 @@ class MemoryGetTool(Tool):
                 pass
             return f"Error: peer-read backend unavailable for '{full_key}'"
         base_url = self._base_url_override or memx_base_url()
+        family = await _fetch_raw_graph(
+            api_key, "shared:family.graph", base_url
+        )
+        topics = await _fetch_raw_graph(
+            api_key, "shared:topics.graph", base_url
+        )
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 r = await client.get(
@@ -550,7 +571,7 @@ class MemoryGetTool(Tool):
         try:
             payload = r.json()
         except ValueError:
-            return r.text
+            return f"(no value stored at '{full_key}')"
         if payload is None:
             return f"(no value stored at '{full_key}')"
         if isinstance(payload, dict):
@@ -560,33 +581,41 @@ class MemoryGetTool(Tool):
         if value is None:
             return f"(no value stored at '{full_key}')"
         wrapped = codec.decode(value) if isinstance(value, str) else None
-        record_tags: set[str] = set()
         if wrapped is not None:
-            record_tags = set(wrapped.tags or [])
+            record_tags = tuple(wrapped.tags)
             effective_value: Any = wrapped.value
         elif isinstance(value, (dict, list)):
+            record_tags = ()
             effective_value = json.dumps(value, ensure_ascii=False)
         else:
+            record_tags = ()
             effective_value = str(value)
-        if SECRET_TAG in record_tags:
-            try:
-                audit.log_event(
-                    "peer_private_read", actor=actor_id, peer=peer_id,
-                    key=full_key, decision="deny", reason="secret_tag",
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            # Fail-closed: indistinguishable from "no such key" — don't
-            # leak even the existence of a secret-tagged record.
+        try:
+            decision = decide_memory_read(
+                reader=actor_id,
+                owner=peer_id,
+                scope="private",
+                key=key,
+                tags=record_tags,
+                family_graph=family,
+                topics_graph=topics,
+                static_policy=_NO_MATCHING_STATIC_POLICY,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("peer-private decision failed: {}", exc)
             return f"(no value stored at '{full_key}')"
         try:
             audit.log_event(
                 "peer_private_read", actor=actor_id, peer=peer_id,
-                key=full_key, decision="allow",
-                tags=sorted(record_tags) if record_tags else [],
+                key=full_key,
+                decision="allow" if decision.allowed else "deny",
+                reason=decision.reason,
+                tags=sorted(record_tags),
             )
         except Exception:  # noqa: BLE001
             pass
+        if not decision.allowed:
+            return f"(no value stored at '{full_key}')"
         return effective_value
 
 
@@ -715,17 +744,13 @@ class MemorySetTool(Tool):
                     },
                     "max_entries": index_limit,
                 }
-        # _resolve_full_key already applied the exact registry + peer-edge
-        # gate for pair routes. Evaluate policy for audit and explicit denies;
-        # tolerate only an unmatched fallback from a legacy policy.
-        decision = get_engine().evaluate(
-            PolicyContext(action="memory.write", actor=actor_id, to_chat=full_key)
-        )
-        if decision.decision is Decision.DENY and (
-            not full_key.startswith("pair:") or is_explicit_deny(decision)
-        ):
-            reason = decision.reason or "policy denied"
-            return f"Policy denied memory.write на '{full_key}': {reason}"
+        if not full_key.startswith("pair:"):
+            decision = get_engine().evaluate(
+                PolicyContext(action="memory.write", actor=actor_id, to_chat=full_key)
+            )
+            if decision.decision is Decision.DENY:
+                reason = decision.reason or "policy denied"
+                return f"Policy denied memory.write на '{full_key}': {reason}"
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 r = await client.post(

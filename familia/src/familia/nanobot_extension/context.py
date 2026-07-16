@@ -42,6 +42,8 @@ class FamiliaContextExtension:
     def build_sections(self, *, actor: str | None, channel: str | None) -> list[str]:
         """Return familia system-prompt sections for the current actor."""
         del channel
+        peer_client = self._principal_client(actor)
+        graph_snapshot = self._load_graph_snapshot(peer_client)
         # Order matters. Product policy templates come first, then own
         # USER/MEMORY, key indexes for rediscovery, and cross-principal context.
         sections = [
@@ -66,6 +68,8 @@ class FamiliaContextExtension:
                 scope_label="shared",
                 heading="Family members' shared keys",
                 relation="family",
+                client=peer_client,
+                graphs=graph_snapshot,
             ),
             self._build_peer_index_block(
                 actor,
@@ -73,8 +77,14 @@ class FamiliaContextExtension:
                 scope_label="private",
                 heading="Peers' private keys",
                 relation="peer",
+                client=peer_client,
+                graphs=graph_snapshot,
             ),
-            self._build_peer_user_block(actor),
+            self._build_peer_user_block(
+                actor,
+                client=peer_client,
+                graphs=graph_snapshot,
+            ),
         ]
         return [section for section in sections if section]
 
@@ -167,6 +177,18 @@ class FamiliaContextExtension:
         except Exception:  # noqa: BLE001
             return self._CLIENT_FAILED
 
+    def _load_graph_snapshot(
+        self,
+        client: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Return one fail-closed raw graph snapshot for this build."""
+        if client is None or client is self._CLIENT_FAILED:
+            return None
+        try:
+            return client._load_graph_snapshot()
+        except Exception:  # noqa: BLE001
+            return None
+
     def _build_user_block(self, actor: str | None) -> str:
         """Own USER profile from ``private:<actor>:value:user_profile``.
 
@@ -255,6 +277,8 @@ class FamiliaContextExtension:
         scope_label: str,
         heading: str,
         relation: str,
+        client: Any,
+        graphs: tuple[dict[str, Any], dict[str, Any]] | None,
     ) -> str:
         """Render custom keys written by related principals.
 
@@ -263,27 +287,23 @@ class FamiliaContextExtension:
         through policy and memX ACLs. Empty bodies, denied reads and malformed
         JSON are skipped silently.
 
-        ``relation`` controls visibility:
-        - ``peer`` uses the strict peer rule for private keys.
-        - ``family`` uses the looser family-member rule for shared keys, so a
-          child can see a parent's shared key listings without gaining private
-          peer access.
+        ``relation`` is retained as presentation metadata. Candidate
+        principals are not authorized here; ``get_other`` applies the
+        canonical record-level decision.
         """
-        client = self._principal_client(actor)
-        if client is None or client is self._CLIENT_FAILED:
+        if (
+            client is None
+            or client is self._CLIENT_FAILED
+            or graphs is None
+        ):
             return ""
         try:
-            from familia.acl.peers import is_family_member, is_peer
-            from familia.bootstrap import make_reachable_tags_getter
+            from familia.acl import principal_memory
             from familia.principals import get_registry
         except ImportError:
             return ""
 
-        if relation == "peer":
-            predicate = is_peer
-        elif relation == "family":
-            predicate = is_family_member
-        else:
+        if relation not in {"peer", "family"}:
             return ""
 
         try:
@@ -291,21 +311,12 @@ class FamiliaContextExtension:
         except Exception:  # noqa: BLE001
             return ""
 
-        # Reachable tag-set for the viewing actor. We drop names whose tags
-        # do not intersect this set: surfacing a key name the actor cannot
-        # read would still leak information, even without the value.
-        reachable_tags: set[str] | None = None
-        reachable_getter = None
+        family_graph, topics_graph = graphs
         sections: list[str] = []
         for pid in registry.ids:
             if pid == actor:
                 continue
-            try:
-                if not predicate(actor, pid):
-                    continue
-            except Exception:  # noqa: BLE001
-                continue
-            raw = client.get_other(pid, suffix)
+            raw = client.get_other(pid, suffix, graphs=graphs)
             if not raw or not raw.strip():
                 continue
             try:
@@ -319,40 +330,35 @@ class FamiliaContextExtension:
                 # Newest first; accept both legacy bare-string entries and
                 # current dict entries with explicit record tags.
                 if isinstance(entry, str) and entry:
-                    filtered.append(entry)
-                    continue
-                if not isinstance(entry, dict):
-                    continue
-                name = entry.get("name")
-                if not isinstance(name, str) or not name:
-                    continue
-                rec_tags = [
-                    tag
-                    for tag in (entry.get("tags") or [])
-                    if isinstance(tag, str) and tag
-                ]
-                # Secret-tagged private records remain owner-only. We hide
-                # both value and key name even when a peer edge exists.
-                if scope_label == "private" and "secret" in rec_tags:
-                    continue
-                if not rec_tags:
-                    # Untagged records preserve legacy behavior: the scope
-                    # rule decides access, so the index name can be shown.
-                    filtered.append(name)
-                    continue
-                if reachable_getter is None:
-                    try:
-                        reachable_getter = make_reachable_tags_getter()
-                    except Exception:  # noqa: BLE001
-                        # Without a reachable tag-set, fail closed and drop
-                        # the tagged entry instead of leaking its name.
+                    name = entry
+                    rec_tags: tuple[str, ...] = ()
+                elif isinstance(entry, dict):
+                    name = entry.get("name")
+                    if not isinstance(name, str) or not name:
                         continue
-                if reachable_tags is None:
-                    try:
-                        reachable_tags = reachable_getter(actor) or set()
-                    except Exception:  # noqa: BLE001
-                        reachable_tags = set()
-                if reachable_tags & set(rec_tags):
+                    rec_tags = tuple(
+                        tag
+                        for tag in (entry.get("tags") or [])
+                        if isinstance(tag, str) and tag
+                    )
+                else:
+                    continue
+                try:
+                    decision = principal_memory.decide_memory_read(
+                        reader=actor,
+                        owner=pid,
+                        scope=scope_label,
+                        key=name,
+                        tags=rec_tags,
+                        family_graph=family_graph,
+                        topics_graph=topics_graph,
+                        static_policy=(
+                            principal_memory._NO_MATCHING_STATIC_POLICY
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+                if decision.allowed:
                     filtered.append(name)
             if not filtered:
                 continue
@@ -381,29 +387,37 @@ class FamiliaContextExtension:
             intro = (
                 "Custom ``private:`` keys of your peers. Read with "
                 "``memory_get(scope='private', actor='<their_id>', "
-                "key='<name>')``. Records the peer tagged ``secret`` "
-                "are filtered from this list and remain owner-only."
+                "key='<name>')``. Each listed name passed the same "
+                "canonical memory-read decision as the value itself."
             )
 
         return f"# {heading}\n\n{intro}\n\n" + "\n\n".join(sections)
 
-    def _build_peer_user_block(self, actor: str | None) -> str:
+    def _build_peer_user_block(
+        self,
+        actor: str | None,
+        *,
+        client: Any,
+        graphs: tuple[dict[str, Any], dict[str, Any]] | None,
+    ) -> str:
         """Stitch peers' USER profiles into the actor's prompt.
 
-        Iterates principals and checks the strict peer predicate
-        (spouse/guardian-style relationships; children excluded). For each
-        peer, reads ``private:<peer>:value:user_profile`` through
-        ``get_other`` so policy decisions stay centralised.
+        Iterates registered principals and reads
+        ``private:<peer>:value:user_profile`` through ``get_other``.
+        The canonical memory-read decision determines which profiles exist
+        for this reader.
 
         Peer-authored text is sanitised and wrapped as descriptive metadata,
         not instructions. Every allow/deny/skip is audited best-effort.
         """
-        client = self._principal_client(actor)
-        if client is None or client is self._CLIENT_FAILED:
+        if (
+            client is None
+            or client is self._CLIENT_FAILED
+            or graphs is None
+        ):
             return ""
         try:
             from familia import audit as audit_mod
-            from familia.acl.peers import is_peer
             from familia.principals import get_registry
         except ImportError:
             return ""
@@ -416,12 +430,11 @@ class FamiliaContextExtension:
         for pid in registry.ids:
             if pid == actor:
                 continue
-            try:
-                if not is_peer(actor, pid):
-                    continue
-            except Exception:  # noqa: BLE001
-                continue
-            text = client.get_other(pid, "value:user_profile")
+            text = client.get_other(
+                pid,
+                "value:user_profile",
+                graphs=graphs,
+            )
             if text is None:
                 # ``get_other`` returns None for policy denial, memX denial
                 # and missing value. The prompt builder does not distinguish

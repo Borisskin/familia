@@ -30,8 +30,9 @@ from typing import Any
 
 from loguru import logger
 
+from familia.acl import codec, graph_io
 from familia.acl.graph_io import GraphIOError, get_raw, set_raw
-from familia.policy import Decision, PolicyContext, get_engine
+from familia.policy import get_engine
 
 
 _FAMILY_RELATIONS = frozenset(
@@ -53,6 +54,7 @@ _ORDINARY_VALUE_KEYS = frozenset(
     }
 )
 _PRINCIPAL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_NO_MATCHING_STATIC_POLICY = "no_matching_rule"
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,97 +370,71 @@ class PrincipalMemoryClient:
         """
         set_raw(self._own_key(suffix), value, api_key=self._api_key)
 
-    def get_other(self, other_id: str, suffix: str) -> str | None:
-        """Read a peer's namespace under the family-by-default model.
+    def _load_graph_snapshot(
+        self,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Load one raw graph pair for a single higher-level operation."""
+        try:
+            family_graph = graph_io.load_graph_value(
+                "shared:family.graph",
+                api_key=self._api_key,
+            )
+            topics_graph = graph_io.load_graph_value(
+                "shared:topics.graph",
+                api_key=self._api_key,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("principal_memory graph snapshot failed: {}", exc)
+            return None
+        return family_graph, topics_graph
 
-        Path (0.3.0):
-          1. self read → fast path through :meth:`get`.
-          2. Synthetic policy check (legacy gate). Deny → None.
-          3. If self and ``other_id`` are connected by a peer-edge in
-             family.graph (``acl.peers.is_peer``), read via the admin
-             proxy key. Records tagged ``secret`` are filtered out and
-             yield ``None`` (fail-closed).
-          4. Otherwise fall back to caller's own api_key. This still
-             works for the admin/owner who holds ``private:*`` in their
-             acl.json scope list, and silently 403s for narrow
-             per-principal keys.
-
-        On any exception, return ``None`` — never raise into the
-        prompt-building path.
-        """
+    def get_other(
+        self,
+        other_id: str,
+        suffix: str,
+        *,
+        graphs: tuple[dict[str, Any], dict[str, Any]] | None = None,
+    ) -> str | None:
+        """Read another principal through the canonical memory-read decision."""
         if other_id == self.principal_id:
             return self.get(suffix)
         full_key = self._other_key(other_id, suffix)
         try:
-            decision = get_engine().evaluate(
-                PolicyContext(
-                    action="memory.read",
-                    actor=self.principal_id,
-                    to_chat=full_key,
-                )
+            proxy_key = graph_io.resolve_admin_key()
+            raw = get_raw(full_key, api_key=proxy_key)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("principal_memory.get_other({}): {}", other_id, exc)
+            return None
+        if graphs is None:
+            graphs = self._load_graph_snapshot()
+        if graphs is None:
+            return None
+        family_graph, topics_graph = graphs
+        text = _coerce_to_str(raw)
+        if text is None:
+            return None
+        wrapped = codec.decode(text)
+        tags = tuple(wrapped.tags) if wrapped is not None else ()
+        value = wrapped.value if wrapped is not None else text
+        try:
+            decision = decide_memory_read(
+                reader=self.principal_id,
+                owner=other_id,
+                scope="private",
+                key=suffix,
+                tags=tags,
+                family_graph=family_graph,
+                topics_graph=topics_graph,
+                static_policy=_NO_MATCHING_STATIC_POLICY,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "principal_memory.get_other({}): policy eval failed: {}",
-                other_id, exc,
+                "principal_memory.get_other({}) decision failed: {}",
+                other_id,
+                exc,
             )
             return None
-        if decision.decision is Decision.DENY:
-            return None
-
-        # Peer-edge fast path. Only ``private:`` keys flow through here;
-        # peers of one actor can read each other's private namespace by
-        # default, with ``secret``-tagged records filtered.
-        peer_path_ok = False
-        if full_key.startswith("private:"):
-            try:
-                from familia.acl.peers import is_peer  # noqa: PLC0415
-                peer_path_ok = is_peer(self.principal_id, other_id)
-            except Exception:  # noqa: BLE001 — never break prompt assembly
-                peer_path_ok = False
-        if peer_path_ok:
-            try:
-                from familia.acl.graph_io import resolve_admin_key  # noqa: PLC0415
-                proxy_key = resolve_admin_key()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "principal_memory.get_other({}): admin key unavailable: {}",
-                    other_id, exc,
-                )
-                proxy_key = None
-            if proxy_key:
-                try:
-                    raw = get_raw(full_key, api_key=proxy_key)
-                except GraphIOError as exc:
-                    logger.warning(
-                        "principal_memory.get_other({}) proxy: {}", other_id, exc,
-                    )
-                    return None
-                text = _coerce_to_str(raw)
-                if text is None:
-                    return None
-                # Filter ``secret``-tagged records — same fail-closed
-                # semantics as MemoryGetTool._read_peer_private.
-                try:
-                    from familia.acl import codec  # noqa: PLC0415
-                    wrapped = codec.decode(text)
-                except Exception:  # noqa: BLE001
-                    wrapped = None
-                if wrapped is not None:
-                    if "secret" in (wrapped.tags or []):
-                        return None
-                    return wrapped.value
-                return text
-
-        # Fallback: caller's narrow key. Admin/owner with private:* in
-        # their acl scope succeeds; narrow per-principal keys 403 →
-        # None.
-        try:
-            raw = get_raw(full_key, api_key=self._api_key)
-        except GraphIOError as exc:
-            logger.warning("principal_memory.get_other({}): {}", other_id, exc)
-            return None
-        return _coerce_to_str(raw)
+        return value if decision.allowed else None
 
 
 def _coerce_to_str(raw: Any) -> str | None:

@@ -9,6 +9,7 @@ that stay owner-only even with a peer-edge.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
@@ -16,7 +17,7 @@ import httpx
 import pytest
 
 from familia import principals as principals_mod
-from familia.acl import codec, peers as peers_mod
+from familia.acl import codec, peers as peers_mod, schema as acl_schema
 from familia.principals import Identity, Principal, PrincipalRegistry
 from familia.tools import memory as memory_mod
 from familia.tools.memory import (
@@ -50,10 +51,13 @@ def registry(monkeypatch: pytest.MonkeyPatch) -> PrincipalRegistry:
 
 @pytest.fixture
 def peer_graph(monkeypatch: pytest.MonkeyPatch, registry):
-    """Set up family.graph with owner↔spouse peer-edge, child_a as child."""
+    """Provide canonical family/topics graphs to both read adapters."""
     peers_mod.reset_cache()
-    graph_doc = {
-        "nodes": [],
+    family_doc = {
+        "nodes": [
+            {"id": principal_id, "type": "principal"}
+            for principal_id in registry.ids
+        ],
         "edges": [
             {"from": "owner", "to": "spouse", "rel": "spouse_of"},
             {"from": "owner", "to": "child_a", "rel": "guardian_of"},
@@ -61,11 +65,35 @@ def peer_graph(monkeypatch: pytest.MonkeyPatch, registry):
         ],
         "updated_at_ms": 1_000_000_000,
     }
+    topics_doc = {
+        "nodes": [
+            {"id": "topic_shared", "type": "topic"},
+            {"id": "hidden_topic", "type": "topic"},
+        ],
+        "edges": [
+            {
+                "from": "topic_shared",
+                "to": principal_id,
+                "rel": "concerns",
+                "concerns_as": "spouse_of",
+            }
+            for principal_id in ("owner", "spouse", "unrelated")
+        ],
+        "updated_at_ms": 1_000_000_000,
+    }
     monkeypatch.setattr(
         "familia.acl.graph_io.load_graph_value",
-        lambda key, *a, **kw: graph_doc,
+        lambda key, *a, **kw: (
+            family_doc if key == "shared:family.graph" else topics_doc
+        ),
         raising=False,
     )
+
+    async def fetch_graph(_api_key, key, _base_url):
+        raw = family_doc if key == "shared:family.graph" else topics_doc
+        return acl_schema.Graph.from_dict(raw)
+
+    monkeypatch.setattr(memory_mod, "_fetch_graph", fetch_graph)
     yield
     peers_mod.reset_cache()
 
@@ -191,11 +219,27 @@ def _patch_admin_key(monkeypatch, key="admin-proxy-key"):
     monkeypatch.setattr(memory_mod, "resolve_admin_key", lambda: key)
 
 
+def _patch_decider(monkeypatch, *, allowed: bool, reason: str):
+    calls: list[dict[str, Any]] = []
+
+    def decide_memory_read(**kwargs):
+        calls.append(dict(kwargs))
+        return SimpleNamespace(allowed=allowed, reason=reason)
+
+    monkeypatch.setattr(memory_mod, "decide_memory_read", decide_memory_read)
+    return calls
+
+
 def test_peer_reads_untagged_custom_private(monkeypatch, registry, peer_graph):
-    """spouse can read owner's untagged private record (family-by-default)."""
+    """The canonical decision can allow an untagged private record."""
     _set_actor(monkeypatch, "spouse")
     _patch_admin_key(monkeypatch)
     audit_events = _patch_audit(monkeypatch)
+    decision_calls = _patch_decider(
+        monkeypatch,
+        allowed=True,
+        reason="family_legacy_untagged",
+    )
 
     response = _FakeHttpxResponse(200, json_data={"value": "20 мая мотосервис"})
     client = _FakeHttpxClient(response)
@@ -209,17 +253,24 @@ def test_peer_reads_untagged_custom_private(monkeypatch, registry, peer_graph):
     assert result == "20 мая мотосервис"
     assert client.captured["headers"] == {"x-api-key": "admin-proxy-key"}
     assert client.captured["params"] == {"key": "private:owner:moto"}
+    assert len(decision_calls) == 1
     allow_events = [e for e in audit_events
                     if e["type"] == "peer_private_read"
-                    and e.get("decision") == "allow"]
+                    and e.get("decision") == "allow"
+                    and e.get("reason") == "family_legacy_untagged"]
     assert len(allow_events) == 1
 
 
 def test_peer_denied_secret_tagged(monkeypatch, registry, peer_graph):
-    """A record tagged 'secret' is invisible to peers (fail-closed)."""
+    """The canonical decision hides a tagged record fail-closed."""
     _set_actor(monkeypatch, "spouse")
     _patch_admin_key(monkeypatch)
     audit_events = _patch_audit(monkeypatch)
+    decision_calls = _patch_decider(
+        monkeypatch,
+        allowed=False,
+        reason="no_common_topic",
+    )
 
     wrapped = codec.encode("gift idea", [SECRET_TAG])
     response = _FakeHttpxResponse(200, json_data={"value": wrapped})
@@ -236,42 +287,29 @@ def test_peer_denied_secret_tagged(monkeypatch, registry, peer_graph):
     deny_events = [e for e in audit_events
                    if e["type"] == "peer_private_read"
                    and e.get("decision") == "deny"
-                   and e.get("reason") == "secret_tag"]
+                   and e.get("reason") == "no_common_topic"]
+    assert len(decision_calls) == 1
     assert len(deny_events) == 1
 
 
 def test_non_peer_denied(monkeypatch, registry, peer_graph):
-    """unrelated is not a peer of owner — read denied without hitting memX."""
+    """An unrelated common-topic reader is denied by one stable reason."""
     _set_actor(monkeypatch, "unrelated")
+    _patch_admin_key(monkeypatch)
     audit_events = _patch_audit(monkeypatch)
-
-    # If memX is contacted at all, the test fails — unrelated should never
-    # reach the proxy path.
-    def _no_http(*a, **kw):
-        raise AssertionError("memX must not be contacted for non-peer read")
-
-    monkeypatch.setattr(memory_mod.httpx, "AsyncClient", _no_http)
-
-    tool = MemoryGetTool()
-    result = _run(tool.execute(scope="private", key="moto", actor="owner"))
-
-    assert result == "(no value stored at 'private:owner:moto')"
-    deny_events = [e for e in audit_events
-                   if e["type"] == "peer_private_read"
-                   and e.get("decision") == "deny"
-                   and e.get("reason") == "not_peer"]
-    assert len(deny_events) == 1
-
-
-def test_child_denied_parent_private(monkeypatch, registry, peer_graph):
-    """Child (role:child + guardian_of edge) is not a peer for private reads."""
-    _set_actor(monkeypatch, "child_a")
-    audit_events = _patch_audit(monkeypatch)
+    decision_calls = _patch_decider(
+        monkeypatch,
+        allowed=False,
+        reason="topic_without_family_relation",
+    )
+    wrapped = codec.encode("must-not-leak", ["topic_shared"])
+    client = _FakeHttpxClient(
+        _FakeHttpxResponse(200, json_data={"value": wrapped})
+    )
     monkeypatch.setattr(
-        memory_mod.httpx, "AsyncClient",
-        lambda **kw: (_ for _ in ()).throw(
-            AssertionError("must not contact memX")
-        ),
+        memory_mod.httpx,
+        "AsyncClient",
+        lambda **kw: client,
     )
 
     tool = MemoryGetTool()
@@ -281,7 +319,39 @@ def test_child_denied_parent_private(monkeypatch, registry, peer_graph):
     deny_events = [e for e in audit_events
                    if e["type"] == "peer_private_read"
                    and e.get("decision") == "deny"
-                   and e.get("reason") == "not_peer"]
+                   and e.get("reason") == "topic_without_family_relation"]
+    assert len(decision_calls) == 1
+    assert len(deny_events) == 1
+
+
+def test_child_denied_parent_private(monkeypatch, registry, peer_graph):
+    """A related reader without the record topic is denied canonically."""
+    _set_actor(monkeypatch, "child_a")
+    _patch_admin_key(monkeypatch)
+    audit_events = _patch_audit(monkeypatch)
+    decision_calls = _patch_decider(
+        monkeypatch,
+        allowed=False,
+        reason="no_common_topic",
+    )
+    wrapped = codec.encode("must-not-leak", ["hidden_topic"])
+    client = _FakeHttpxClient(
+        _FakeHttpxResponse(200, json_data={"value": wrapped})
+    )
+    monkeypatch.setattr(
+        memory_mod.httpx, "AsyncClient",
+        lambda **kw: client,
+    )
+
+    tool = MemoryGetTool()
+    result = _run(tool.execute(scope="private", key="moto", actor="owner"))
+
+    assert result == "(no value stored at 'private:owner:moto')"
+    deny_events = [e for e in audit_events
+                   if e["type"] == "peer_private_read"
+                   and e.get("decision") == "deny"
+                   and e.get("reason") == "no_common_topic"]
+    assert len(decision_calls) == 1
     assert len(deny_events) == 1
 
 
@@ -291,10 +361,15 @@ def test_child_denied_parent_private(monkeypatch, registry, peer_graph):
     "value:heartbeat",
 ])
 def test_peer_reads_reserved_slot_via_proxy(monkeypatch, registry, peer_graph, reserved):
-    """Reserved slots are peer-readable through admin proxy (family-by-default)."""
+    """The canonical decision can allow reserved slots through the proxy."""
     _set_actor(monkeypatch, "spouse")
     _patch_admin_key(monkeypatch)
     _patch_audit(monkeypatch)
+    decision_calls = _patch_decider(
+        monkeypatch,
+        allowed=True,
+        reason="family_legacy_untagged",
+    )
 
     response = _FakeHttpxResponse(200, json_data={"value": "owner's reserved content"})
     client = _FakeHttpxClient(response)
@@ -309,6 +384,7 @@ def test_peer_reads_reserved_slot_via_proxy(monkeypatch, registry, peer_graph, r
     assert client.captured["params"] == {"key": f"private:owner:{reserved}"}
     assert client.captured["headers"] == {"x-api-key": "admin-proxy-key"}
     assert result == "owner's reserved content"
+    assert len(decision_calls) == 1
 
 
 @pytest.mark.parametrize("reserved", [
@@ -317,10 +393,15 @@ def test_peer_reads_reserved_slot_via_proxy(monkeypatch, registry, peer_graph, r
     "value:heartbeat",
 ])
 def test_peer_denied_secret_reserved_slot(monkeypatch, registry, peer_graph, reserved):
-    """Reserved slot with 'secret' tag is hidden from peers, fail-closed."""
+    """The canonical decision can hide a tagged reserved slot."""
     _set_actor(monkeypatch, "spouse")
     _patch_admin_key(monkeypatch)
     _patch_audit(monkeypatch)
+    decision_calls = _patch_decider(
+        monkeypatch,
+        allowed=False,
+        reason="no_common_topic",
+    )
 
     from familia.acl import codec as _codec
     wrapped = _codec.encode("owner private journal entry", [SECRET_TAG])
@@ -334,6 +415,7 @@ def test_peer_denied_secret_reserved_slot(monkeypatch, registry, peer_graph, res
     result = _run(tool.execute(scope="private", key=reserved, actor="owner"))
 
     assert result == f"(no value stored at 'private:owner:{reserved}')"
+    assert len(decision_calls) == 1
 
 
 def test_owner_reads_own_secret(monkeypatch, registry, peer_graph):
