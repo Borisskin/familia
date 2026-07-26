@@ -109,111 +109,67 @@ def test_canonical_contract_export_exists_and_validates() -> None:
     _assert_valid(_validator(CONTRACT_SCHEMA_PATH), contract)
 
 
-def test_contract_records_task_zero_storage_archive_and_outcome_rules() -> None:
+def test_contract_records_simple_private_write_and_consolidation_rules() -> None:
     contract = _canonical_contract()
 
     assert contract["authority"]["final_writer"] == "PrincipalMemoryIngestor"
+    assert contract["authority"]["model_may_select_owner"] is False
+    assert contract["authority"]["model_may_request_topic"] is True
+    assert contract["authority"]["server_validates_topic"] is True
+    assert contract["authority"]["model_may_create_topic"] is False
+
     assert contract["storage"]["atomic_fact_key"] == "private:<principal>:memory:<fact_id>"
-    assert contract["storage"]["transaction_candidate_key"] == (
-        "private:<principal>:history:<source_id>"
-    )
+    assert "transaction_candidate_key" not in contract["storage"]
     assert contract["storage"]["fact_topics"] == {
         "assigned_by": "server",
         "homogeneous_reader_set": True,
     }
-    assert contract["archive"]["archive_source"]["immutable_fields"] == [
-        "source_kind",
-        "session_key",
-        "channel",
-        "chat_id",
-        "private_mode_proof",
-        "session_generation_id",
-        "message_seq_start",
-        "message_seq_end",
-        "trigger_reason",
-        "algorithm_version",
-    ]
-    assert contract["archive"]["range_identity"]["range_id_fields"] == [
-        "source_kind",
-        "session_key",
-        "session_generation_id",
-        "message_seq_start",
-        "message_seq_end",
-    ]
-    assert contract["archive"]["range_identity"]["source_id_fields"] == [
-        "range_id",
-        "principal",
-    ]
-    assert contract["archive"]["fingerprint"]["known_owner_only"] is True
-    assert contract["archive"]["fingerprint"]["forbidden_for_discarded_unknown"] is True
 
-    outcome_categories = (
-        "operation",
-        "part",
-        "private_source",
-        "unknown_private_source",
-        "session_range",
-        "legacy_row",
-        "migration_command",
-    )
-    assert {name: contract["outcomes"][name] for name in outcome_categories} == {
-        "operation": {
-            "values": [
-                "applied",
-                "duplicate",
-                "awaiting_owner",
-                "denied_invalid",
-                "retryable_failure",
-            ],
-            "terminal": ["applied", "duplicate", "awaiting_owner", "denied_invalid"],
-        },
-        "part": {
-            "values": [
-                "complete",
-                "complete_with_denials",
-                "retryable_failure",
-                "integrity_conflict",
-            ],
-            "terminal": ["complete", "complete_with_denials"],
-        },
-        "private_source": {
-            "values": ["complete", "duplicate", "retryable_failure", "integrity_conflict"],
-            "terminal": ["complete", "duplicate"],
-        },
-        "unknown_private_source": {
-            "values": ["discarded_unknown"],
-            "terminal": ["discarded_unknown"],
-        },
-        "session_range": {
-            "values": [
-                "complete",
-                "retryable_failure",
-                "integrity_conflict",
-                "unsupported_topology",
-            ],
-            "terminal": ["complete"],
-        },
-        "legacy_row": {
-            "values": [
-                "imported",
-                "duplicate",
-                "awaiting_owner",
-                "discarded_unknown",
-                "retryable_failure",
-            ],
-            "terminal": ["imported", "duplicate", "awaiting_owner", "discarded_unknown"],
-        },
-        "migration_command": {
-            "plan": {
-                "values": ["planned", "blocked_needs_review"],
-                "terminal": ["planned", "blocked_needs_review"],
-            },
-            "apply": {
-                "values": ["complete", "partial", "failed"],
-                "terminal": ["complete", "partial", "failed"],
-            },
+    assert contract["write_routing"] == {
+        "physical_owner": "actor",
+        "owner_assigned_by": "server",
+        "default_destination": "private",
+        "third_party_fact_owner": "speaker",
+        "foreign_private_allowed": False,
+        "direct_shared_allowed": False,
+        "direct_pair_allowed": False,
+        "topic": {
+            "form": "server_verified_private_fact_tag",
+            "creation": "admin_only",
+            "existing_without_shared_relations": "tag_and_notify_private_only",
+            "missing_or_unavailable": "store_private_untagged_and_notify",
         },
     }
+
+    assert contract["updates"] == {
+        "identity": "stable_fact_id",
+        "record_revision": "ts",
+        "full_memory_scan_required": False,
+        "operations": ["profile", "memory", "delete"],
+        "delete_scope": "private_actor_fact_only",
+        "delete_missing": "success",
+    }
+
+    assert contract["consolidation"] == {
+        "supported_sources": ["vk_private", "telegram_private"],
+        "automatic_destination": "private_owner_untagged",
+        "owner_resolver": {
+            "input": ["session_key", "messages"],
+            "result": "principal_or_none",
+            "before_model": True,
+        },
+        "archive_sink": {
+            "input": ["principal", "messages"],
+            "success": "return_without_exception",
+            "failure": "exception",
+            "failure_keeps_source_messages": True,
+        },
+        "retry": "reapply_stable_fact_operations",
+        "session_serialization": "single_lock",
+        "standalone_without_sink": "legacy_behavior",
+    }
+    assert "archive" not in contract
+
     assert contract["migration"]["exit_codes"] == {
         "plan": {"planned": 2, "blocked_needs_review": 2},
         "apply": {"complete": 0, "partial": 2, "failed": 1},
@@ -238,7 +194,7 @@ def test_contract_records_registry_access_unknown_flat_file_and_soul_rules() -> 
         "no_matching_static_rule",
     ]
     assert access["legacy_untagged_memory_available_to_family"] is True
-    assert access["transaction_candidate_internal_only"] is True
+    assert "transaction_candidate_internal_only" not in access
 
     assert contract["unknown_content"] == {
         "discard_before_model": True,
@@ -273,34 +229,29 @@ def test_contract_records_registry_access_unknown_flat_file_and_soul_rules() -> 
     ]
 
 
-def test_contract_defines_exact_semantics_for_special_outcomes() -> None:
-    semantics = _canonical_contract()["outcomes"]["semantics"]
+def test_contract_keeps_only_migration_outcomes() -> None:
+    outcomes = _canonical_contract()["outcomes"]
 
-    assert semantics["discarded_unknown"] == {
-        "only_for": "unknown_private_source",
-        "happens_before": ["llm", "fingerprint"],
-        "content_or_derived_copy_persisted": False,
-        "receipt_payload": ["server_coordinates", "reason_counter"],
-        "terminal": True,
+    assert set(outcomes) == {"legacy_row", "migration_command"}
+    assert outcomes["legacy_row"] == {
+        "values": [
+            "imported",
+            "duplicate",
+            "awaiting_owner",
+            "discarded_unknown",
+            "retryable_failure",
+        ],
+        "terminal": ["imported", "duplicate", "awaiting_owner", "discarded_unknown"],
     }
-    assert semantics["awaiting_owner"] == {
-        "only_for": "deterministic_conflict_known_owner",
-        "existing_value_replaced": False,
-        "pending_candidate_visibility": "owner_only_secret",
-        "excluded_from": ["memory_get_for_others", "indexes", "automatic_context"],
-        "notification_contains_fact_text": False,
-        "blocks_activation": False,
-        "terminal": True,
-    }
-    assert semantics["denied_invalid"] == {
-        "only_for": "single_deterministically_invalid_operation",
-        "allowed_for_whole_model_response": False,
-        "terminal": True,
-    }
-    assert semantics["unusable_whole_model_response"] == {
-        "outcome": "retryable_failure",
-        "terminal": False,
-        "grants_coverage": False,
+    assert outcomes["migration_command"] == {
+        "plan": {
+            "values": ["planned", "blocked_needs_review"],
+            "terminal": ["planned", "blocked_needs_review"],
+        },
+        "apply": {
+            "values": ["complete", "partial", "failed"],
+            "terminal": ["complete", "partial", "failed"],
+        },
     }
 
 

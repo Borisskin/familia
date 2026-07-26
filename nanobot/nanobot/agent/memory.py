@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -12,7 +13,7 @@ import weakref
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, ContextManager, Iterator
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, ContextManager, Iterator
 
 from loguru import logger
 from filelock import FileLock
@@ -688,7 +689,15 @@ class Consolidator:
         build_messages: Callable[..., list[dict[str, Any]]],
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
         max_completion_tokens: int = 4096,
+        archive_sink: Callable[[str, list[dict]], Awaitable[Any]] | None = None,
+        private_session_owner_resolver: (
+            Callable[[str, list[dict]], Awaitable[str | None]] | None
+        ) = None,
     ):
+        if archive_sink is not None and private_session_owner_resolver is None:
+            raise ValueError(
+                "private_session_owner_resolver is required when archive_sink is configured"
+            )
         self.store = store
         self.provider = provider
         self.model = model
@@ -697,9 +706,15 @@ class Consolidator:
         self.max_completion_tokens = max_completion_tokens
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
+        self._archive_sink = archive_sink
+        self._private_session_owner_resolver = private_session_owner_resolver
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
+
+    @property
+    def archive_sink_enabled(self) -> bool:
+        return self._archive_sink is not None
 
     def get_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared consolidation lock for one session."""
@@ -791,7 +806,12 @@ class Consolidator:
             groups.append((current_actor, buf))
         return groups
 
-    async def archive(self, messages: list[dict]) -> str | None:
+    async def archive(
+        self,
+        messages: list[dict],
+        *,
+        session_key: str | None = None,
+    ) -> Any:
         """Summarize messages via LLM and append to history.jsonl.
 
         Splits the chunk by user-actor runs (see ``_group_by_actor``) so each
@@ -801,8 +821,22 @@ class Consolidator:
         legacy single-return behavior callers use for ``_last_summary``), or
         None if nothing was archived.
         """
+        if self._archive_sink is not None and (
+            not isinstance(session_key, str) or not session_key
+        ):
+            raise ValueError("session_key is required when archive_sink is configured")
         if not messages:
             return None
+        if self._archive_sink is not None:
+            resolver = self._private_session_owner_resolver
+            if resolver is None:  # Constructor validation keeps this branch unreachable.
+                raise ValueError(
+                    "private_session_owner_resolver is required when archive_sink is configured"
+                )
+            resolution = await resolver(session_key, messages)
+            if not isinstance(resolution, str) or not resolution:
+                raise RuntimeError("private session owner is unavailable")
+            return await self._archive_sink(resolution, messages)
         last_summary: str | None = None
         for actor, chunk in self._group_by_actor(messages):
             if not chunk:
@@ -848,17 +882,24 @@ class Consolidator:
         session: Session,
         *,
         session_summary: str | None = None,
-    ) -> None:
+    ) -> Session:
         """Loop: archive old messages until prompt fits within safe budget.
 
         The budget reserves space for completion tokens and a safety buffer
         so the LLM request never exceeds the context window.
         """
-        if not session.messages or self.context_window_tokens <= 0:
-            return
-
-        lock = self.get_lock(session.key)
+        key = session.key
+        lock = self.get_lock(key)
         async with lock:
+            session = self.sessions.get_or_create(key)
+            if self.context_window_tokens <= 0:
+                return session
+            if not session.messages:
+                return session
+
+            original_messages = deepcopy(session.messages)
+            original_last_consolidated = session.last_consolidated
+            original_metadata = deepcopy(session.metadata)
             budget = self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
             target = budget // 2
             try:
@@ -870,7 +911,7 @@ class Consolidator:
                 logger.exception("Token estimation failed for {}", session.key)
                 estimated, source = 0, "error"
             if estimated <= 0:
-                return
+                return session
             if estimated < budget:
                 unconsolidated_count = len(session.messages) - session.last_consolidated
                 logger.debug(
@@ -881,9 +922,10 @@ class Consolidator:
                     source,
                     unconsolidated_count,
                 )
-                return
+                return session
 
             last_summary = None
+            changed = False
             for round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
                 if estimated <= target:
                     break
@@ -920,13 +962,14 @@ class Consolidator:
                     source,
                     len(chunk),
                 )
-                summary = await self.archive(chunk)
-                if summary:
-                    last_summary = summary
-                else:
-                    break
+                summary = await self.archive(chunk, session_key=session.key)
+                if self._archive_sink is None:
+                    if summary:
+                        last_summary = summary
+                    else:
+                        break
                 session.last_consolidated = end_idx
-                self.sessions.save(session)
+                changed = True
 
                 try:
                     estimated, source = self.estimate_session_prompt_tokens(
@@ -947,7 +990,17 @@ class Consolidator:
                     "text": last_summary,
                     "last_active": session.updated_at.isoformat(),
                 }
-                self.sessions.save(session)
+                changed = True
+
+            if changed:
+                try:
+                    self.sessions.save(session)
+                except Exception:
+                    session.messages = original_messages
+                    session.last_consolidated = original_last_consolidated
+                    session.metadata = original_metadata
+                    raise
+            return session
 
 
 # ---------------------------------------------------------------------------
@@ -981,6 +1034,7 @@ class Dream:
         annotate_line_ages: bool = True,
         dream_tool_installers: list[Callable[[ToolRegistry, MemoryStore], None]] | None = None,
         dream_turn_context: Callable[[], ContextManager[Any]] | None = None,
+        dream_batch_context: Callable[[list[dict[str, Any]]], ContextManager[Any]] | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -994,6 +1048,7 @@ class Dream:
         self.annotate_line_ages = annotate_line_ages
         self._dream_tool_installers = dream_tool_installers or []
         self._dream_turn_context = dream_turn_context
+        self._dream_batch_context = dream_batch_context
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
 
@@ -1024,6 +1079,160 @@ class Dream:
         for install_tools in self._dream_tool_installers:
             install_tools(tools, self.store)
         return tools
+
+    @staticmethod
+    def _without_workspace_edit_instructions(prompt: str) -> str:
+        """Remove file-edit guidance when the Dream registry has no editor."""
+        removed_sections = {
+            "## File paths (relative to workspace root)",
+            "## Privacy invariant",
+            "## Editing rules",
+        }
+        current_section = ""
+        skip_directive_continuation = False
+        lines: list[str] = []
+        for line in prompt.splitlines():
+            if line.startswith("Update memory files / scoped memX"):
+                lines.append("Update scoped memX / skills based on the analysis below.")
+                continue
+            if line.startswith("## "):
+                current_section = line
+            if current_section in removed_sections:
+                continue
+            if line.startswith(("- [FILE] entries:", "- [FILE-REMOVE] entries:")):
+                skip_directive_continuation = True
+                continue
+            if skip_directive_continuation and line.startswith("  "):
+                continue
+            skip_directive_continuation = False
+            lines.append(line)
+        return "\n".join(lines).strip()
+
+    def _uses_atomic_operation_prompt(self) -> bool:
+        return self._tools.has("dream_memory_set") and not self._tools.has("edit_file")
+
+    @staticmethod
+    def _atomic_operation_phase1_prompt() -> str:
+        return """Extract only automatic principal-memory operations from the history.
+
+The server has already fixed one private owner. Never infer or emit an owner,
+scope, topic, participant, storage key, or routing decision.
+
+Output one line per finding in exactly one of these forms:
+[PROFILE] kind=profile value=<profile>
+[MEMORY] kind=memory fact_id=<stable_fact_id> value=<atomic_fact>
+[DELETE] kind=delete fact_id=<stable_fact_id>
+
+Rules:
+- PROFILE is the current participant profile or a correction to it.
+- MEMORY is one atomic durable fact with a stable fact_id.
+- Do not combine facts, invent routing, or copy temporary status and filler.
+- Reuse the same semantic fact_id when a newer statement replaces an old one.
+- If the participant says not to save a fact, do not emit MEMORY for it.
+- Emit DELETE when that exact stable fact may have been saved earlier.
+- Never copy the forbidden content or the prohibition itself into durable memory.
+- Return [SKIP] when no operation is needed."""
+
+    @staticmethod
+    def _atomic_operation_phase2_prompt(_prompt: str = "") -> str:
+        return """Apply only the atomic operations from the analysis below.
+- [PROFILE] entries: call `dream_memory_set` with
+  kind='profile', value='<profile>'
+- [MEMORY] entries: call `dream_memory_set` with
+  kind='memory', fact_id='<stable_fact_id>', value='<atomic_fact>'
+- [DELETE] entries: call `dream_memory_set` with
+  kind='delete', fact_id='<stable_fact_id>'
+
+Never add owner, scope, topic, actor, other participant, or storage key fields.
+If nothing needs updating, stop without calling tools."""
+
+    async def archive_private(
+        self,
+        principal: str,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Apply automatic memory operations for one server-resolved owner."""
+        if not isinstance(principal, str) or not principal:
+            raise ValueError("private archive principal is required")
+        if not messages:
+            return None
+        if not self._uses_atomic_operation_prompt():
+            raise RuntimeError("automatic private memory tool is not configured")
+
+        history_text = MemoryStore._format_messages(messages)
+        phase1_response = await self.provider.chat_with_retry(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": self._atomic_operation_phase1_prompt(),
+                },
+                {
+                    "role": "user",
+                    "content": f"## Conversation History\n{history_text}",
+                },
+            ],
+            tools=None,
+            tool_choice=None,
+        )
+        analysis = phase1_response.content or ""
+        runner_messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": self._atomic_operation_phase2_prompt(),
+            },
+            {
+                "role": "user",
+                "content": f"## Analysis Result\n{analysis}",
+            },
+        ]
+
+        turn_context = (
+            self._dream_turn_context()
+            if self._dream_turn_context is not None
+            else nullcontext()
+        )
+        principal_context = (
+            self._dream_batch_context(principal)
+            if self._dream_batch_context is not None
+            else nullcontext()
+        )
+        with turn_context, principal_context:
+            result = await self._runner.run(
+                AgentRunSpec(
+                    initial_messages=runner_messages,
+                    tools=self._tools,
+                    model=self.model,
+                    max_iterations=self.max_iterations,
+                    max_tool_result_chars=self.max_tool_result_chars,
+                    fail_on_tool_error=True,
+                )
+            )
+
+        required_operations = sum(
+            1
+            for line in analysis.splitlines()
+            if line.strip().startswith(("[PROFILE]", "[MEMORY]", "[DELETE]"))
+        )
+        tool_events = result.tool_events or []
+        successful_operations = sum(
+            1
+            for event in tool_events
+            if (
+                event.get("name") == "dream_memory_set"
+                and event.get("status") == "ok"
+            )
+        )
+        if (
+            result.stop_reason != "completed"
+            or result.error
+            or any(event.get("status") != "ok" for event in tool_events)
+            or successful_operations < required_operations
+        ):
+            raise RuntimeError(
+                "automatic private memory operations were not fully applied"
+            )
+        return None
 
     # -- skill listing --------------------------------------------------------
 
@@ -1110,17 +1319,45 @@ class Dream:
         if not entries:
             return False
 
+        operation_only = self._uses_atomic_operation_prompt()
         batch = entries[: self.max_batch_size]
+        if operation_only:
+            persisted_actor = batch[0].get("actor")
+            prefix_size = 1
+            for entry in batch[1:]:
+                if entry.get("actor") != persisted_actor:
+                    break
+                prefix_size += 1
+            batch = batch[:prefix_size]
         logger.info(
             "Dream: processing {} entries (cursor {}→{}), batch={}",
             len(entries), last_cursor, batch[-1]["cursor"], len(batch),
         )
 
-        # Build history text for LLM — include per-entry actor so Phase 1 can
-        # attribute facts to a principal (and Phase 2 can route private facts
-        # to memX instead of the shared MEMORY.md).  Entries from before the
-        # actor-tagging change have no ``actor`` field — render them as
-        # "(untagged)" so the LLM sees the ambiguity.
+        if operation_only:
+            principal = batch[0].get("actor")
+            if not isinstance(principal, str) or not principal:
+                return False
+            try:
+                await self.archive_private(
+                    principal,
+                    [
+                        {
+                            "role": "user",
+                            "content": str(entry.get("content") or ""),
+                        }
+                        for entry in batch
+                    ],
+                )
+            except Exception:
+                logger.exception("Dream private archive failed")
+                return False
+            new_cursor = batch[-1]["cursor"]
+            self.store.set_last_dream_cursor(new_cursor)
+            self.store.compact_history()
+            return True
+
+        # Build history text for the standalone file-backed Dream.
         def _render(e: dict) -> str:
             actor = e.get("actor") or "(untagged)"
             return f"[{e['timestamp']}] actor={actor}: {e['content']}"
@@ -1183,16 +1420,16 @@ class Dream:
             )
         phase2_prompt = f"## Analysis Result\n{analysis}\n\n{file_context}{skills_section}"
 
-        tools = self._tools
         skill_creator_path = BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md"
+        phase2_system_prompt = render_template(
+            "agent/dream_phase2.md",
+            strip=True,
+            skill_creator_path=str(skill_creator_path),
+        )
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
-                "content": render_template(
-                    "agent/dream_phase2.md",
-                    strip=True,
-                    skill_creator_path=str(skill_creator_path),
-                ),
+                "content": phase2_system_prompt,
             },
             {"role": "user", "content": phase2_prompt},
         ]
@@ -1206,7 +1443,7 @@ class Dream:
             with turn_context:
                 result = await self._runner.run(AgentRunSpec(
                     initial_messages=messages,
-                    tools=tools,
+                    tools=self._tools,
                     model=self.model,
                     max_iterations=self.max_iterations,
                     max_tool_result_chars=self.max_tool_result_chars,
@@ -1222,10 +1459,11 @@ class Dream:
             logger.exception("Dream Phase 2 failed")
             result = None
 
+        required_markers = ("[PRIVATE:", "[PAIR:")
         required_scoped_writes = sum(
             1
             for line in analysis.splitlines()
-            if line.strip().startswith(("[PRIVATE:", "[PAIR:"))
+            if line.strip().startswith(required_markers)
         )
         tool_events = result.tool_events if result else []
         successful_scoped_writes = sum(

@@ -1,10 +1,13 @@
 """Tests for the lightweight Consolidator — append-only to HISTORY.md."""
 
-import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
+import nanobot.agent.memory as memory_module
 from nanobot.agent.memory import Consolidator, MemoryStore
+from nanobot.session.manager import Session
 
 
 @pytest.fixture
@@ -19,8 +22,7 @@ def mock_provider():
     return p
 
 
-@pytest.fixture
-def consolidator(store, mock_provider):
+def _make_consolidator(store, mock_provider, **kwargs):
     sessions = MagicMock()
     sessions.save = MagicMock()
     return Consolidator(
@@ -32,7 +34,26 @@ def consolidator(store, mock_provider):
         build_messages=MagicMock(return_value=[]),
         get_tool_definitions=MagicMock(return_value=[]),
         max_completion_tokens=100,
+        **kwargs,
     )
+
+
+def test_removed_archive_protocol_symbols_are_absent() -> None:
+    for name in (
+        "ArchiveSource",
+        "ArchivePart",
+        "ArchiveManifest",
+        "build_archive_range_id",
+        "build_archive_source_id",
+        "build_session_archive_source",
+        "_freeze_private_mode_proof",
+    ):
+        assert not hasattr(memory_module, name), name
+
+
+@pytest.fixture
+def consolidator(store, mock_provider):
+    return _make_consolidator(store, mock_provider)
 
 
 class TestConsolidatorSummarize:
@@ -114,27 +135,25 @@ class TestConsolidatorTokenBudget:
         session.key = "test:key"
         consolidator.estimate_session_prompt_tokens = MagicMock(return_value=(100, "tiktoken"))
         consolidator.archive = AsyncMock(return_value=True)
+        consolidator.sessions.get_or_create.return_value = session
         await consolidator.maybe_consolidate_by_tokens(session)
         consolidator.archive.assert_not_called()
 
     async def test_chunk_cap_preserves_user_turn_boundary(self, consolidator):
         """Chunk cap should rewind to the last user boundary within the cap."""
         consolidator._SAFETY_BUFFER = 0
-        session = MagicMock()
-        session.last_consolidated = 0
-        session.key = "test:key"
-        session.messages = [
-            {
-                "role": "user" if i in {0, 50, 61} else "assistant",
-                "content": f"m{i}",
-            }
-            for i in range(70)
-        ]
+        session = Session(key="test:key")
+        for i in range(70):
+            session.add_message(
+                "user" if i in {0, 50, 61} else "assistant",
+                f"m{i}",
+            )
         consolidator.estimate_session_prompt_tokens = MagicMock(
             side_effect=[(1200, "tiktoken"), (400, "tiktoken")]
         )
         consolidator.pick_consolidation_boundary = MagicMock(return_value=(61, 999))
         consolidator.archive = AsyncMock(return_value=True)
+        consolidator.sessions.get_or_create.return_value = session
 
         await consolidator.maybe_consolidate_by_tokens(session)
 
@@ -160,8 +179,158 @@ class TestConsolidatorTokenBudget:
         consolidator.estimate_session_prompt_tokens = MagicMock(return_value=(1200, "tiktoken"))
         consolidator.pick_consolidation_boundary = MagicMock(return_value=(61, 999))
         consolidator.archive = AsyncMock(return_value=True)
+        consolidator.sessions.get_or_create.return_value = session
 
         await consolidator.maybe_consolidate_by_tokens(session)
 
         consolidator.archive.assert_not_awaited()
         assert session.last_consolidated == 0
+
+
+@pytest.mark.asyncio
+async def test_private_archive_boundary_is_only_session_owner_and_messages(
+    store,
+    mock_provider,
+):
+    events: list[str] = []
+    messages = [
+        {"role": "user", "content": "личный факт"},
+        {"role": "assistant", "content": "ответ"},
+    ]
+
+    async def resolve_owner(session_key, actual_messages):
+        events.append("resolver")
+        assert session_key == "telegram:1001"
+        assert actual_messages is messages
+        return "principal_alpha"
+
+    async def archive_sink(principal, actual_messages):
+        events.append("sink")
+        assert principal == "principal_alpha"
+        assert actual_messages is messages
+
+    consolidator = _make_consolidator(
+        store,
+        mock_provider,
+        archive_sink=archive_sink,
+        private_session_owner_resolver=resolve_owner,
+    )
+
+    result = await consolidator.archive(
+        messages,
+        session_key="telegram:1001",
+    )
+
+    assert result is None
+    assert events == ["resolver", "sink"]
+
+
+def _overflowing_private_session() -> Session:
+    session = Session(key="telegram:1001")
+    session.add_message("user", "fact", actor="principal_alpha")
+    session.add_message("assistant", "answer")
+    session.add_message("user", "next", actor="principal_alpha")
+    session.add_message("assistant", "next answer")
+    return session
+
+
+@pytest.mark.asyncio
+async def test_sink_return_without_exception_advances_boundary(
+    store,
+    mock_provider,
+):
+    session = _overflowing_private_session()
+    resolver = AsyncMock(return_value="principal_alpha")
+    sink = AsyncMock(return_value=None)
+    consolidator = _make_consolidator(
+        store,
+        mock_provider,
+        archive_sink=sink,
+        private_session_owner_resolver=resolver,
+    )
+    consolidator._SAFETY_BUFFER = 0
+    consolidator.estimate_session_prompt_tokens = MagicMock(
+        side_effect=[(1200, "test"), (400, "test")]
+    )
+    consolidator.pick_consolidation_boundary = MagicMock(
+        return_value=(2, 1000)
+    )
+    consolidator.sessions.get_or_create.return_value = session
+
+    await consolidator.maybe_consolidate_by_tokens(session)
+
+    assert session.last_consolidated == 2
+    consolidator.sessions.save.assert_called_once_with(session)
+    resolver.assert_awaited_once_with(
+        "telegram:1001",
+        session.messages[:2],
+    )
+    sink.assert_awaited_once_with(
+        "principal_alpha",
+        session.messages[:2],
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_owner_keeps_boundary_and_messages(
+    store,
+    mock_provider,
+):
+    session = _overflowing_private_session()
+    original_messages = list(session.messages)
+    resolver = AsyncMock(return_value=None)
+    sink = AsyncMock(return_value=None)
+    consolidator = _make_consolidator(
+        store,
+        mock_provider,
+        archive_sink=sink,
+        private_session_owner_resolver=resolver,
+    )
+    consolidator._SAFETY_BUFFER = 0
+    consolidator.estimate_session_prompt_tokens = MagicMock(
+        return_value=(1200, "test")
+    )
+    consolidator.pick_consolidation_boundary = MagicMock(
+        return_value=(2, 1000)
+    )
+    consolidator.sessions.get_or_create.return_value = session
+
+    with pytest.raises(RuntimeError, match="session owner is unavailable"):
+        await consolidator.maybe_consolidate_by_tokens(session)
+
+    assert session.last_consolidated == 0
+    assert session.messages == original_messages
+    sink.assert_not_awaited()
+    consolidator.sessions.save.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sink_exception_keeps_boundary_and_messages(
+    store,
+    mock_provider,
+):
+    session = _overflowing_private_session()
+    original_messages = list(session.messages)
+    resolver = AsyncMock(return_value="principal_alpha")
+    sink = AsyncMock(side_effect=RuntimeError("memX unavailable"))
+    consolidator = _make_consolidator(
+        store,
+        mock_provider,
+        archive_sink=sink,
+        private_session_owner_resolver=resolver,
+    )
+    consolidator._SAFETY_BUFFER = 0
+    consolidator.estimate_session_prompt_tokens = MagicMock(
+        return_value=(1200, "test")
+    )
+    consolidator.pick_consolidation_boundary = MagicMock(
+        return_value=(2, 1000)
+    )
+    consolidator.sessions.get_or_create.return_value = session
+
+    with pytest.raises(RuntimeError, match="memX unavailable"):
+        await consolidator.maybe_consolidate_by_tokens(session)
+
+    assert session.last_consolidated == 0
+    assert session.messages == original_messages
+    consolidator.sessions.save.assert_not_called()

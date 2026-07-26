@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from loguru import logger
@@ -29,6 +30,12 @@ import sys
 
 from familia.principals import get_current_actor, set_current_actor, set_current_channel
 from familia.roles import load_effective_roles
+
+
+_dream_principal: ContextVar[str | None] = ContextVar(
+    "familia_dream_principal",
+    default=None,
+)
 
 
 def make_context_extensions(workspace: Any) -> list[Any]:
@@ -68,6 +75,14 @@ def make_channel_classes() -> dict[str, Any]:
     return {"vk": VKChannel}
 
 
+def make_private_session_owner_resolver() -> Any:
+    """Return Familia's resolver for private archive source ownership."""
+    from familia.principals import get_registry
+    from familia.private_session_owner import PrivateSessionOwnerResolver
+
+    return PrivateSessionOwnerResolver(get_registry)
+
+
 def make_agent_loop_kwargs(workspace: Any) -> dict[str, Any]:
     """Return familia adapters for nanobot's neutral extension points."""
     from familia import audit
@@ -83,6 +98,7 @@ def make_agent_loop_kwargs(workspace: Any) -> dict[str, Any]:
         "direct_actor_resolver": make_direct_actor_resolver(),
         "current_actor_getter": get_current_actor,
         "history_actor_validator": make_history_actor_validator(),
+        "private_session_owner_resolver": make_private_session_owner_resolver(),
         "tool_call_auditor": audit.log_event,
         "cron_tool_options": {
             "to_validator": make_principal_chat_validator(),
@@ -92,6 +108,8 @@ def make_agent_loop_kwargs(workspace: Any) -> dict[str, Any]:
         },
         "dream_tool_installers": make_dream_tool_installers(),
         "dream_turn_context": make_dream_turn_context(),
+        "dream_restore_policy": make_dream_restore_policy(),
+        "dream_batch_context": make_dream_batch_context(),
     }
 
 
@@ -106,7 +124,35 @@ def make_dream_tool_installers() -> list[Any]:
     """Return familia Dream memory tool installers for nanobot Dream."""
     from familia.nanobot_extension.cron import make_dream_tool_installers as _make
 
-    return _make()
+    return _make(server_principal_getter=make_dream_server_context_resolver())
+
+
+def make_dream_restore_policy() -> Any:
+    """Return Familia's fail-closed policy for ordinary Dream restores."""
+
+    tracked_files = {"SOUL.md", "USER.md", "memory/MEMORY.md"}
+
+    def _policy(changed_files: list[str] | None) -> str | None:
+        if (
+            not isinstance(changed_files, list)
+            or not changed_files
+            or any(
+                not isinstance(path, str) or path not in tracked_files
+                for path in changed_files
+            )
+        ):
+            return (
+                "Familia cannot verify which files this Dream change affects. "
+                "Use the isolated snapshot restore path instead."
+            )
+        if "SOUL.md" in changed_files:
+            return (
+                "Familia does not restore `SOUL.md` through `/dream-restore`. "
+                "Use the isolated snapshot restore path instead."
+            )
+        return None
+
+    return _policy
 
 
 def make_history_actor_validator() -> Any:
@@ -133,6 +179,37 @@ def make_dream_turn_context() -> Any:
             set_current_actor(previous)
 
     return _scope
+
+
+def make_dream_batch_context() -> Any:
+    """Bind one server-resolved private owner for the active Dream turn."""
+
+    @contextmanager
+    def _scope(principal: str):
+        value = principal if isinstance(principal, str) and principal else None
+        token = _dream_principal.set(value)
+        try:
+            yield
+        finally:
+            _dream_principal.reset(token)
+
+    return _scope
+
+
+def make_dream_server_context_resolver() -> Any:
+    """Return the registry-verified owner bound to the active Dream turn."""
+    from familia.principals import get_registry
+
+    def _resolve() -> str | None:
+        principal = _dream_principal.get()
+        if (
+            not isinstance(principal, str)
+            or get_registry().get(principal) is None
+        ):
+            return None
+        return principal
+
+    return _resolve
 
 
 def make_heartbeat_source_reader(target_actor: str | None) -> Any:

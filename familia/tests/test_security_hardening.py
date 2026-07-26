@@ -83,24 +83,50 @@ def registry(monkeypatch: pytest.MonkeyPatch) -> PrincipalRegistry:
 
 
 def test_dream_memory_set_refuses_non_consolidator_actor(registry):
+    from unittest.mock import AsyncMock, Mock
+
     from familia.tools.dream_memory import DreamMemorySetTool
 
-    tool = DreamMemorySetTool(base_url="http://nope", api_key="k")
+    ingestor = Mock()
+    ingestor.ingest = AsyncMock(return_value="committed: must not run")
+    server_principal_getter = Mock(return_value="owner")
+    tool = DreamMemorySetTool(
+        ingestor=ingestor,
+        server_principal_getter=server_principal_getter,
+    )
     set_current_actor("owner")
     out = asyncio.run(tool.execute(
-        scope="shared", key="x", value="v",
+        kind="memory",
+        fact_id="fact-owner",
+        value="v",
     ))
     assert "Error" in out
     assert "consolidator" in out.lower()
+    ingestor.ingest.assert_not_awaited()
+    server_principal_getter.assert_not_called()
 
 
 def test_dream_memory_set_refuses_anonymous_actor(registry):
+    from unittest.mock import AsyncMock, Mock
+
     from familia.tools.dream_memory import DreamMemorySetTool
 
-    tool = DreamMemorySetTool(base_url="http://nope", api_key="k")
+    ingestor = Mock()
+    ingestor.ingest = AsyncMock(return_value="committed: must not run")
+    server_principal_getter = Mock(return_value="owner")
+    tool = DreamMemorySetTool(
+        ingestor=ingestor,
+        server_principal_getter=server_principal_getter,
+    )
     set_current_actor(None)
-    out = asyncio.run(tool.execute(scope="shared", key="x", value="v"))
+    out = asyncio.run(tool.execute(
+        kind="memory",
+        fact_id="fact-anonymous",
+        value="v",
+    ))
     assert "Error" in out
+    ingestor.ingest.assert_not_awaited()
+    server_principal_getter.assert_not_called()
 
 
 # ---- M3: memory_set value size cap -----------------------------------------
@@ -111,7 +137,7 @@ def test_memory_set_rejects_oversized_value(registry, monkeypatch):
     set_current_actor("owner")
     tool = MemorySetTool(base_url="http://nope")
     huge = "x" * (_MAX_VALUE_BYTES + 1)
-    out = asyncio.run(tool.execute(scope="shared", key="big", value=huge))
+    out = asyncio.run(tool.execute(fact_id="big", value=huge))
     assert out.startswith("Error: value too large")
     assert str(_MAX_VALUE_BYTES) in out
 

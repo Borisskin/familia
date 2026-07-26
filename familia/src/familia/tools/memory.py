@@ -193,6 +193,55 @@ async def _reachable_for(actor_id: str, api_key: str, base_url: str) -> set[str]
     return reachable_tag_ids(family, topics, actor_id, _principal_role_map())
 
 
+async def _topic_write_state(
+    actor_id: str,
+    api_key: str,
+    topic: str,
+    base_url: str,
+) -> str:
+    """Return whether an Admin-created topic is shared, isolated, or unavailable."""
+    try:
+        topics = await _fetch_graph(api_key, "shared:topics.graph", base_url)
+    except Exception:  # noqa: BLE001
+        return "unavailable"
+
+    topic_ids = {
+        node.id
+        for node in topics.nodes
+        if node.type == "topic"
+    }
+    if topic not in topic_ids:
+        return "unavailable"
+
+    linked_principals = {
+        edge.dst
+        for edge in topics.edges
+        if edge.rel == "concerns" and edge.src == topic
+    }
+    if not linked_principals:
+        return "isolated"
+
+    if not _is_admin(actor_id):
+        try:
+            family = await _fetch_graph(
+                api_key,
+                "shared:family.graph",
+                base_url,
+            )
+            reachable = reachable_tag_ids(
+                family,
+                topics,
+                actor_id,
+                _principal_role_map(),
+            )
+        except Exception:  # noqa: BLE001
+            return "unavailable"
+        if topic not in reachable:
+            return "unavailable"
+
+    return "shared" if linked_principals - {actor_id} else "isolated"
+
+
 async def _check_read_acl(
     actor_id: str, api_key: str, record_tags: set[str], full_key: str,
 ) -> tuple[bool, str]:
@@ -621,18 +670,29 @@ class MemoryGetTool(Tool):
 
 @tool_parameters(
     tool_parameters_schema(
-        scope=StringSchema(SCOPE_DESC),
-        key=StringSchema("Bare memory key (no scope prefix)"),
-        value=StringSchema("Value to store (use JSON-encoded string for structured data)"),
-        tags=ArraySchema(StringSchema(""), description=_TAGS_DESC, nullable=True),
-        required=["scope", "key", "value"],
+        fact_id=StringSchema("Stable identifier of one atomic fact"),
+        value=StringSchema(
+            "One atomic fact to store. Omit value to delete exact fact_id"
+        ),
+        topic=StringSchema(
+            "Optional existing shared topic requested by the person",
+            nullable=True,
+        ),
+        required=["fact_id"],
     )
+    | {"additionalProperties": False}
 )
 class MemorySetTool(Tool):
-    """Write a scoped memory value via memX using the current actor's key."""
+    """Write one atomic fact to the current actor's private memory."""
 
-    def __init__(self, base_url: str | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str | None = None,
+        *,
+        ingestor: Any | None = None,
+    ) -> None:
         self._base_url_override = base_url
+        self._ingestor = ingestor
 
     @property
     def name(self) -> str:
@@ -641,157 +701,96 @@ class MemorySetTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Write a value to scoped family memory (memX).\n\n"
-            "Family-by-default: ``private:`` records without the "
-            "``secret`` tag are readable by every peer-edge principal "
-            "(spouse / guardian). To keep a record owner-only — gifts, "
-            "therapy/health notes, work secrets — include ``secret`` in "
-            "the ``tags`` list. The owner always sees their own records "
-            "regardless of tag.\n\n"
-            "WHERE TO WRITE — pick the scope deliberately:\n"
-            "  • Personal facts about the current user (preferences, "
-            "ongoing context, profile bits, anything that follows them "
-            "between channels) → ALWAYS scope='private'.\n"
-            "    - Profile-style summary (one canonical doc) → "
-            "key='value:user_profile'.\n"
-            "    - Running notes / scratchpad → key='value:memory'.\n"
-            "    These two keys are auto-loaded into every prompt — "
-            "write there and you'll see the data on the next turn "
-            "regardless of channel.\n"
-            "    Custom private keys also work (anything under "
-            "'private:<actor>:*'); they get indexed under "
-            "'private:<actor>:value:private_index' and surface in your "
-            "system prompt as 'Private keys you've written' next turn, "
-            "so you can rediscover them by name. Prefer "
-            "'value:user_profile'/'value:memory' for the canonical "
-            "data — custom keys are for genuinely separate categories.\n"
-            "  • Family-wide facts that everyone should see (shared "
-            "calendar, household rule) → scope='shared'. Every custom "
-            "shared key you write gets indexed under "
-            "'private:<actor>:value:shared_index' and surfaces in your "
-            "prompt as 'Shared keys you've written'.\n"
-            "  • To share a fact with one specific other principal "
-            "(spouse, parent↔child, etc.), write it to scope='shared' "
-            "and put their id in the 'tags' field. Peer-edge ACL + "
-            "tag-ACL combine to make sure only that principal can read "
-            "it — there is NO separate scope for two-person sharing.\n\n"
-            "DO NOT stash personal facts about a single principal under "
-            "custom shared keys without tags — the auto-prompt won't "
-            "pick them up and you will look amnesiac on the next "
-            "channel switch.\n\n"
-            "Last-write-wins; no TTL/history at this layer."
+            "Store one atomic fact for the current person. The physical "
+            "destination is always that person's private memory. Use "
+            "topic only when the person explicitly requests an existing "
+            "shared topic; it is stored as a server-verified tag. Never "
+            "invent a topic or choose another person's memory. Omit value "
+            "to delete exact fact_id. Topic is ignored when deleting."
         )
 
     async def execute(
-        self, scope: str, key: str, value: str,
-        tags: list[str] | None = None,
+        self,
+        fact_id: str,
+        value: str | None = None,
+        topic: str | None = None,
         **kwargs: Any,
     ) -> str:
         actor_id, api_key, err = _current_actor_and_key()
         if err:
             return err
-        full_key, err = _resolve_full_key(scope, key, actor_id)
-        if err:
-            return err
-        # SR-14: belt-and-suspenders. Even if someone (mis)edits policy.yaml
-        # to allow these keys, the tool itself refuses — graphs/roles edits
-        # go through the `familia` CLI only.
-        if _is_reserved_structural_key(full_key):
-            return (
-                f"Error: '{full_key}' is a structural key (graphs/roles) and "
-                "cannot be written from chat. Use the `familia` CLI on the VM."
-            )
-        # Normalize tags early so size checks see the on-disk bytes.
-        tag_set: set[str] = set()
-        if tags:
-            for t in tags:
-                if isinstance(t, str) and t.strip():
-                    tag_set.add(t.strip())
-        if tag_set:
-            ok, reason = await _check_write_acl(
-                actor_id, api_key, tag_set, full_key,
-            )
-            if not ok:
+        delete = value is None
+        server_topic: str | None = None
+        requested_topic = ""
+        topic_state = "none"
+        if not delete:
+            value_bytes = value.encode("utf-8", errors="replace")
+            if len(value_bytes) > _MAX_VALUE_BYTES:
                 return (
-                    f"Error: cannot tag with {sorted(tag_set)} — {reason}. "
-                    "You can only tag records with ids in your reachable set."
+                    f"Error: value too large ({len(value_bytes)} bytes); "
+                    f"limit is {_MAX_VALUE_BYTES} bytes. Split it into atomic facts."
                 )
-            stored_value = codec.encode(value, sorted(tag_set))
-        else:
-            stored_value = value
-        value_bytes = (stored_value or "").encode("utf-8", errors="replace")
-        if len(value_bytes) > _MAX_VALUE_BYTES:
-            return (
-                f"Error: value too large ({len(value_bytes)} bytes); "
-                f"limit is {_MAX_VALUE_BYTES} bytes. Split into multiple "
-                "keys or summarize."
+
+            requested_topic = topic.strip() if isinstance(topic, str) else ""
+            if requested_topic:
+                topic_state = await _topic_write_state(
+                    actor_id,
+                    api_key,
+                    requested_topic,
+                    self._base_url_override or memx_base_url(),
+                )
+                if topic_state in {"shared", "isolated"}:
+                    server_topic = requested_topic
+
+        ingestor = self._ingestor
+        if ingestor is None:
+            from familia.principal_memory_ingestor import PrincipalMemoryIngestor
+
+            ingestor = PrincipalMemoryIngestor(
+                base_url=self._base_url_override or memx_base_url(),
+                api_key=api_key,
+                server_topic_validator=(
+                    (lambda candidate: candidate == server_topic)
+                    if server_topic is not None
+                    else None
+                ),
             )
-        index_update: dict[str, Any] | None = None
-        if not _is_reserved_value_key(key):
-            index_suffix: str | None = None
-            index_limit = _PRIVATE_INDEX_MAX_ENTRIES
-            if scope == "shared":
-                index_suffix = "value:shared_index"
-                index_limit = _SHARED_INDEX_MAX_ENTRIES
-            elif scope == "private":
-                index_suffix = "value:private_index"
-            if index_suffix is not None:
-                index_update = {
-                    "key": f"private:{actor_id}:{index_suffix}",
-                    "entry": {
-                        "name": key,
-                        "tags": sorted(tag_set) if tag_set else [],
-                    },
-                    "max_entries": index_limit,
+        result = await ingestor.ingest(
+            server_principal=actor_id,
+            server_topic=server_topic,
+            operation=(
+                {"kind": "delete", "fact_id": fact_id}
+                if delete
+                else {
+                    "kind": "memory",
+                    "fact_id": fact_id,
+                    "value": value,
                 }
-        if not full_key.startswith("pair:"):
-            decision = get_engine().evaluate(
-                PolicyContext(action="memory.write", actor=actor_id, to_chat=full_key)
-            )
-            if decision.decision is Decision.DENY:
-                reason = decision.reason or "policy denied"
-                return f"Policy denied memory.write на '{full_key}': {reason}"
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                r = await client.post(
-                    f"{self._base_url_override or memx_base_url()}/set",
-                    headers={"x-api-key": api_key},
-                    json={
-                        "key": full_key,
-                        "value": stored_value,
-                        "index_update": index_update,
-                    },
+            ),
+        )
+        if delete:
+            return result
+        committed = isinstance(result, str) and result.startswith("committed:")
+        if topic_state == "isolated":
+            if not committed:
+                return (
+                    f"{result}; у топика '{requested_topic}' нет общих связей"
                 )
-        except httpx.HTTPError as exc:
-            return f"Error: memX unreachable ({type(exc).__name__}: {exc})"
-        if r.status_code == 403:
-            return "denied_invalid: memX ACL rejected the write"
-        if r.status_code >= 400:
-            return f"error: memX transport status {r.status_code}: {r.text[:200]}"
-        try:
-            payload = r.json()
-        except (TypeError, ValueError):
-            return "error: memX returned a non-JSON semantic result"
-        if not isinstance(payload, dict):
-            return "error: memX returned a non-object semantic result"
-        status = payload.get("status")
-        if (
-            status == "committed"
-            and payload.get("committed") is True
-            and payload.get("updated") is True
-            and payload.get("retryable") is False
-        ):
-            pass
-        elif status == "denied_invalid":
-            return "denied_invalid: memX rejected the mutation"
-        elif payload.get("retryable") is True or status == "not_updated":
-            return f"retryable_failure: memX semantic state '{status or 'unknown'}'"
-        else:
-            return f"error: memX returned inconsistent semantic state '{status}'"
-        if tag_set:
-            tag_str = ", ".join(sorted(tag_set))
-            return f"committed: Stored at '{full_key}' (теги: {tag_str})"
-        return f"committed: Stored at '{full_key}'"
+            return (
+                f"{result}; сохранено в личную память с тегом топика "
+                f"'{requested_topic}', но у топика '{requested_topic}' "
+                "нет общих связей"
+            )
+        if topic_state == "unavailable":
+            if not committed:
+                return (
+                    f"{result}; топик '{requested_topic}' недоступен и не настроен"
+                )
+            return (
+                f"{result}; топик '{requested_topic}' недоступен и не настроен; "
+                "сохранено в личную память без топика"
+            )
+        return result
 
 
 # Maximum number of entries we keep in each per-actor key-index.

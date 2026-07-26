@@ -357,7 +357,7 @@ def _write_baseline_index(root: Path, baseline: dict[str, TreeEntry]) -> None:
         absolute = root / PurePosixPath(path)
         absolute.parent.mkdir(parents=True, exist_ok=True)
         absolute.write_bytes(entry.data)
-    _run(["git", "add", "-A"], cwd=root)
+    _run(["git", "add", "--force", "-A"], cwd=root)
     for path, entry in baseline.items():
         if entry.mode == "100755":
             _run(["git", "update-index", "--chmod=+x", "--", path], cwd=root)

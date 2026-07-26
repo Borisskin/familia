@@ -1,15 +1,7 @@
-"""Unit tests for per-scope Dream (familia #44).
+"""Unit tests for Familia Dream memory.
 
-Scope:
-
-* ``MemoryStore.append_history`` tags entries with ``actor``.
-* ``Consolidator._group_by_actor`` splits a mixed chunk into per-actor runs.
-* ``DreamMemorySetTool`` builds the right memX key for each scope and gates
-  through policy as ``dream_consolidator``.
-
-The heavy Dream.run path (LLM-driven Phase 1 + Phase 2) is not exercised
-here — it's covered by live integration smoke.  These tests pin down
-the mechanical guarantees the smoke depends on.
+Automatic compaction receives one server-resolved private owner and exposes
+only atomic profile, memory, and delete operations.
 """
 
 from __future__ import annotations
@@ -18,7 +10,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -28,6 +20,7 @@ from nanobot.agent.memory import Consolidator, MemoryStore
 from familia.policy import Decision, PolicyContext
 from familia.policy.engine import load_engine
 from familia.tools.dream_memory import DreamMemorySetTool
+from nanobot.providers.base import LLMResponse
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1] / "src" / "familia" / "config"
@@ -90,39 +83,33 @@ def test_group_by_actor_leading_untagged_goes_to_none() -> None:
     assert groups[1][0] == "member_a"
 
 
-# --- DreamMemorySetTool: key construction ---------------------------------
+# --- DreamMemorySetTool: automatic-operation boundary ----------------------
 
-@pytest.mark.parametrize(
-    "scope,actor,other,key,expected",
-    [
-        ("shared",  None,         None,     "todo",  "shared:todo"),
-        ("private", "member_a",     None,     "feels", "private:member_a:value:memory"),
-        # pair: alphabetical order regardless of argument order
-        ("pair",    "member_a",     "owner", "note", "pair:member_a_owner:note"),
-        ("pair",    "owner", "member_a",     "note", "pair:member_a_owner:note"),
-    ],
-)
-def test_dream_memory_key_resolution(scope, actor, other, key, expected):
-    from familia.tools.dream_memory import _resolve_full_key
-    full, err = _resolve_full_key(scope, key, actor, other)
-    assert err is None, err
-    assert full == expected
+def test_dream_memory_tool_schema_excludes_model_routing_fields() -> None:
+    tool = DreamMemorySetTool()
+    properties = tool.parameters["properties"]
+
+    assert set(properties) == {"kind", "fact_id", "value"}
+    assert {
+        "source_cursor",
+        "scope",
+        "actor",
+        "other",
+        "owner",
+        "topic",
+    }.isdisjoint(properties)
+    assert tool.parameters["additionalProperties"] is False
 
 
-@pytest.mark.parametrize(
-    "scope,actor,other,key",
-    [
-        ("private", None,         None,      "x"),   # scope=private requires actor
-        ("pair",    "member_a",     None,      "x"),   # pair requires both
-        ("pair",    "member_a",     "member_a",  "x"),   # pair requires distinct
-        ("shared",  None,         None,      ""),    # empty key
-        ("weird",   None,         None,      "x"),   # unknown scope
-    ],
-)
-def test_dream_memory_key_invalid(scope, actor, other, key):
-    from familia.tools.dream_memory import _resolve_full_key
-    _, err = _resolve_full_key(scope, key, actor, other)
-    assert err is not None
+def test_dream_memory_module_has_no_legacy_writer_branch() -> None:
+    from familia.tools import dream_memory as dream_memory_mod
+
+    assert {
+        "_resolve_full_key",
+        "_merge_memory_document",
+        "httpx",
+        "CONSOLIDATOR_KEY_ENV",
+    }.isdisjoint(vars(dream_memory_mod))
 
 
 # --- DreamMemorySetTool: policy gate --------------------------------------
@@ -148,7 +135,14 @@ def known_member(monkeypatch: pytest.MonkeyPatch) -> PrincipalRegistry:
                 identities=[Identity(channel="test", sender_id="member-a")],
                 memx_key="member-a",
                 roles=[],
-            )
+            ),
+            Principal(
+                id="member_b",
+                display_name="Member B",
+                identities=[Identity(channel="test", sender_id="member-b")],
+                memx_key="member-b",
+                roles=[],
+            ),
         ]
     )
     monkeypatch.setattr(principals_mod, "_registry", registry)
@@ -176,52 +170,146 @@ def test_dream_consolidator_denied_for_memory_read(policy_engine) -> None:
     assert r.decision is Decision.DENY
 
 
-def test_dream_memory_set_tool_calls_memx_on_allow(policy_engine, known_member) -> None:
-    import asyncio
+@pytest.mark.asyncio
+async def test_dream_memory_set_tool_delegates_without_own_http_writer() -> None:
     from familia.principals import set_current_actor
     from familia.tools.dream_memory import CONSOLIDATOR_ACTOR
 
-    tool = DreamMemorySetTool(base_url="http://mock-memx:8000", api_key="dream_consolidator_key")
-
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.text = "ok"
-    mock_resp.json.return_value = {
-        "ok": True,
-        "status": "committed",
-        "committed": True,
-        "updated": True,
-        "retryable": False,
-        "version": 1.0,
-    }
-    mock_get_resp = MagicMock(status_code=200, text="null")
-    mock_get_resp.json.return_value = None
-
-    # Dream agent pins this actor for its turn; the tool now refuses to run
-    # outside that context (defense-in-depth against accidental registration
-    # on the main loop). Mirror prod here.
+    ingestor = MagicMock()
+    ingestor.ingest = AsyncMock(return_value="committed: stored")
+    server_principal_getter = MagicMock(return_value="member_a")
+    tool = DreamMemorySetTool(
+        ingestor=ingestor,
+        server_principal_getter=server_principal_getter,
+    )
     set_current_actor(CONSOLIDATOR_ACTOR)
 
-    with patch("httpx.AsyncClient") as mock_client_cls:
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=mock_get_resp)
-        mock_client.post = AsyncMock(return_value=mock_resp)
-        mock_client_cls.return_value.__aenter__.return_value = mock_client
+    result = await tool.execute(
+        kind="memory",
+        fact_id="fact-17",
+        value="worried about deadline",
+    )
 
-        result = asyncio.run(tool.execute(
-            scope="private", actor="member_a",
-            key="value:memory", value="worried about deadline",
-        ))
+    assert result == "committed: stored"
+    server_principal_getter.assert_called_once_with()
+    ingestor.ingest.assert_awaited_once_with(
+        server_principal="member_a",
+        server_topic=None,
+        operation={
+            "kind": "memory",
+            "fact_id": "fact-17",
+            "value": "worried about deadline",
+        },
+    )
 
-    assert "Stored at 'private:member_a:value:memory'" in result
-    mock_client.post.assert_called_once()
-    call_args = mock_client.post.call_args
-    assert call_args.kwargs["headers"]["x-api-key"] == "dream_consolidator_key"
-    assert call_args.kwargs["json"] == {
-        "key": "private:member_a:value:memory",
-        "value": "worried about deadline",
-        "expected_ts": None,
-    }
+
+@pytest.mark.asyncio
+async def test_dream_memory_set_tool_deletes_exact_private_fact() -> None:
+    from familia.principals import set_current_actor
+    from familia.tools.dream_memory import CONSOLIDATOR_ACTOR
+
+    ingestor = MagicMock()
+    ingestor.ingest = AsyncMock(return_value="deleted: removed")
+    tool = DreamMemorySetTool(
+        ingestor=ingestor,
+        server_principal_getter=MagicMock(return_value="member_a"),
+    )
+    set_current_actor(CONSOLIDATOR_ACTOR)
+
+    result = await tool.execute(
+        kind="delete",
+        fact_id="employment.current",
+    )
+
+    assert result == "deleted: removed"
+    ingestor.ingest.assert_awaited_once_with(
+        server_principal="member_a",
+        server_topic=None,
+        operation={
+            "kind": "delete",
+            "fact_id": "employment.current",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_dream_batch_context_fixes_private_owner(
+    known_member: PrincipalRegistry,
+) -> None:
+    from familia.bootstrap import (
+        make_dream_batch_context,
+        make_dream_server_context_resolver,
+        make_dream_turn_context,
+    )
+    from familia.principals import set_current_actor
+    from familia.tools.dream_memory import CONSOLIDATOR_ACTOR
+
+    ingestor = MagicMock()
+    ingestor.ingest = AsyncMock(return_value="committed: stored")
+    owner = make_dream_server_context_resolver()
+    tool = DreamMemorySetTool(
+        ingestor=ingestor,
+        server_principal_getter=owner,
+    )
+    set_current_actor(CONSOLIDATOR_ACTOR)
+
+    assert owner() is None
+    with make_dream_turn_context()(), make_dream_batch_context()("member_a"):
+        result = await tool.execute(
+            kind="memory",
+            fact_id="employment.current",
+            value="works at Example",
+        )
+
+    assert result == "committed: stored"
+    assert owner() is None
+    ingestor.ingest.assert_awaited_once_with(
+        server_principal="member_a",
+        server_topic=None,
+        operation={
+            "kind": "memory",
+            "fact_id": "employment.current",
+            "value": "works at Example",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_standalone_phase1_prompt_and_history_keep_legacy_contract(
+    tmp_path: Path,
+) -> None:
+    from nanobot.agent.memory import Dream
+    from nanobot.agent.runner import AgentRunResult
+
+    captured_messages: list[dict[str, Any]] = []
+    provider = MagicMock()
+
+    async def phase1(**kwargs: Any) -> LLMResponse:
+        captured_messages.extend(kwargs["messages"])
+        return LLMResponse(content="[SKIP]")
+
+    provider.chat_with_retry = AsyncMock(side_effect=phase1)
+    store = MemoryStore(tmp_path)
+    store.append_history("standalone fact", actor="member_a")
+    dream = Dream(store=store, provider=provider, model="test-model")
+    dream._runner.run = AsyncMock(
+        return_value=AgentRunResult(
+            final_content="done",
+            messages=[],
+            stop_reason="completed",
+            tool_events=[],
+        )
+    )
+
+    assert await dream.run() is True
+    phase1_system = captured_messages[0]["content"]
+    phase1_history = captured_messages[1]["content"]
+    assert "actor=member_a: standalone fact" in phase1_history
+    assert "source_cursor" not in phase1_history
+    assert "[FILE] atomic fact" in phase1_system
+    assert "[PRIVATE:<actor>]" in phase1_system
+    assert "[PAIR:<a>,<b>]" in phase1_system
+    assert "source_cursor" not in phase1_system
 
 
 @pytest.mark.asyncio
@@ -260,74 +348,67 @@ async def test_dream_sets_and_restores_consolidator_actor(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_explicit_shared_file_route_remains_available(tmp_path: Path) -> None:
+async def test_familia_dream_does_not_register_protected_file_editor(
+    tmp_path: Path,
+) -> None:
     from nanobot.agent.memory import Dream
     from familia.nanobot_extension.cron import make_dream_tool_installers
 
     store = MemoryStore(tmp_path)
-    store.write_memory("# Shared memory\n")
+    protected = {
+        "USER.md": "user-before\n",
+        "MEMORY.md": "root-memory-before\n",
+        "memory/MEMORY.md": "memory-before\n",
+        "SOUL.md": "soul-before\n",
+    }
+    for relative_path, content in protected.items():
+        path = tmp_path / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
     dream = Dream(
         store=store,
         provider=MagicMock(),
         model="test-model",
         dream_tool_installers=make_dream_tool_installers(),
     )
-    edit_tool = dream._tools.get("edit_file")
-    assert edit_tool is not None
 
-    result = await edit_tool.execute(
-        path="memory/MEMORY.md",
-        old_text="# Shared memory",
-        new_text="# Shared memory\n- shared household fact",
-        dream_scope="shared",
+    protected_aliases = (
+        "./USER.md",
+        "./MEMORY.md",
+        "memory/../memory/MEMORY.md",
+        "sOuL.Md",
+        "dream_scope='shared'",
     )
+    assert dream._tools.get("edit_file") is None, protected_aliases
+    assert {
+        relative_path: (tmp_path / relative_path).read_text(encoding="utf-8")
+        for relative_path in protected
+    } == protected
 
-    assert not result.startswith("Error:")
-    assert store.read_memory() == "# Shared memory\n- shared household fact\n"
 
-
-@pytest.mark.asyncio
-async def test_dream_memory_updated_false_is_not_committed(
-    policy_engine,
-    known_member,
+def test_bootstrap_wires_history_validator_dream_scope_and_restore_policy(
+    tmp_path: Path,
 ) -> None:
-    from familia.principals import set_current_actor
-    from familia.tools.dream_memory import CONSOLIDATOR_ACTOR
-
-    tool = DreamMemorySetTool(base_url="http://mock-memx:8000", api_key="key")
-    response = MagicMock(status_code=200, text='{"ok":true,"updated":false}')
-    response.json.return_value = {
-        "ok": True,
-        "status": "not_updated",
-        "committed": False,
-        "updated": False,
-        "retryable": False,
-        "version": None,
-    }
-    get_response = MagicMock(status_code=200, text="null")
-    get_response.json.return_value = None
-    set_current_actor(CONSOLIDATOR_ACTOR)
-
-    with patch("httpx.AsyncClient") as client_cls:
-        client = AsyncMock()
-        client.get = AsyncMock(return_value=get_response)
-        client.post = AsyncMock(return_value=response)
-        client_cls.return_value.__aenter__.return_value = client
-        result = await tool.execute(
-            scope="private",
-            actor="member_a",
-            key="value:memory",
-            value="unchanged",
-        )
-
-    assert result.startswith("Error:")
-    assert "semantic commit failed" in result
-
-
-def test_bootstrap_wires_history_validator_and_dream_scope(tmp_path: Path) -> None:
     from familia.bootstrap import make_agent_loop_kwargs
 
     kwargs = make_agent_loop_kwargs(tmp_path)
 
     assert callable(kwargs["history_actor_validator"])
     assert callable(kwargs["dream_turn_context"])
+    restore_policy = kwargs["dream_restore_policy"]
+    assert callable(restore_policy)
+    assert isinstance(restore_policy(["SOUL.md"]), str)
+    assert restore_policy(["USER.md", "memory/MEMORY.md"]) is None
+
+
+def test_bootstrap_wires_private_session_owner_resolver(tmp_path: Path) -> None:
+    from familia.bootstrap import make_agent_loop_kwargs
+    from familia.private_session_owner import PrivateSessionOwnerResolver
+
+    kwargs = make_agent_loop_kwargs(tmp_path)
+
+    assert isinstance(
+        kwargs["private_session_owner_resolver"],
+        PrivateSessionOwnerResolver,
+    )

@@ -2,7 +2,7 @@
 # upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
 
 diff --git a/nanobot/nanobot/channels/telegram.py b/nanobot/nanobot/channels/telegram.py
-index 6925658..7a5ca15 100644
+index 6925658..e9ab541 100644
 --- a/nanobot/nanobot/channels/telegram.py
 +++ b/nanobot/nanobot/channels/telegram.py
 @@ -11,7 +11,7 @@ from typing import Any, Literal
@@ -296,7 +296,32 @@ index 6925658..7a5ca15 100644
      @staticmethod
      def _sender_id(user) -> str:
          """Build sender_id with username for allowlist matching."""
-@@ -796,13 +742,13 @@ class TelegramChannel(BaseChannel):
+@@ -777,15 +723,22 @@ class TelegramChannel(BaseChannel):
+     def _build_message_metadata(message, user) -> dict:
+         """Build common Telegram inbound metadata payload."""
+         reply_to = getattr(message, "reply_to_message", None)
++        is_group = message.chat.type != "private"
++        topic_id = getattr(message, "message_thread_id", None)
+         return {
+             "message_id": message.message_id,
+             "user_id": user.id,
+             "username": user.username,
+             "first_name": user.first_name,
+-            "is_group": message.chat.type != "private",
+-            "message_thread_id": getattr(message, "message_thread_id", None),
++            "is_group": is_group,
++            "message_thread_id": topic_id,
+             "is_forum": bool(getattr(message.chat, "is_forum", False)),
+             "reply_to_message_id": getattr(reply_to, "message_id", None) if reply_to else None,
++            "private_mode_proof": {
++                "private_mode": not is_group,
++                "is_group": is_group,
++                "topic_id": topic_id,
++            },
+         }
+ 
+     async def _extract_reply_context(self, message) -> str | None:
+@@ -796,13 +749,13 @@ class TelegramChannel(BaseChannel):
          text = getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
          if len(text) > TELEGRAM_REPLY_CONTEXT_MAX_LEN:
              text = text[:TELEGRAM_REPLY_CONTEXT_MAX_LEN] + "..."
@@ -313,7 +338,7 @@ index 6925658..7a5ca15 100644
          if bot_id and reply_user and getattr(reply_user, "id", None) == bot_id:
              return f"[Reply to bot: {text}]"
          elif reply_user and getattr(reply_user, "username", None):
-@@ -813,9 +759,20 @@ class TelegramChannel(BaseChannel):
+@@ -813,9 +766,20 @@ class TelegramChannel(BaseChannel):
              return f"[Reply to: {text}]"
  
      async def _download_message_media(
@@ -336,7 +361,7 @@ index 6925658..7a5ca15 100644
          media_file = None
          media_type = None
          if getattr(msg, "photo", None):
-@@ -854,11 +811,25 @@ class TelegramChannel(BaseChannel):
+@@ -854,11 +818,25 @@ class TelegramChannel(BaseChannel):
              await file.download_to_drive(str(file_path))
              path_str = str(file_path)
              if media_type in ("voice", "audio"):
@@ -363,7 +388,7 @@ index 6925658..7a5ca15 100644
              return [path_str], [f"[{media_type}: {path_str}]"]
          except Exception as e:
              logger.warning("Failed to download message media: {}", e)
-@@ -940,30 +911,6 @@ class TelegramChannel(BaseChannel):
+@@ -940,30 +918,6 @@ class TelegramChannel(BaseChannel):
          if len(self._message_threads) > 1000:
              self._message_threads.pop(next(iter(self._message_threads)))
  
@@ -394,7 +419,7 @@ index 6925658..7a5ca15 100644
      async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
          """Handle incoming messages (text, photos, voice, documents)."""
          if not update.message or not update.effective_user:
-@@ -997,9 +944,19 @@ class TelegramChannel(BaseChannel):
+@@ -997,9 +951,19 @@ class TelegramChannel(BaseChannel):
              lon = message.location.longitude
              content_parts.append(f"[location: {lat}, {lon}]")
  
@@ -415,7 +440,7 @@ index 6925658..7a5ca15 100644
          )
          media_paths.extend(current_media_paths)
          content_parts.extend(current_media_parts)
-@@ -1010,7 +967,9 @@ class TelegramChannel(BaseChannel):
+@@ -1010,7 +974,9 @@ class TelegramChannel(BaseChannel):
          reply = getattr(message, "reply_to_message", None)
          if reply is not None:
              reply_ctx = await self._extract_reply_context(message)

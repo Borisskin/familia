@@ -66,7 +66,7 @@ Phase 10 must still do hunk-by-hunk review:
 | `agent_context.patch`, `agent_loop.patch`, `agent_memory.patch`, `agent_tools_message.patch`, `channels_base.patch`, `cli_commands.patch` | Core behavioral deltas that need Phase 10 hunk-by-hunk audit. |
 | `pyproject.patch` | Fork/version/dependency delta against upstream `0.1.5.post2`; audit before changing package metadata. |
 
-`command_builtin.patch` records the known one-blank-line normalization in
-`nanobot/nanobot/command/builtin.py`. Its hunk is explicitly categorized as
-generated noise in `ownership.yaml`; keeping the deterministic patch avoids the
-former contradiction where regeneration produced an uncommitted extra file.
+`command_builtin.patch` records the synchronized `/new` archive-and-clear flow,
+save rollback, and the injected Dream restore policy in
+`nanobot/nanobot/command/builtin.py`. These are Familia-owned behavioral
+invariants in `ownership.yaml`.

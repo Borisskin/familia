@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import json
 import os
@@ -192,6 +193,12 @@ class AgentLoop:
         dream_tool_installers: list[CallableABC[[ToolRegistry, MemoryStore], None]] | None = None,
         history_actor_validator: CallableABC[[str], bool] | None = None,
         dream_turn_context: CallableABC[[], Any] | None = None,
+        dream_restore_policy: CallableABC[[list[str] | None], str | None] | None = None,
+        dream_batch_context: CallableABC[[list[dict[str, Any]]], Any] | None = None,
+        archive_sink: Callable[[str, list[dict]], Awaitable[Any]] | None = None,
+        private_session_owner_resolver: (
+            Callable[[str, list[dict]], Awaitable[str | None]] | None
+        ) = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
@@ -233,6 +240,7 @@ class AgentLoop:
         self._tool_call_auditor = tool_call_auditor
         self._cron_tool_options = cron_tool_options or {}
         self._dream_tool_installers = dream_tool_installers or []
+        self.dream_restore_policy = dream_restore_policy
 
         # Deployments inject concrete prompt/runtime extensions here; the
         # builder remains unaware of which product owns them.
@@ -275,6 +283,16 @@ class AgentLoop:
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
         )
+        self.dream = Dream(
+            store=self.context.memory,
+            provider=provider,
+            model=self.model,
+            dream_tool_installers=self._dream_tool_installers,
+            dream_turn_context=dream_turn_context,
+            dream_batch_context=dream_batch_context,
+        )
+        if archive_sink is None and private_session_owner_resolver is not None:
+            archive_sink = self.dream.archive_private
         self.consolidator = Consolidator(
             store=self.context.memory,
             provider=provider,
@@ -284,18 +302,13 @@ class AgentLoop:
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
+            archive_sink=archive_sink,
+            private_session_owner_resolver=private_session_owner_resolver,
         )
         self.auto_compact = AutoCompact(
             sessions=self.sessions,
             consolidator=self.consolidator,
             session_ttl_minutes=session_ttl_minutes,
-        )
-        self.dream = Dream(
-            store=self.context.memory,
-            provider=provider,
-            model=self.model,
-            dream_tool_installers=self._dream_tool_installers,
-            dream_turn_context=dream_turn_context,
         )
         self._register_default_tools()
         if _tc.my.enable:
@@ -822,7 +835,7 @@ class AgentLoop:
 
             session, pending = self.auto_compact.prepare_session(session, key)
 
-            await self.consolidator.maybe_consolidate_by_tokens(
+            session = await self.consolidator.maybe_consolidate_by_tokens(
                 session,
                 session_summary=pending,
             )
@@ -865,6 +878,20 @@ class AgentLoop:
                 content=final_content or "Background task completed.",
             )
 
+        metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
+        has_private_mode_proof = (
+            "private_mode_proof" in metadata
+            and metadata["private_mode_proof"] is not None
+        )
+        if (
+            self.consolidator.archive_sink_enabled
+            and msg.channel in {"telegram", "vk"}
+            and not has_private_mode_proof
+        ):
+            raise ValueError(
+                "private_mode_proof is required for server messages"
+            )
+
         if self._pending_inbound_handler:
             handled, pending_response = await self._pending_inbound_handler(msg)
             if handled:
@@ -888,7 +915,7 @@ class AgentLoop:
 
         session, pending = self.auto_compact.prepare_session(session, key)
 
-        await self.consolidator.maybe_consolidate_by_tokens(
+        session = await self.consolidator.maybe_consolidate_by_tokens(
             session,
             session_summary=pending,
         )
@@ -949,11 +976,23 @@ class AgentLoop:
         # makes recovery possible from the session log alone.
         user_persisted_early = False
         if isinstance(msg.content, str) and msg.content.strip():
+            user_message_kwargs: dict[str, Any] = {
+                "sender_id": str(msg.sender_id),
+            }
+            if has_private_mode_proof:
+                user_message_kwargs.update(
+                    {
+                        "channel": msg.channel,
+                        "chat_id": str(msg.chat_id),
+                        "private_mode_proof": copy.deepcopy(
+                            metadata["private_mode_proof"]
+                        ),
+                    }
+                )
             user_actor = self._current_actor_getter()
             if user_actor:
-                session.add_message("user", msg.content, actor=user_actor)
-            else:
-                session.add_message("user", msg.content)
+                user_message_kwargs["actor"] = user_actor
+            session.add_message("user", msg.content, **user_message_kwargs)
             self._mark_pending_user_turn(session)
             self.sessions.save(session)
             user_persisted_early = True
@@ -1087,7 +1126,9 @@ class AgentLoop:
                         continue
                     entry["content"] = filtered
             entry.setdefault("timestamp", datetime.now().isoformat())
-            session.messages.append(entry)
+            stored_role = entry.pop("role", None)
+            stored_content = entry.pop("content", "")
+            session.add_message(stored_role, stored_content, **entry)
         session.updated_at = datetime.now()
 
     def _persist_subagent_followup(self, session: Session, msg: InboundMessage) -> bool:
@@ -1189,7 +1230,13 @@ class AgentLoop:
             ):
                 overlap = size
                 break
-        session.messages.extend(restored_messages[overlap:])
+        previous_updated_at = session.updated_at
+        for restored_message in restored_messages[overlap:]:
+            entry = dict(restored_message)
+            role = entry.pop("role", None)
+            content = entry.pop("content", "")
+            session.add_message(role, content, **entry)
+        session.updated_at = previous_updated_at
 
         self._clear_pending_user_turn(session)
         self._clear_runtime_checkpoint(session)
@@ -1203,12 +1250,10 @@ class AgentLoop:
             return False
 
         if session.messages and session.messages[-1].get("role") == "user":
-            session.messages.append(
-                {
-                    "role": "assistant",
-                    "content": "Error: Task interrupted before a response was generated.",
-                    "timestamp": datetime.now().isoformat(),
-                }
+            session.add_message(
+                "assistant",
+                "Error: Task interrupted before a response was generated.",
+                timestamp=datetime.now().isoformat(),
             )
             session.updated_at = datetime.now()
 

@@ -723,15 +723,22 @@ class TelegramChannel(BaseChannel):
     def _build_message_metadata(message, user) -> dict:
         """Build common Telegram inbound metadata payload."""
         reply_to = getattr(message, "reply_to_message", None)
+        is_group = message.chat.type != "private"
+        topic_id = getattr(message, "message_thread_id", None)
         return {
             "message_id": message.message_id,
             "user_id": user.id,
             "username": user.username,
             "first_name": user.first_name,
-            "is_group": message.chat.type != "private",
-            "message_thread_id": getattr(message, "message_thread_id", None),
+            "is_group": is_group,
+            "message_thread_id": topic_id,
             "is_forum": bool(getattr(message.chat, "is_forum", False)),
             "reply_to_message_id": getattr(reply_to, "message_id", None) if reply_to else None,
+            "private_mode_proof": {
+                "private_mode": not is_group,
+                "is_group": is_group,
+                "topic_id": topic_id,
+            },
         }
 
     async def _extract_reply_context(self, message) -> str | None:

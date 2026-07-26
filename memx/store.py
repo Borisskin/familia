@@ -61,6 +61,68 @@ def get_value(key):
     return _decode_record(raw, key)
 
 
+def delete_value(
+    key: str,
+    *,
+    expected_ts: float | None | object = _EXPECTED_TS_UNSET,
+) -> MutationResult:
+    """Delete one value with timestamp CAS; absence is an idempotent success."""
+    if (
+        expected_ts is not _EXPECTED_TS_UNSET
+        and expected_ts is not None
+        and (
+            not isinstance(expected_ts, (int, float))
+            or isinstance(expected_ts, bool)
+        )
+    ):
+        raise ValueError("expected_ts must be a number or null")
+
+    redis_key = _redis_key(key)
+    with _redis.pipeline() as pipe:
+        while True:
+            try:
+                pipe.watch(redis_key)
+                raw = pipe.get(redis_key)
+                if not raw:
+                    pipe.unwatch()
+                    return MutationResult(
+                        status="absent",
+                        committed=True,
+                        updated=False,
+                        retryable=False,
+                        version=None,
+                    )
+
+                current_ts = _decode_record(raw, key)["ts"]
+                if (
+                    expected_ts is not _EXPECTED_TS_UNSET
+                    and expected_ts != current_ts
+                ):
+                    pipe.unwatch()
+                    return MutationResult(
+                        status="conflict",
+                        committed=False,
+                        updated=False,
+                        retryable=True,
+                        version=current_ts,
+                    )
+
+                pipe.multi()
+                pipe.delete(redis_key)
+                pipe.execute()
+                return MutationResult(
+                    status="deleted",
+                    committed=True,
+                    updated=True,
+                    retryable=False,
+                    version=current_ts,
+                )
+            except redis.WatchError:
+                continue
+            finally:
+                pipe.reset()
+
+
 def _decode_index_entries(raw: str | bytes | None, key: str) -> list[dict[str, Any]]:
     if raw is None:
         return []

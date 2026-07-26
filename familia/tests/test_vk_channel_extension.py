@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -78,3 +79,64 @@ async def test_vk_callback_event_resolves_actor(monkeypatch) -> None:
     assert event.payload == {"action": "approve"}
     assert event.metadata["correlation_id"] == "corr_a"
     assert calls == [("vk", "100")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("from_id", "peer_id", "private_mode"),
+    [(100, 100, True), (100, 200, False)],
+)
+async def test_vk_message_new_preserves_private_mode_proof(
+    monkeypatch, from_id: int, peer_id: int, private_mode: bool
+) -> None:
+    from familia.channels.vk import VKChannel
+
+    channel = VKChannel(
+        SimpleNamespace(
+            enabled=True,
+            group_id=1,
+            access_token="token_a",
+            api_version="5.199",
+            allow_from=["*"],
+            long_poll_wait=25,
+            streaming=False,
+            proxy="",
+            media_proxy="",
+        ),
+        MessageBus(),
+    )
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    monkeypatch.setattr(channel, "_handle_message", capture_handle)
+    monkeypatch.setattr(channel, "_start_typing", lambda _chat_id: None)
+    monkeypatch.setattr(
+        channel,
+        "_download_attachments",
+        AsyncMock(return_value=([], [])),
+    )
+
+    await channel._handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": from_id,
+                    "peer_id": peer_id,
+                    "text": "hello",
+                    "attachments": [],
+                }
+            },
+        }
+    )
+
+    assert len(handled) == 1
+    assert handled[0]["sender_id"] == str(from_id)
+    assert handled[0]["chat_id"] == str(peer_id)
+    assert handled[0]["metadata"]["private_mode_proof"] == {
+        "private_mode": private_mode,
+        "peer_id": str(peer_id),
+        "from_id": str(from_id),
+    }

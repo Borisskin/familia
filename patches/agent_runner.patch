@@ -2,7 +2,7 @@
 # upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
 
 diff --git a/nanobot/nanobot/agent/runner.py b/nanobot/nanobot/agent/runner.py
-index d90c79f..8e5641b 100644
+index d90c79f..6d2013e 100644
 --- a/nanobot/nanobot/agent/runner.py
 +++ b/nanobot/nanobot/agent/runner.py
 @@ -450,9 +450,22 @@ class AgentRunner:
@@ -30,3 +30,31 @@ index d90c79f..8e5641b 100644
                  self._append_model_error_placeholder(messages)
                  context.final_content = final_content
                  context.error = error
+@@ -627,6 +640,7 @@ class AgentRunner:
+     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
+         batches = self._partition_tool_batches(spec, tool_calls)
+         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
++        stop_after_error = False
+         for batch in batches:
+             if spec.concurrent_tools and len(batch) > 1:
+                 tool_results.extend(await asyncio.gather(*(
+@@ -635,7 +649,13 @@ class AgentRunner:
+                 )))
+             else:
+                 for tool_call in batch:
+-                    tool_results.append(await self._run_tool(spec, tool_call, external_lookup_counts))
++                    outcome = await self._run_tool(spec, tool_call, external_lookup_counts)
++                    tool_results.append(outcome)
++                    if spec.fail_on_tool_error and outcome[2] is not None:
++                        stop_after_error = True
++                        break
++            if stop_after_error:
++                break
+ 
+         results: list[Any] = []
+         events: list[dict[str, str]] = []
+@@ -984,4 +1004,3 @@ class AgentRunner:
+         if current:
+             batches.append(current)
+         return batches
+-

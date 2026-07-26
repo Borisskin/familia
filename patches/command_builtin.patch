@@ -2,10 +2,18 @@
 # upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
 
 diff --git a/nanobot/nanobot/command/builtin.py b/nanobot/nanobot/command/builtin.py
-index 87d4bf6..54a7520 100644
+index 87d4bf6..30bfa05 100644
 --- a/nanobot/nanobot/command/builtin.py
 +++ b/nanobot/nanobot/command/builtin.py
-@@ -52,7 +52,7 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++from copy import deepcopy
+ import os
+ import sys
+ 
+@@ -52,7 +53,7 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
          pass
      if ctx_est <= 0:
          ctx_est = loop._last_usage.get("prompt_tokens", 0)
@@ -14,3 +22,80 @@ index 87d4bf6..54a7520 100644
      # Fetch web search provider usage (best-effort, never blocks the response)
      search_usage_text: str | None = None
      try:
+@@ -95,13 +96,29 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
+     """Stop active task and start a fresh session."""
+     loop = ctx.loop
+     await loop._cancel_active_tasks(ctx.key)
+-    session = ctx.session or loop.sessions.get_or_create(ctx.key)
+-    snapshot = session.messages[session.last_consolidated:]
+-    session.clear()
+-    loop.sessions.save(session)
+-    loop.sessions.invalidate(session.key)
+-    if snapshot:
+-        loop._schedule_background(loop.consolidator.archive(snapshot))
++    lock = loop.consolidator.get_lock(ctx.key)
++    async with lock:
++        session = loop.sessions.get_or_create(ctx.key)
++        original_messages = deepcopy(session.messages)
++        original_last_consolidated = session.last_consolidated
++        original_metadata = deepcopy(session.metadata)
++        original_updated_at = session.updated_at
++        snapshot = session.messages[session.last_consolidated:]
++        if snapshot:
++            await loop.consolidator.archive(
++                snapshot,
++                session_key=session.key,
++            )
++        session.clear()
++        try:
++            loop.sessions.save(session)
++        except Exception:
++            session.messages = original_messages
++            session.last_consolidated = original_last_consolidated
++            session.metadata = original_metadata
++            session.updated_at = original_updated_at
++            raise
++        loop.sessions.invalidate(session.key)
+     return OutboundMessage(
+         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+         content="New session started.",
+@@ -287,19 +304,27 @@ async def cmd_dream_restore(ctx: CommandContext) -> OutboundMessage:
+         sha = args.split()[0]
+         result = git.show_commit_diff(sha)
+         changed_files = _format_changed_files(result[1]) if result else "the tracked memory files"
+-        new_sha = git.revert(sha)
+-        if new_sha:
+-            content = (
+-                f"Restored Dream memory to the state before `{sha}`.\n\n"
+-                f"- New safety commit: `{new_sha}`\n"
+-                f"- Restored files: {changed_files}\n\n"
+-                f"Use `/dream-log {new_sha}` to inspect the restore diff."
+-            )
++        changed_file_paths = _extract_changed_files(result[1]) if result else None
++        restore_policy = getattr(ctx.loop, "dream_restore_policy", None)
++        restore_block_reason = (
++            restore_policy(changed_file_paths) if callable(restore_policy) else None
++        )
++        if restore_block_reason is not None:
++            content = restore_block_reason
+         else:
+-            content = (
+-                f"Couldn't restore Dream change `{sha}`.\n\n"
+-                "It may not exist, or it may be the first saved version with no earlier state to restore."
+-            )
++            new_sha = git.revert(sha)
++            if new_sha:
++                content = (
++                    f"Restored Dream memory to the state before `{sha}`.\n\n"
++                    f"- New safety commit: `{new_sha}`\n"
++                    f"- Restored files: {changed_files}\n\n"
++                    f"Use `/dream-log {new_sha}` to inspect the restore diff."
++                )
++            else:
++                content = (
++                    f"Couldn't restore Dream change `{sha}`.\n\n"
++                    "It may not exist, or it may be the first saved version with no earlier state to restore."
++                )
+     return OutboundMessage(
+         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+         content=content, metadata={"render_as": "text"},

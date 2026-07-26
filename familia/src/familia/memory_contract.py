@@ -19,7 +19,9 @@ MEMORY_CONTRACT: Final[dict[str, Any]] = {
         "automatic_scopes": ["private_profile", "private_atomic_memory"],
         "owner_assignment": "server_only",
         "model_may_select_owner": False,
-        "model_may_select_topic": False,
+        "model_may_request_topic": True,
+        "server_validates_topic": True,
+        "model_may_create_topic": False,
     },
     "identity": {
         "principal_id": {
@@ -119,140 +121,54 @@ MEMORY_CONTRACT: Final[dict[str, Any]] = {
         "atomic_fact_key": "private:<principal>:memory:<fact_id>",
         "legacy_combined_key": "private:<principal>:value:memory",
         "legacy_combined_role": "migration_and_compatibility_input_only",
-        "transaction_candidate_key": "private:<principal>:history:<source_id>",
         "pending_migration_key": "private:<principal>:pending_migration:<id>",
         "fact_topics": {
             "assigned_by": "server",
             "homogeneous_reader_set": True,
         },
     },
-    "archive": {
-        "supported_private_sources": [
-            {
-                "channel": "vk",
-                "session_key": "vk:<chat_id>",
-                "required_proofs": ["private_mode", "peer_id_equals_from_id"],
-            },
-            {
-                "channel": "telegram",
-                "session_key": "telegram:<chat_id>",
-                "required_proofs": ["private_mode", "not_group", "no_topic"],
-            },
-        ],
-        "unsupported_topologies": ["group", "topic", "unified"],
-        "owner_resolution": {
-            "lookup": "(channel,chat_id)",
-            "result": "exactly_one_principal",
-            "user_actor_role": "cross_check_only",
-            "resolve_before": ["archive_sink", "llm", "legacy_archive_one"],
-        },
-        "archive_source": {
-            "immutable_fields": [
-                "source_kind",
-                "session_key",
-                "channel",
-                "chat_id",
-                "private_mode_proof",
-                "session_generation_id",
-                "message_seq_start",
-                "message_seq_end",
-                "trigger_reason",
-                "algorithm_version",
-            ],
-            "message_range": "absolute_half_open",
-        },
-        "range_identity": {
-            "range_id_fields": [
-                "source_kind",
-                "session_key",
-                "session_generation_id",
-                "message_seq_start",
-                "message_seq_end",
-            ],
-            "source_id_fields": ["range_id", "principal"],
-            "excluded_identity_fields": ["trigger_reason", "algorithm_version"],
-        },
-        "manifest": {
-            "persist_before_llm": True,
-            "frozen_fields": [
-                "principal",
-                "algorithm_version",
-                "source_id",
-                "parts",
-                "part_ids",
-            ],
-            "reuse_on_retry": True,
-        },
-        "transaction_candidate": {
-            "internal_only": True,
-            "immutable_fields": [
-                "principal",
-                "topic",
-                "session",
-                "source_id",
-                "manifest_ref",
-                "normalized_operations",
-                "original_revisions",
-                "expected_revisions",
-                "receipts",
-            ],
-            "excluded_from": ["memory_get", "indexes", "automatic_context"],
-            "close_after_canonical_writes": True,
-        },
-        "coverage": {
-            "required_before_range_release": True,
-            "parts": "terminal_non_overlapping_no_gaps",
-            "retryable_failure_is_terminal": False,
-        },
-        "fingerprint": {
-            "canonical_package": True,
-            "known_owner_only": True,
-            "collision_result": "integrity_conflict",
-            "forbidden_for_discarded_unknown": True,
+    "write_routing": {
+        "physical_owner": "actor",
+        "owner_assigned_by": "server",
+        "default_destination": "private",
+        "third_party_fact_owner": "speaker",
+        "foreign_private_allowed": False,
+        "direct_shared_allowed": False,
+        "direct_pair_allowed": False,
+        "topic": {
+            "form": "server_verified_private_fact_tag",
+            "creation": "admin_only",
+            "existing_without_shared_relations": "tag_and_notify_private_only",
+            "missing_or_unavailable": "store_private_untagged_and_notify",
         },
     },
+    "updates": {
+        "identity": "stable_fact_id",
+        "record_revision": "ts",
+        "full_memory_scan_required": False,
+        "operations": ["profile", "memory", "delete"],
+        "delete_scope": "private_actor_fact_only",
+        "delete_missing": "success",
+    },
+    "consolidation": {
+        "supported_sources": ["vk_private", "telegram_private"],
+        "automatic_destination": "private_owner_untagged",
+        "owner_resolver": {
+            "input": ["session_key", "messages"],
+            "result": "principal_or_none",
+            "before_model": True,
+        },
+        "archive_sink": {
+            "input": ["principal", "messages"],
+            "success": "return_without_exception",
+            "failure": "exception",
+            "failure_keeps_source_messages": True,
+        },
+        "retry": "reapply_stable_fact_operations",
+        "session_serialization": "single_lock",
+        "standalone_without_sink": "legacy_behavior",
+    },
     "outcomes": {
-        "operation": {
-            "values": [
-                "applied",
-                "duplicate",
-                "awaiting_owner",
-                "denied_invalid",
-                "retryable_failure",
-            ],
-            "terminal": ["applied", "duplicate", "awaiting_owner", "denied_invalid"],
-        },
-        "part": {
-            "values": [
-                "complete",
-                "complete_with_denials",
-                "retryable_failure",
-                "integrity_conflict",
-            ],
-            "terminal": ["complete", "complete_with_denials"],
-        },
-        "private_source": {
-            "values": [
-                "complete",
-                "duplicate",
-                "retryable_failure",
-                "integrity_conflict",
-            ],
-            "terminal": ["complete", "duplicate"],
-        },
-        "unknown_private_source": {
-            "values": ["discarded_unknown"],
-            "terminal": ["discarded_unknown"],
-        },
-        "session_range": {
-            "values": [
-                "complete",
-                "retryable_failure",
-                "integrity_conflict",
-                "unsupported_topology",
-            ],
-            "terminal": ["complete"],
-        },
         "legacy_row": {
             "values": [
                 "imported",
@@ -276,38 +192,6 @@ MEMORY_CONTRACT: Final[dict[str, Any]] = {
             "apply": {
                 "values": ["complete", "partial", "failed"],
                 "terminal": ["complete", "partial", "failed"],
-            },
-        },
-        "semantics": {
-            "discarded_unknown": {
-                "only_for": "unknown_private_source",
-                "happens_before": ["llm", "fingerprint"],
-                "content_or_derived_copy_persisted": False,
-                "receipt_payload": ["server_coordinates", "reason_counter"],
-                "terminal": True,
-            },
-            "awaiting_owner": {
-                "only_for": "deterministic_conflict_known_owner",
-                "existing_value_replaced": False,
-                "pending_candidate_visibility": "owner_only_secret",
-                "excluded_from": [
-                    "memory_get_for_others",
-                    "indexes",
-                    "automatic_context",
-                ],
-                "notification_contains_fact_text": False,
-                "blocks_activation": False,
-                "terminal": True,
-            },
-            "denied_invalid": {
-                "only_for": "single_deterministically_invalid_operation",
-                "allowed_for_whole_model_response": False,
-                "terminal": True,
-            },
-            "unusable_whole_model_response": {
-                "outcome": "retryable_failure",
-                "terminal": False,
-                "grants_coverage": False,
             },
         },
     },
@@ -352,7 +236,6 @@ MEMORY_CONTRACT: Final[dict[str, Any]] = {
         "same_topic_without_family_relation": "deny",
         "pair_scope": "exact_members_only",
         "shared_scope": "family_relation_required",
-        "transaction_candidate_internal_only": True,
         "service_keys_owner_only": True,
     },
     "unknown_content": {

@@ -28,6 +28,15 @@
       "invariant": "neutral ContextExtension API remains exported"
     },
     {
+      "catalog_id": "D-HB-042",
+      "path": "nanobot/nanobot/agent/autocompact.py",
+      "patch": "agent_autocompact.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "auto-compaction shares the session lock, rolls back failed saves, and publishes summaries only after persistence"
+    },
+    {
       "catalog_id": "D-HB-002",
       "path": "nanobot/nanobot/agent/context.py",
       "patch": "agent_context.patch",
@@ -43,7 +52,7 @@
       "owner": "familia",
       "category": "familia-invariant",
       "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "neutral adapters and Dream failure propagation remain wired without product imports"
+      "invariant": "neutral archive callbacks, private-mode proof persistence, and returned consolidated sessions remain wired without product imports"
     },
     {
       "catalog_id": "D-HB-004",
@@ -52,7 +61,7 @@
       "owner": "familia",
       "category": "familia-invariant",
       "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "actor-safe versioned durable history, quarantine, idempotent fallback, and cursor-last Dream commit"
+      "invariant": "standalone file archiving remains the default while optional owner-resolved private archives and session updates commit only after successful durable writes"
     },
     {
       "catalog_id": "D-HB-005",
@@ -196,7 +205,7 @@
       "owner": "familia",
       "category": "familia-invariant",
       "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "Telegram media, audio, inbound policy, and disabled command menu remain explicit"
+      "invariant": "Telegram media, audio, inbound policy, private-mode proof, and disabled command menu remain explicit"
     },
     {
       "catalog_id": "D-HB-021",
@@ -229,10 +238,10 @@
       "catalog_id": "D-HB-040",
       "path": "nanobot/nanobot/command/builtin.py",
       "patch": "command_builtin.patch",
-      "owner": "upstream",
-      "category": "generated-noise",
-      "hunks": [{"range": "all", "category": "generated-noise"}],
-      "invariant": "the known blank-line normalization has no behavioral effect and remains explicitly reconstructable"
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "new-session archival completes under the session lock before clearing, failed saves roll back, and Dream restore policy can deny protected files"
     },
     {
       "catalog_id": "D-HB-024",
@@ -332,6 +341,15 @@
       "category": "familia-invariant",
       "hunks": [{"range": "all", "category": "familia-invariant"}],
       "invariant": "product adapters load through neutral entry points without direct imports"
+    },
+    {
+      "catalog_id": "D-HB-043",
+      "path": "nanobot/nanobot/session/manager.py",
+      "patch": "session_manager.patch",
+      "owner": "familia",
+      "category": "familia-invariant",
+      "hunks": [{"range": "all", "category": "familia-invariant"}],
+      "invariant": "session JSONL saves stay atomic and serialized per key without archive coordinates or revision protocols"
     },
     {
       "catalog_id": "D-HB-035",

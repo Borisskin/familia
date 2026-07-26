@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 
 def test_heartbeat_source_reader_uses_principal_memx(monkeypatch) -> None:
@@ -44,22 +45,52 @@ def test_heartbeat_source_reader_fails_closed_without_memx_key(monkeypatch) -> N
     assert reader() == (None, None)
 
 
-def test_make_dream_tool_installers_registers_dream_memory_tool() -> None:
+def test_make_dream_tool_installers_registers_dream_memory_tool(
+    monkeypatch,
+) -> None:
     from familia.nanobot_extension import cron
+    from familia import memx_client, principal_memory_ingestor
 
     class _Registry:
         def __init__(self) -> None:
             self.tools = []
+            self.events = []
+
+        def unregister(self, name: str) -> None:
+            self.events.append(("unregister", name))
 
         def register(self, tool) -> None:
+            self.events.append(("register", tool.name))
             self.tools.append(tool)
 
     registry = _Registry()
+    ingestor = MagicMock()
+    ingestor_factory = MagicMock(return_value=ingestor)
+    monkeypatch.setenv("DREAM_CONSOLIDATOR_MEMX_KEY", "dream-writer-key")
+    monkeypatch.setattr(memx_client, "memx_base_url", lambda: "http://mock-memx:8000")
+    monkeypatch.setattr(
+        principal_memory_ingestor,
+        "PrincipalMemoryIngestor",
+        ingestor_factory,
+    )
     installers = cron.make_dream_tool_installers()
 
     assert len(installers) == 1
     installers[0](registry, SimpleNamespace(workspace=None))
+    assert registry.events == [
+        ("unregister", "read_file"),
+        ("unregister", "edit_file"),
+        ("unregister", "write_file"),
+        ("register", "dream_memory_set"),
+    ]
     assert [tool.name for tool in registry.tools] == ["dream_memory_set"]
+    ingestor_factory.assert_called_once_with(
+        base_url="http://mock-memx:8000",
+        api_key="dream-writer-key",
+        server_topic_validator=None,
+    )
+    assert registry.tools[0]._ingestor is ingestor
+    assert callable(registry.tools[0]._server_principal_getter)
 
 
 def test_cron_identity_round_trip_restart_and_dedupe(tmp_path, monkeypatch) -> None:

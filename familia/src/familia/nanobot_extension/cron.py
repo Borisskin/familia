@@ -7,6 +7,7 @@ Dream write tool can write scoped facts to memX.
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator
 
@@ -64,23 +65,42 @@ def make_heartbeat_source_reader(target_actor: str | None) -> Callable[[], tuple
     return _read
 
 
-def make_dream_tool_installers() -> list[Callable[[Any, Any], None]]:
-    """Return Dream tool installers for per-scope familia memory writes.
+def make_dream_tool_installers(
+    *,
+    server_principal_getter: Callable[[], Any] | None = None,
+    server_topic_validator: Callable[[str], bool] | None = None,
+) -> list[Callable[[Any, Any], None]]:
+    """Return the configured Familia automatic-memory tool installer.
 
     Dream still runs in nanobot, but the memX write path is familia-specific.
-    Injecting the tool here keeps nanobot's Dream registry neutral while
-    preserving per-scope writes to private/shared memory.
+    The integration removes nanobot's workspace-wide editor before adding the
+    owner-bound atomic writer; standalone nanobot keeps its default editor.
     """
 
     def _install(registry: Any, _memory_store: Any) -> None:
         # Import lazily so importing the cron adapter does not construct tool
         # dependencies until nanobot is actually building the Dream registry.
-        from familia.tools.dream_memory import DreamMemorySetTool, ScopedDreamEditGuard
+        from familia.memx_client import memx_base_url
+        from familia.principal_memory_ingestor import PrincipalMemoryIngestor
+        from familia.tools.dream_memory import DreamMemorySetTool
 
-        get_tool = getattr(registry, "get", None)
-        edit_tool = get_tool("edit_file") if callable(get_tool) else None
-        if edit_tool is not None:
-            registry.register(ScopedDreamEditGuard(edit_tool))
-        registry.register(DreamMemorySetTool())
+        principal_getter = server_principal_getter
+        if principal_getter is None:
+            from familia.bootstrap import make_dream_server_context_resolver
+
+            principal_getter = make_dream_server_context_resolver()
+        ingestor = PrincipalMemoryIngestor(
+            base_url=memx_base_url(),
+            api_key=os.environ.get("DREAM_CONSOLIDATOR_MEMX_KEY", ""),
+            server_topic_validator=server_topic_validator,
+        )
+        for name in ("read_file", "edit_file", "write_file"):
+            registry.unregister(name)
+        registry.register(
+            DreamMemorySetTool(
+                ingestor=ingestor,
+                server_principal_getter=principal_getter,
+            )
+        )
 
     return [_install]

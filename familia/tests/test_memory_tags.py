@@ -1,4 +1,4 @@
-"""Tag-based ACL on memory_set / memory_get (SR-7, SR-10, SR-11).
+"""Tag-based ACL on memory_get (SR-7, SR-10, SR-11).
 
 Mocks httpx so memX traffic is fake; relies on the Graph fixtures to
 shape who-sees-what.
@@ -16,7 +16,7 @@ import pytest
 from familia import principals as principals_mod
 from familia.acl import codec
 from familia.principals import Identity, Principal, PrincipalRegistry
-from familia.tools.memory import MemoryGetTool, MemorySetTool
+from familia.tools.memory import MemoryGetTool
 
 
 # ---- shared graphs fixture --------------------------------------------------
@@ -54,11 +54,14 @@ TOPICS_GRAPH = {
 }
 
 
-def _store_get_response(value: Any) -> MagicMock:
+def _store_get_response(value: Any, *, ts: float | None = None) -> MagicMock:
     r = MagicMock()
     r.status_code = 200
-    r.text = json.dumps({"value": value}, ensure_ascii=False)
-    r.json.return_value = {"value": value}
+    payload = {"value": value}
+    if ts is not None:
+        payload["ts"] = ts
+    r.text = json.dumps(payload, ensure_ascii=False)
+    r.json.return_value = payload
     return r
 
 
@@ -68,17 +71,22 @@ def _patched_client(values_by_key: dict[str, Any]):
 
     async def get(url, headers=None, params=None):
         key = (params or {}).get("key", "")
-        return _store_get_response(values_by_key.get(key))
+        value = values_by_key.get(key)
+        if key in {"shared:family.graph", "shared:topics.graph"}:
+            return _store_get_response(value)
+        return _store_get_response(value, ts=41.0)
 
     async def post(url, headers=None, json=None, **_):
         captured_writes.append(json or {})
         r = MagicMock()
         r.status_code = 200
         payload = {
+            "ok": True,
             "status": "committed",
             "committed": True,
             "updated": True,
             "retryable": False,
+            "version": 42.0,
         }
         r.text = "committed"
         r.json.return_value = payload
@@ -117,108 +125,6 @@ def graphs_in_memx():
         "shared:family.graph": FAMILY_GRAPH,
         "shared:topics.graph": TOPICS_GRAPH,
     }
-
-
-# ---- write-side --- SR-7 ---------------------------------------------------
-
-def test_set_with_unreachable_tag_rejected(monkeypatch, graphs_in_memx):
-    _make_registry(monkeypatch)
-    monkeypatch.setattr("familia.policy.engine._engine", None)
-    # member_a tries to tag with "finance" — she IS connected to finance, ok.
-    # Try with an actually unreachable tag like "ghost_topic" not in graph.
-    principals_mod.set_current_actor("member_a")
-    from familia.roles import set_effective_roles_for_tests
-    set_effective_roles_for_tests({"owner": frozenset({"admin"}), "member_a": frozenset()})
-
-    client, writes = _patched_client(graphs_in_memx)
-    with patch("httpx.AsyncClient") as cls:
-        cls.return_value.__aenter__.return_value = client
-        tool = MemorySetTool(base_url="http://nope")
-        # `nanny`-tag is reachable for member_a (parent_of varya, caregiver_of varya)?
-        # member_a is connected to varya (parent_of); nanny is connected to varya
-        # (caregiver_of). They share varya, so are reciprocally reachable through
-        # varya? No — reachable_persons does direct hops only. member_a reaches
-        # {member_a, owner, varya}; nanny is NOT in that set. Use it.
-        out = asyncio.run(tool.execute(
-            scope="shared", key="x", value="v",
-            tags=["nanny"],
-        ))
-    assert out.startswith("Error:")
-    assert "nanny" in out
-    assert writes == []  # nothing should have been POSTed
-
-
-def test_set_with_reachable_tags_succeeds_wrapped(monkeypatch, graphs_in_memx):
-    _make_registry(monkeypatch)
-    monkeypatch.setattr("familia.policy.engine._engine", None)
-    principals_mod.set_current_actor("member_a")
-    from familia.roles import set_effective_roles_for_tests
-    set_effective_roles_for_tests({"owner": frozenset({"admin"}), "member_a": frozenset()})
-
-    client, writes = _patched_client(graphs_in_memx)
-    with patch("httpx.AsyncClient") as cls:
-        cls.return_value.__aenter__.return_value = client
-        tool = MemorySetTool(base_url="http://nope")
-        out = asyncio.run(tool.execute(
-            scope="shared", key="varya.school_supplies",
-            value="тетради, ручки",
-            tags=["varya", "school"],
-        ))
-    assert "Stored at" in out
-    assert "теги: school, varya" in out
-    # Value and index update are one semantic memX mutation.  This keeps
-    # the canonical value and its discoverability index atomic.
-    assert len(writes) == 1
-    value_write = writes[0]
-    assert value_write["key"] == "shared:varya.school_supplies"
-    parsed = json.loads(value_write["value"])
-    assert parsed["__familia_acl_v1"] is True
-    assert sorted(parsed["tags"]) == ["school", "varya"]
-    assert parsed["value"] == "тетради, ручки"
-    index_update = value_write["index_update"]
-    assert index_update["key"] == "private:member_a:value:shared_index"
-    assert index_update["entry"] == {
-        "name": "varya.school_supplies",
-        "tags": ["school", "varya"],
-    }
-
-
-def test_admin_can_tag_anything(monkeypatch, graphs_in_memx):
-    _make_registry(monkeypatch)
-    monkeypatch.setattr("familia.policy.engine._engine", None)
-    principals_mod.set_current_actor("owner")
-    from familia.roles import set_effective_roles_for_tests
-    set_effective_roles_for_tests({"owner": frozenset({"admin"})})
-
-    client, writes = _patched_client(graphs_in_memx)
-    with patch("httpx.AsyncClient") as cls:
-        cls.return_value.__aenter__.return_value = client
-        tool = MemorySetTool(base_url="http://nope")
-        out = asyncio.run(tool.execute(
-            scope="shared", key="x", value="v",
-            tags=["definitely_not_in_graph"],
-        ))
-    assert "Stored at" in out
-
-
-def test_set_without_tags_legacy_path(monkeypatch, graphs_in_memx):
-    """Backward compat: missing tags param keeps legacy raw value write."""
-    _make_registry(monkeypatch)
-    monkeypatch.setattr("familia.policy.engine._engine", None)
-    principals_mod.set_current_actor("member_a")
-    from familia.roles import set_effective_roles_for_tests
-    set_effective_roles_for_tests({"owner": frozenset({"admin"}), "member_a": frozenset()})
-
-    client, writes = _patched_client(graphs_in_memx)
-    with patch("httpx.AsyncClient") as cls:
-        cls.return_value.__aenter__.return_value = client
-        tool = MemorySetTool(base_url="http://nope")
-        out = asyncio.run(tool.execute(
-            scope="private", key="note", value="legacy text",
-        ))
-    assert "Stored at" in out
-    assert "теги:" not in out
-    assert writes[0]["value"] == "legacy text"  # unwrapped
 
 
 # ---- read-side --- SR-10 fail-closed --------------------------------------
@@ -289,32 +195,3 @@ def test_get_legacy_lookalike_value_treated_as_legacy(monkeypatch, graphs_in_mem
     assert "no value stored" not in out
     # And the actual content (parsed legacy JSON) reaches the reader.
     assert "leak" in out
-
-
-# ---- audit (SR-11) --------------------------------------------------------
-
-def test_set_audit_emitted_on_deny(monkeypatch, graphs_in_memx, tmp_path):
-    _make_registry(monkeypatch)
-    monkeypatch.setattr("familia.policy.engine._engine", None)
-    principals_mod.set_current_actor("nanny")
-    from familia.roles import set_effective_roles_for_tests
-    set_effective_roles_for_tests({"owner": frozenset({"admin"}), "nanny": frozenset()})
-
-    audit_file = tmp_path / "audit.jsonl"
-    monkeypatch.setenv("FAMILIA_AUDIT_FILE", str(audit_file))
-    # Reset chmod cache between tests.
-    from familia import audit as audit_mod
-    audit_mod._chmod_done.clear()
-
-    client, _ = _patched_client(graphs_in_memx)
-    with patch("httpx.AsyncClient") as cls:
-        cls.return_value.__aenter__.return_value = client
-        tool = MemorySetTool(base_url="http://nope")
-        asyncio.run(tool.execute(
-            scope="shared", key="x", value="v",
-            tags=["finance"],
-        ))
-    text = audit_file.read_text(encoding="utf-8")
-    events = [json.loads(line) for line in text.splitlines()]
-    decisions = [e for e in events if e.get("kind") == "tag_acl_decision"]
-    assert any(e["decision"] == "deny" for e in decisions)

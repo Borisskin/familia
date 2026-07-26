@@ -1,5 +1,5 @@
 from fastapi import FastAPI, WebSocket, Request, HTTPException
-from store import CorruptRecordError, get_value, set_value
+from store import CorruptRecordError, delete_value, get_value, set_value
 from pubsub import subscribe, publish
 from schema import (
     CorruptSchemaError,
@@ -88,6 +88,51 @@ async def set(request: Request):
         )
 
     return result.as_payload()
+
+
+@app.post("/delete")
+async def delete(request: Request):
+    body = await request.json()
+    key = body["key"]
+
+    await validate_api.validate_api_key(request, key, action="write")
+    namespaced_key = getattr(request.state, "namespaced_key", key)
+
+    try:
+        delete_kwargs = {}
+        if "expected_ts" in body:
+            delete_kwargs["expected_ts"] = body["expected_ts"]
+        result = delete_value(namespaced_key, **delete_kwargs)
+    except ValueError as exc:
+        raise HTTPException(
+            400,
+            detail={
+                "status": "denied_invalid",
+                "committed": False,
+                "retryable": False,
+                "message": str(exc),
+            },
+        ) from exc
+    except CorruptRecordError as exc:
+        raise HTTPException(
+            409,
+            detail={
+                "status": "corruption_needs_repair",
+                "committed": False,
+                "retryable": False,
+                "message": str(exc),
+            },
+        ) from exc
+
+    if result.updated:
+        await publish(
+            namespaced_key,
+            {"event": "delete", "key": namespaced_key},
+            event="value",
+        )
+
+    return result.as_payload()
+
 
 @app.websocket("/subscribe/{key}")
 async def websocket_endpoint(websocket: WebSocket, key: str):

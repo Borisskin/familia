@@ -1,431 +1,347 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://familia.invalid/schemas/memory-contract-2.0.0.json",
-  "title": "Familia authoritative memory contract 2.0.0",
+  "$id": "https://familia.local/schema/memory-contract-2.0.0.json",
+  "title": "Familia memory contract 2.0.0",
   "type": "object",
-  "required": ["contract_version"],
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "authority",
+    "identity",
+    "destination_registry",
+    "pair_codec",
+    "failure_rules",
+    "storage",
+    "write_routing",
+    "updates",
+    "consolidation",
+    "outcomes",
+    "registry",
+    "access",
+    "unknown_content",
+    "flat_memory",
+    "soul",
+    "migration"
+  ],
   "properties": {
-    "contract_version": { "const": "2.0.0" }
-  },
-  "const": {
-    "contract_version": "2.0.0",
+    "contract_version": {
+      "const": "2.0.0"
+    },
     "authority": {
-      "canonical_export": "familia.memory_contract.MEMORY_CONTRACT",
-      "final_writer": "PrincipalMemoryIngestor",
-      "automatic_sources": [
-        "dream",
-        "conversation_consolidation",
-        "legacy_history_migration",
-        "memory_set"
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "canonical_export",
+        "final_writer",
+        "automatic_sources",
+        "automatic_scopes",
+        "owner_assignment",
+        "model_may_select_owner",
+        "model_may_request_topic",
+        "server_validates_topic",
+        "model_may_create_topic"
       ],
-      "automatic_scopes": ["private_profile", "private_atomic_memory"],
-      "owner_assignment": "server_only",
-      "model_may_select_owner": false,
-      "model_may_select_topic": false
+      "properties": {
+        "canonical_export": {
+          "const": "familia.memory_contract.MEMORY_CONTRACT"
+        },
+        "final_writer": {
+          "const": "PrincipalMemoryIngestor"
+        },
+        "automatic_sources": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "automatic_scopes": {
+          "const": [
+            "private_profile",
+            "private_atomic_memory"
+          ]
+        },
+        "owner_assignment": {
+          "const": "server_only"
+        },
+        "model_may_select_owner": {
+          "const": false
+        },
+        "model_may_request_topic": {
+          "const": true
+        },
+        "server_validates_topic": {
+          "const": true
+        },
+        "model_may_create_topic": {
+          "const": false
+        }
+      }
     },
     "identity": {
-      "principal_id": {
-        "canonical_regex": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
-        "encoding": "UTF-8",
-        "normalization": "none",
-        "registered_required": true
-      },
-      "multi_principal": {
-        "explicit_actor_required": true,
-        "actor_must_be_canonical": true,
-        "actor_must_be_registered": true,
-        "missing_or_invalid_outcome": "denied_invalid"
-      },
-      "executor_destination_owner_distinct": true
+      "type": "object"
     },
     "destination_registry": {
-      "version": "2.0.0",
-      "arbitrary_destinations_allowed": false,
-      "generic_file_fallback_allowed": false
+      "type": "object"
     },
     "pair_codec": {
-      "version": "pair-key-v1",
-      "implementation_status": "implemented_RP-040",
-      "principal_id_domain": {
-        "canonical_regex": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
-        "encoding": "UTF-8",
-        "normalization": "none"
-      },
-      "member_cardinality": 2,
-      "members_distinct": true,
-      "ordering": "ascending_utf8_bytes",
-      "physical_grammar": "pair-v1/<decimal-utf8-byte-length>:<id>/<decimal-utf8-byte-length>:<id>",
-      "length_grammar": "base10_no_leading_zero_positive_integer",
-      "decode_rejection_rules": [
-        "invalid_prefix",
-        "invalid_or_noncanonical_length",
-        "invalid_utf8_or_principal_id",
-        "truncated_or_surplus_member_bytes",
-        "noncanonical_member_order",
-        "duplicate_members",
-        "trailing_bytes"
-      ],
-      "injective_over_full_id_domain": true,
-      "shared_by": ["value_keys", "acl_generation"],
-      "collision_vector": {
-        "left_members": ["a_b", "c"],
-        "right_members": ["a", "b_c"],
-        "left_encoding": "pair-v1/3:a_b/1:c",
-        "right_encoding": "pair-v1/1:a/3:b_c",
-        "must_differ": true
-      }
+      "type": "object"
     },
     "failure_rules": {
-      "unknown_scope": {
-        "outcome": "denied_invalid",
-        "destination_selected": false,
-        "writes": 0
-      },
-      "invalid_actor_multi_principal": {
-        "cases": [
-          "missing",
-          "blank",
-          "malformed",
-          "non_canonical",
-          "unknown_to_registry"
-        ],
-        "outcome": "denied_invalid",
-        "destination_selected": false,
-        "writes": 0,
-        "prompt_assembly_allowed": false
-      },
-      "malformed_pair": {
-        "cases": [
-          "missing_member",
-          "one_member",
-          "three_or_more_members",
-          "duplicate_members",
-          "invalid_member",
-          "noncanonical_order"
-        ],
-        "outcome": "denied_invalid",
-        "destination_selected": false,
-        "writes": 0
-      },
-      "unregistered_destination": {
-        "outcome": "denied_invalid",
-        "fallback": "none",
-        "writes": 0
-      }
+      "type": "object"
     },
     "storage": {
-      "profile_key": "private:<principal>:value:user_profile",
-      "atomic_fact_key": "private:<principal>:memory:<fact_id>",
-      "legacy_combined_key": "private:<principal>:value:memory",
-      "legacy_combined_role": "migration_and_compatibility_input_only",
-      "transaction_candidate_key": "private:<principal>:history:<source_id>",
-      "pending_migration_key": "private:<principal>:pending_migration:<id>",
-      "fact_topics": {
-        "assigned_by": "server",
-        "homogeneous_reader_set": true
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile_key",
+        "atomic_fact_key",
+        "legacy_combined_key",
+        "legacy_combined_role",
+        "pending_migration_key",
+        "fact_topics"
+      ],
+      "properties": {
+        "profile_key": {
+          "const": "private:<principal>:value:user_profile"
+        },
+        "atomic_fact_key": {
+          "const": "private:<principal>:memory:<fact_id>"
+        },
+        "legacy_combined_key": {
+          "const": "private:<principal>:value:memory"
+        },
+        "legacy_combined_role": {
+          "const": "migration_and_compatibility_input_only"
+        },
+        "pending_migration_key": {
+          "const": "private:<principal>:pending_migration:<id>"
+        },
+        "fact_topics": {
+          "const": {
+            "assigned_by": "server",
+            "homogeneous_reader_set": true
+          }
+        }
       }
     },
-    "archive": {
-      "supported_private_sources": [
-        {
-          "channel": "vk",
-          "session_key": "vk:<chat_id>",
-          "required_proofs": ["private_mode", "peer_id_equals_from_id"]
-        },
-        {
-          "channel": "telegram",
-          "session_key": "telegram:<chat_id>",
-          "required_proofs": ["private_mode", "not_group", "no_topic"]
-        }
+    "write_routing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "physical_owner",
+        "owner_assigned_by",
+        "default_destination",
+        "third_party_fact_owner",
+        "foreign_private_allowed",
+        "direct_shared_allowed",
+        "direct_pair_allowed",
+        "topic"
       ],
-      "unsupported_topologies": ["group", "topic", "unified"],
-      "owner_resolution": {
-        "lookup": "(channel,chat_id)",
-        "result": "exactly_one_principal",
-        "user_actor_role": "cross_check_only",
-        "resolve_before": ["archive_sink", "llm", "legacy_archive_one"]
-      },
-      "archive_source": {
-        "immutable_fields": [
-          "source_kind",
-          "session_key",
-          "channel",
-          "chat_id",
-          "private_mode_proof",
-          "session_generation_id",
-          "message_seq_start",
-          "message_seq_end",
-          "trigger_reason",
-          "algorithm_version"
-        ],
-        "message_range": "absolute_half_open"
-      },
-      "range_identity": {
-        "range_id_fields": [
-          "source_kind",
-          "session_key",
-          "session_generation_id",
-          "message_seq_start",
-          "message_seq_end"
-        ],
-        "source_id_fields": ["range_id", "principal"],
-        "excluded_identity_fields": ["trigger_reason", "algorithm_version"]
-      },
-      "manifest": {
-        "persist_before_llm": true,
-        "frozen_fields": [
-          "principal",
-          "algorithm_version",
-          "source_id",
-          "parts",
-          "part_ids"
-        ],
-        "reuse_on_retry": true
-      },
-      "transaction_candidate": {
-        "internal_only": true,
-        "immutable_fields": [
-          "principal",
-          "topic",
-          "session",
-          "source_id",
-          "manifest_ref",
-          "normalized_operations",
-          "original_revisions",
-          "expected_revisions",
-          "receipts"
-        ],
-        "excluded_from": ["memory_get", "indexes", "automatic_context"],
-        "close_after_canonical_writes": true
-      },
-      "coverage": {
-        "required_before_range_release": true,
-        "parts": "terminal_non_overlapping_no_gaps",
-        "retryable_failure_is_terminal": false
-      },
-      "fingerprint": {
-        "canonical_package": true,
-        "known_owner_only": true,
-        "collision_result": "integrity_conflict",
-        "forbidden_for_discarded_unknown": true
+      "properties": {
+        "physical_owner": {
+          "const": "actor"
+        },
+        "owner_assigned_by": {
+          "const": "server"
+        },
+        "default_destination": {
+          "const": "private"
+        },
+        "third_party_fact_owner": {
+          "const": "speaker"
+        },
+        "foreign_private_allowed": {
+          "const": false
+        },
+        "direct_shared_allowed": {
+          "const": false
+        },
+        "direct_pair_allowed": {
+          "const": false
+        },
+        "topic": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "form",
+            "creation",
+            "existing_without_shared_relations",
+            "missing_or_unavailable"
+          ],
+          "properties": {
+            "form": {
+              "const": "server_verified_private_fact_tag"
+            },
+            "creation": {
+              "const": "admin_only"
+            },
+            "existing_without_shared_relations": {
+              "const": "tag_and_notify_private_only"
+            },
+            "missing_or_unavailable": {
+              "const": "store_private_untagged_and_notify"
+            }
+          }
+        }
+      }
+    },
+    "updates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "record_revision",
+        "full_memory_scan_required",
+        "operations",
+        "delete_scope",
+        "delete_missing"
+      ],
+      "properties": {
+        "identity": {
+          "const": "stable_fact_id"
+        },
+        "record_revision": {
+          "const": "ts"
+        },
+        "full_memory_scan_required": {
+          "const": false
+        },
+        "operations": {
+          "const": [
+            "profile",
+            "memory",
+            "delete"
+          ]
+        },
+        "delete_scope": {
+          "const": "private_actor_fact_only"
+        },
+        "delete_missing": {
+          "const": "success"
+        }
+      }
+    },
+    "consolidation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supported_sources",
+        "automatic_destination",
+        "owner_resolver",
+        "archive_sink",
+        "retry",
+        "session_serialization",
+        "standalone_without_sink"
+      ],
+      "properties": {
+        "supported_sources": {
+          "const": [
+            "vk_private",
+            "telegram_private"
+          ]
+        },
+        "automatic_destination": {
+          "const": "private_owner_untagged"
+        },
+        "owner_resolver": {
+          "const": {
+            "input": [
+              "session_key",
+              "messages"
+            ],
+            "result": "principal_or_none",
+            "before_model": true
+          }
+        },
+        "archive_sink": {
+          "const": {
+            "input": [
+              "principal",
+              "messages"
+            ],
+            "success": "return_without_exception",
+            "failure": "exception",
+            "failure_keeps_source_messages": true
+          }
+        },
+        "retry": {
+          "const": "reapply_stable_fact_operations"
+        },
+        "session_serialization": {
+          "const": "single_lock"
+        },
+        "standalone_without_sink": {
+          "const": "legacy_behavior"
+        }
       }
     },
     "outcomes": {
-      "operation": {
-        "values": [
-          "applied",
-          "duplicate",
-          "awaiting_owner",
-          "denied_invalid",
-          "retryable_failure"
-        ],
-        "terminal": ["applied", "duplicate", "awaiting_owner", "denied_invalid"]
-      },
-      "part": {
-        "values": [
-          "complete",
-          "complete_with_denials",
-          "retryable_failure",
-          "integrity_conflict"
-        ],
-        "terminal": ["complete", "complete_with_denials"]
-      },
-      "private_source": {
-        "values": [
-          "complete",
-          "duplicate",
-          "retryable_failure",
-          "integrity_conflict"
-        ],
-        "terminal": ["complete", "duplicate"]
-      },
-      "unknown_private_source": {
-        "values": ["discarded_unknown"],
-        "terminal": ["discarded_unknown"]
-      },
-      "session_range": {
-        "values": [
-          "complete",
-          "retryable_failure",
-          "integrity_conflict",
-          "unsupported_topology"
-        ],
-        "terminal": ["complete"]
-      },
-      "legacy_row": {
-        "values": [
-          "imported",
-          "duplicate",
-          "awaiting_owner",
-          "discarded_unknown",
-          "retryable_failure"
-        ],
-        "terminal": [
-          "imported",
-          "duplicate",
-          "awaiting_owner",
-          "discarded_unknown"
-        ]
-      },
-      "migration_command": {
-        "plan": {
-          "values": ["planned", "blocked_needs_review"],
-          "terminal": ["planned", "blocked_needs_review"]
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "legacy_row",
+        "migration_command"
+      ],
+      "properties": {
+        "legacy_row": {
+          "type": "object"
         },
-        "apply": {
-          "values": ["complete", "partial", "failed"],
-          "terminal": ["complete", "partial", "failed"]
-        }
-      },
-      "semantics": {
-        "discarded_unknown": {
-          "only_for": "unknown_private_source",
-          "happens_before": ["llm", "fingerprint"],
-          "content_or_derived_copy_persisted": false,
-          "receipt_payload": ["server_coordinates", "reason_counter"],
-          "terminal": true
-        },
-        "awaiting_owner": {
-          "only_for": "deterministic_conflict_known_owner",
-          "existing_value_replaced": false,
-          "pending_candidate_visibility": "owner_only_secret",
-          "excluded_from": [
-            "memory_get_for_others",
-            "indexes",
-            "automatic_context"
-          ],
-          "notification_contains_fact_text": false,
-          "blocks_activation": false,
-          "terminal": true
-        },
-        "denied_invalid": {
-          "only_for": "single_deterministically_invalid_operation",
-          "allowed_for_whole_model_response": false,
-          "terminal": true
-        },
-        "unusable_whole_model_response": {
-          "outcome": "retryable_failure",
-          "terminal": false,
-          "grants_coverage": false
+        "migration_command": {
+          "type": "object"
         }
       }
     },
     "registry": {
-      "required_non_empty": true,
-      "unique_fields": ["principal.id", "memx_key"],
-      "exact_identity_key": "(channel,str(sender_id))",
-      "telegram_derived_alias": "numeric_user_id_before_first_pipe",
-      "effective_identity_keys_unique_between_principals": true,
-      "invalid_states": [
-        "missing",
-        "empty",
-        "malformed",
-        "duplicate_principal_id",
-        "duplicate_memx_key",
-        "exact_identity_collision",
-        "derived_identity_collision"
-      ],
-      "publish_after_full_validation": true,
-      "first_install_uses_same_validation": true
+      "type": "object"
     },
     "access": {
-      "decision_function": "decide_memory_read",
-      "stable_reason_required": true,
-      "owner_reads_own_valid_record": true,
-      "family_relation_kinds": [
-        "spouse_of",
-        "parent_of",
-        "owner_of",
-        "caregiver_of",
-        "guardian_of"
+      "type": "object",
+      "required": [
+        "common_topic_requires_family_relation"
       ],
-      "family_relation_direct_only": true,
-      "family_relation_direction_matters": false,
-      "common_topic_requires_family_relation": true,
-      "common_topic_ordinary_memory_overrides": [
-        "secret",
-        "explicit_deny",
-        "no_matching_static_rule"
-      ],
-      "legacy_untagged_memory_available_to_family": true,
-      "same_topic_without_family_relation": "deny",
-      "pair_scope": "exact_members_only",
-      "shared_scope": "family_relation_required",
-      "transaction_candidate_internal_only": true,
-      "service_keys_owner_only": true
+      "properties": {
+        "common_topic_requires_family_relation": {
+          "const": true
+        }
+      },
+      "not": {
+        "required": [
+          "transaction_candidate_internal_only"
+        ]
+      }
     },
     "unknown_content": {
-      "discard_before_model": true,
-      "allowed_persistence": ["reason_counters"],
-      "forbidden_persistence": [
-        "content",
-        "excerpt",
-        "plain_hash",
-        "cryptographic_hash",
-        "derived_copy",
-        "quarantine",
-        "manual_review_queue"
-      ]
-    },
-    "flat_memory": {
-      "paths": ["USER.md", "MEMORY.md", "memory/MEMORY.md"],
-      "may_be_memory_source": false,
-      "required_size_bytes_after_transition": 0
-    },
-    "soul": {
-      "path": "SOUL.md",
-      "initial_template": "admin/src-tauri/resources/personality.template.txt",
-      "initial_creation": "atomic_create_if_absent",
-      "ordinary_writer": "Admin",
-      "restore_from_snapshot_is_only_exception": true,
-      "preserve_bytes_during": [
-        "dream",
-        "dream_restore",
-        "conversation_consolidation",
-        "version_update",
-        "legacy_transition",
-        "failed_restore"
+      "type": "object",
+      "required": [
+        "allowed_persistence"
       ],
-      "missing_existing_state": "integrity_error",
-      "non_regular_file": "integrity_error"
-    },
-    "migration": {
-      "report_schema": "release/memory-migration.schema.json",
-      "source_contract_versions": ["legacy-unversioned", "1.0.0", "2.0.0"],
-      "target_contract_version": "2.0.0",
-      "migration_kinds": {
-        "legacy-unversioned": "legacy_upgrade",
-        "1.0.0": "legacy_upgrade",
-        "2.0.0": "current_verify"
-      },
-      "current_verify_imports_history": false,
-      "current_verify_calls_model": false,
-      "current_verify": {
-        "imports_history": false,
-        "calls_model": false,
-        "required_checks": [
-          "flat_files_empty",
-          "soul_verified",
-          "registry_verified",
-          "memx_verified",
-          "receipts_verified",
-          "target_invariants_verified",
-          "no_unfinished_rows",
-          "unknown_content_discarded"
-        ]
-      },
-      "plan_is_applied_evidence": false,
-      "exit_codes": {
-        "plan": {
-          "planned": 2,
-          "blocked_needs_review": 2
-        },
-        "apply": {
-          "complete": 0,
-          "partial": 2,
-          "failed": 1
+      "properties": {
+        "allowed_persistence": {
+          "const": [
+            "reason_counters"
+          ]
         }
       }
+    },
+    "flat_memory": {
+      "type": "object",
+      "required": [
+        "may_be_memory_source"
+      ],
+      "properties": {
+        "may_be_memory_source": {
+          "const": false
+        }
+      }
+    },
+    "soul": {
+      "type": "object"
+    },
+    "migration": {
+      "type": "object"
     }
   }
 }
