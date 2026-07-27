@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
+import shutil
 from typing import Any
 
 
@@ -366,12 +368,76 @@ EXPECTED_MEMORY_READ_DECISIONS: tuple[dict[str, Any], ...] = (
 @dataclass(frozen=True)
 class SyntheticSnapshot:
     root: Path
+    source_root: Path
+    source_workspace: Path
     workspace: Path
-    existing_memory: dict[str, str]
-    family_graph: dict[str, Any]
-    topics_graph: dict[str, Any]
-    deterministic_conflict: dict[str, Any]
+    source_byte_pairs: tuple[tuple[str, bytes], ...]
+    source_logical_payload: bytes
+    source_digest: str
     expected_end_state: dict[str, Any]
+
+    @property
+    def source_bytes(self) -> dict[str, bytes]:
+        return dict(self.source_byte_pairs)
+
+    @property
+    def source_logical_state(self) -> dict[str, Any]:
+        return json.loads(self.source_logical_payload.decode("utf-8"))
+
+    @property
+    def existing_memory(self) -> dict[str, str]:
+        return self.source_logical_state["existing_memory"]
+
+    @property
+    def family_graph(self) -> dict[str, Any]:
+        return self.source_logical_state["family_graph"]
+
+    @property
+    def topics_graph(self) -> dict[str, Any]:
+        return self.source_logical_state["topics_graph"]
+
+    @property
+    def deterministic_conflict(self) -> dict[str, Any]:
+        return self.source_logical_state["deterministic_conflict"]
+
+
+def _tree_byte_pairs(root: Path) -> tuple[tuple[str, bytes], ...]:
+    return tuple(
+        (path.relative_to(root).as_posix(), path.read_bytes())
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    )
+
+
+def _deep_logical_digest(
+    file_pairs: tuple[tuple[str, bytes], ...],
+    logical_payload: bytes,
+) -> str:
+    digest = hashlib.sha256()
+    for relative_path, content in file_pairs:
+        path_bytes = relative_path.encode("utf-8")
+        digest.update(len(path_bytes).to_bytes(8, "big"))
+        digest.update(path_bytes)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    digest.update(logical_payload)
+    return digest.hexdigest()
+
+
+def synthetic_source_digest(
+    source_root: Path,
+    logical_state: dict[str, Any],
+) -> str:
+    logical_payload = json.dumps(
+        logical_state,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _deep_logical_digest(
+        _tree_byte_pairs(source_root),
+        logical_payload,
+    )
 
 
 def _history_record(cursor: int, actor: str | None, content: str) -> str:
@@ -389,11 +455,13 @@ def _history_record(cursor: int, actor: str | None, content: str) -> str:
 
 def write_synthetic_snapshot(base: Path) -> SyntheticSnapshot:
     root = base / "synthetic-snapshot"
-    workspace = root / "workspace"
-    memory = workspace / "memory"
+    source_root = root / "source"
+    source_workspace = source_root / "workspace"
+    workspace = root / "target" / "workspace"
+    memory = source_workspace / "memory"
     memory.mkdir(parents=True)
 
-    (root / "principals.json").write_text(
+    (source_root / "principals.json").write_text(
         json.dumps(principal_registry_sample(), sort_keys=True),
         encoding="utf-8",
     )
@@ -409,9 +477,9 @@ def write_synthetic_snapshot(base: Path) -> SyntheticSnapshot:
         },
         "outcome": "awaiting_owner",
     }
-    (workspace / "SOUL.md").write_bytes(b"synthetic soul bytes\n")
-    (workspace / "USER.md").write_bytes(b"flat user data must be erased\n")
-    (workspace / "MEMORY.md").write_bytes(b"root flat memory must be erased\n")
+    (source_workspace / "SOUL.md").write_bytes(b"synthetic soul bytes\n")
+    (source_workspace / "USER.md").write_bytes(b"flat user data must be erased\n")
+    (source_workspace / "MEMORY.md").write_bytes(b"root flat memory must be erased\n")
     (memory / "MEMORY.md").write_bytes(b"nested flat memory must be erased\n")
     history = [
         _history_record(1, "principal_alpha", "alpha profile fact"),
@@ -463,12 +531,30 @@ def write_synthetic_snapshot(base: Path) -> SyntheticSnapshot:
         "conflict_notification_contains_fact_text": False,
         "decision_cases": [row["case"] for row in EXPECTED_MEMORY_READ_DECISIONS],
     }
+    source_logical_payload = json.dumps(
+        {
+            "existing_memory": existing_memory,
+            "family_graph": family_graph,
+            "topics_graph": topics_graph,
+            "deterministic_conflict": deterministic_conflict,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    source_byte_pairs = _tree_byte_pairs(source_root)
+    source_digest = _deep_logical_digest(
+        source_byte_pairs,
+        source_logical_payload,
+    )
+    shutil.copytree(source_workspace, workspace)
     return SyntheticSnapshot(
         root=root,
+        source_root=source_root,
+        source_workspace=source_workspace,
         workspace=workspace,
-        existing_memory=existing_memory,
-        family_graph=family_graph,
-        topics_graph=topics_graph,
-        deterministic_conflict=deterministic_conflict,
+        source_byte_pairs=source_byte_pairs,
+        source_logical_payload=source_logical_payload,
+        source_digest=source_digest,
         expected_end_state=expected_end_state,
     )
