@@ -1,5 +1,6 @@
 # Local working notes (planning docs, drafts, scratch)
 notes/
+openspec/
 *.local.*
 !docker-compose.local.yml
 !docker-compose.memx.local.yml
