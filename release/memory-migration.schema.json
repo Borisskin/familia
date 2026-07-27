@@ -1,221 +1,100 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://familia.invalid/schemas/memory-migration-2.0.0.json",
-  "title": "Familia memory migration report 2.0.0",
+  "title": "Familia legacy history transition result 2.0.0",
   "oneOf": [
-    { "$ref": "#/$defs/plan" },
-    { "$ref": "#/$defs/apply" }
+    {
+      "$ref": "#/$defs/plan"
+    },
+    {
+      "$ref": "#/$defs/apply"
+    }
   ],
   "$defs": {
-    "rowId": {
+    "principalId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
     },
-    "planRow": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["row_id", "outcome"],
-      "properties": {
-        "row_id": { "$ref": "#/$defs/rowId" },
-        "outcome": { "enum": ["planned", "blocked_needs_review"] }
-      }
-    },
-    "plannedRow": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["row_id", "outcome"],
-      "properties": {
-        "row_id": { "$ref": "#/$defs/rowId" },
-        "outcome": { "const": "planned" }
-      }
-    },
-    "applyRow": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["row_id", "outcome"],
-      "properties": {
-        "row_id": { "$ref": "#/$defs/rowId" },
-        "outcome": {
-          "enum": [
-            "imported",
-            "duplicate",
-            "awaiting_owner",
-            "discarded_unknown",
-            "retryable_failure"
-          ]
-        }
-      }
-    },
-    "terminalApplyRow": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["row_id", "outcome"],
-      "properties": {
-        "row_id": { "$ref": "#/$defs/rowId" },
-        "outcome": {
-          "enum": [
-            "imported",
-            "duplicate",
-            "awaiting_owner",
-            "discarded_unknown"
-          ]
-        }
-      }
-    },
-    "retryableApplyRow": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["row_id", "outcome"],
-      "properties": {
-        "row_id": { "$ref": "#/$defs/rowId" },
-        "outcome": { "const": "retryable_failure" }
-      }
-    },
-    "checks": {
+    "flatAction": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "flat_files_empty",
-        "soul_verified",
-        "registry_verified",
-        "memx_verified",
-        "receipts_verified",
-        "target_invariants_verified",
-        "no_unfinished_rows",
-        "unknown_content_discarded"
-      ],
-      "properties": {
-        "flat_files_empty": { "type": "boolean" },
-        "soul_verified": { "type": "boolean" },
-        "registry_verified": { "type": "boolean" },
-        "memx_verified": { "type": "boolean" },
-        "receipts_verified": { "type": "boolean" },
-        "target_invariants_verified": { "type": "boolean" },
-        "no_unfinished_rows": { "type": "boolean" },
-        "unknown_content_discarded": { "type": "boolean" }
-      }
-    },
-    "completeChecks": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "flat_files_empty",
-        "soul_verified",
-        "registry_verified",
-        "memx_verified",
-        "receipts_verified",
-        "target_invariants_verified",
-        "no_unfinished_rows",
-        "unknown_content_discarded"
-      ],
-      "properties": {
-        "flat_files_empty": { "const": true },
-        "soul_verified": { "const": true },
-        "registry_verified": { "const": true },
-        "memx_verified": { "const": true },
-        "receipts_verified": { "const": true },
-        "target_invariants_verified": { "const": true },
-        "no_unfinished_rows": { "const": true },
-        "unknown_content_discarded": { "const": true }
-      }
-    },
-    "partialChecks": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "flat_files_empty",
-        "soul_verified",
-        "registry_verified",
-        "memx_verified",
-        "receipts_verified",
-        "target_invariants_verified",
-        "no_unfinished_rows",
-        "unknown_content_discarded"
-      ],
-      "properties": {
-        "flat_files_empty": { "const": true },
-        "soul_verified": { "const": true },
-        "registry_verified": { "const": true },
-        "memx_verified": { "const": true },
-        "receipts_verified": { "const": true },
-        "target_invariants_verified": { "const": true },
-        "no_unfinished_rows": { "const": false },
-        "unknown_content_discarded": { "const": true }
-      }
-    },
-    "plan": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "schema_version",
         "phase",
-        "dry_run",
-        "migration_kind",
-        "source_contract_version",
-        "target_contract_version",
-        "status",
-        "rows",
-        "exit_code"
+        "component",
+        "source",
+        "destination",
+        "actor",
+        "candidate_actor",
+        "disposition",
+        "reason"
       ],
       "properties": {
-        "schema_version": { "const": "2.0.0" },
-        "phase": { "const": "plan" },
-        "dry_run": { "const": true },
-        "migration_kind": { "enum": ["legacy_upgrade", "current_verify"] },
-        "source_contract_version": {
-          "enum": ["legacy-unversioned", "1.0.0", "2.0.0"]
+        "phase": {
+          "const": "files"
         },
-        "target_contract_version": { "const": "2.0.0" },
-        "status": { "enum": ["planned", "blocked_needs_review"] },
-        "rows": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/planRow" }
+        "component": {
+          "enum": [
+            "user_profile",
+            "memory"
+          ]
         },
-        "exit_code": { "const": 2 }
+        "source": {
+          "enum": [
+            "USER.md",
+            "MEMORY.md",
+            "memory/MEMORY.md"
+          ]
+        },
+        "destination": {
+          "type": "null"
+        },
+        "actor": {
+          "type": "null"
+        },
+        "candidate_actor": {
+          "type": "null"
+        },
+        "disposition": {
+          "const": "erase_without_read"
+        },
+        "reason": {
+          "const": "flat_memory_retired"
+        }
       },
       "allOf": [
         {
           "oneOf": [
             {
               "properties": {
-                "migration_kind": { "const": "legacy_upgrade" },
-                "source_contract_version": {
-                  "enum": ["legacy-unversioned", "1.0.0"]
+                "source": {
+                  "const": "USER.md"
+                },
+                "component": {
+                  "const": "user_profile"
                 }
               }
             },
             {
               "properties": {
-                "migration_kind": { "const": "current_verify" },
-                "source_contract_version": { "const": "2.0.0" }
-              }
-            }
-          ]
-        },
-        {
-          "oneOf": [
-            {
-              "properties": {
-                "status": { "const": "planned" },
-                "rows": {
-                  "type": "array",
-                  "items": { "$ref": "#/$defs/plannedRow" }
+                "source": {
+                  "const": "MEMORY.md"
+                },
+                "component": {
+                  "const": "memory"
                 }
               }
             },
             {
               "properties": {
-                "status": { "const": "blocked_needs_review" },
-                "rows": {
-                  "type": "array",
-                  "contains": {
-                    "type": "object",
-                    "required": ["outcome"],
-                    "properties": {
-                      "outcome": { "const": "blocked_needs_review" }
-                    }
-                  },
-                  "minContains": 1
+                "source": {
+                  "const": "memory/MEMORY.md"
+                },
+                "component": {
+                  "const": "memory"
                 }
               }
             }
@@ -223,161 +102,400 @@
         }
       ]
     },
-    "apply": {
+    "llmHistoryAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "component",
+        "source",
+        "source_sha256",
+        "actor",
+        "fact_id",
+        "source_actors",
+        "cursors",
+        "record_count",
+        "destination",
+        "disposition",
+        "reason"
+      ],
+      "properties": {
+        "phase": {
+          "const": "history"
+        },
+        "component": {
+          "const": "history"
+        },
+        "source": {
+          "const": "memory/history.jsonl"
+        },
+        "source_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "actor": {
+          "$ref": "#/$defs/principalId"
+        },
+        "fact_id": {
+          "const": "legacy-history"
+        },
+        "source_actors": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/principalId"
+          }
+        },
+        "cursors": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "integer"
+          }
+        },
+        "record_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "destination": {
+          "type": "string",
+          "pattern": "^private:[A-Za-z0-9][A-Za-z0-9._-]{0,127}:memory:legacy-history$"
+        },
+        "disposition": {
+          "const": "llm_required"
+        },
+        "reason": {
+          "const": "history_requires_consolidation"
+        }
+      }
+    },
+    "discardedHistoryAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "component",
+        "source",
+        "source_sha256",
+        "source_line",
+        "actor",
+        "source_actor",
+        "cursor",
+        "destination",
+        "disposition",
+        "reason"
+      ],
+      "properties": {
+        "phase": {
+          "const": "history"
+        },
+        "component": {
+          "const": "history"
+        },
+        "source": {
+          "const": "memory/history.jsonl"
+        },
+        "source_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "actor": {
+          "type": "null"
+        },
+        "source_actor": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/principalId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cursor": {
+          "oneOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "destination": {
+          "type": "null"
+        },
+        "disposition": {
+          "const": "discarded_unknown"
+        },
+        "reason": {
+          "enum": [
+            "history_malformed_or_unknown_schema",
+            "history_actorless",
+            "history_actor_unknown"
+          ]
+        }
+      }
+    },
+    "action": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/flatAction"
+        },
+        {
+          "$ref": "#/$defs/llmHistoryAction"
+        },
+        {
+          "$ref": "#/$defs/discardedHistoryAction"
+        }
+      ]
+    },
+    "plan": {
       "type": "object",
       "additionalProperties": false,
       "required": [
         "schema_version",
-        "phase",
-        "dry_run",
         "migration_kind",
         "source_contract_version",
         "target_contract_version",
+        "workspace",
+        "known_actors",
+        "dry_run",
         "status",
-        "rows",
-        "checks",
-        "exit_code"
+        "actions",
+        "summary"
       ],
       "properties": {
-        "schema_version": { "const": "2.0.0" },
-        "phase": { "const": "apply" },
-        "dry_run": { "const": false },
-        "migration_kind": { "enum": ["legacy_upgrade", "current_verify"] },
+        "schema_version": {
+          "const": "2.0.0"
+        },
+        "migration_kind": {
+          "const": "legacy_upgrade"
+        },
         "source_contract_version": {
-          "enum": ["legacy-unversioned", "1.0.0", "2.0.0"]
+          "const": "1.0.0"
         },
-        "target_contract_version": { "const": "2.0.0" },
-        "status": { "enum": ["complete", "partial", "failed"] },
-        "rows": {
+        "target_contract_version": {
+          "const": "2.0.0"
+        },
+        "workspace": {
+          "type": "string",
+          "minLength": 1
+        },
+        "known_actors": {
           "type": "array",
-          "items": { "$ref": "#/$defs/applyRow" }
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/principalId"
+          }
         },
-        "checks": { "$ref": "#/$defs/checks" },
-        "exit_code": { "enum": [0, 1, 2] }
+        "dry_run": {
+          "const": true
+        },
+        "status": {
+          "const": "ready"
+        },
+        "actions": {
+          "type": "array",
+          "minItems": 3,
+          "items": {
+            "$ref": "#/$defs/action"
+          },
+          "allOf": [
+            {
+              "contains": {
+                "type": "object",
+                "required": [
+                  "source"
+                ],
+                "properties": {
+                  "source": {
+                    "const": "USER.md"
+                  }
+                }
+              },
+              "minContains": 1,
+              "maxContains": 1
+            },
+            {
+              "contains": {
+                "type": "object",
+                "required": [
+                  "source"
+                ],
+                "properties": {
+                  "source": {
+                    "const": "MEMORY.md"
+                  }
+                }
+              },
+              "minContains": 1,
+              "maxContains": 1
+            },
+            {
+              "contains": {
+                "type": "object",
+                "required": [
+                  "source"
+                ],
+                "properties": {
+                  "source": {
+                    "const": "memory/MEMORY.md"
+                  }
+                }
+              },
+              "minContains": 1,
+              "maxContains": 1
+            }
+          ]
+        },
+        "summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "erase_without_read"
+          ],
+          "properties": {
+            "erase_without_read": {
+              "const": 3
+            },
+            "llm_required": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "discarded_unknown": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      }
+    },
+    "apply": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "applied_actions",
+        "written_keys",
+        "failed_actors",
+        "failed_actions",
+        "fatal_failure",
+        "dream_cursor_updated"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "complete",
+            "partial",
+            "failed"
+          ]
+        },
+        "applied_actions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "written_keys": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^private:[A-Za-z0-9][A-Za-z0-9._-]{0,127}:memory:legacy-history$"
+          }
+        },
+        "failed_actors": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/principalId"
+          }
+        },
+        "failed_actions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "fatal_failure": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dream_cursor_updated": {
+          "type": "boolean"
+        }
       },
       "allOf": [
         {
           "oneOf": [
             {
               "properties": {
-                "migration_kind": { "const": "legacy_upgrade" },
-                "source_contract_version": {
-                  "enum": ["legacy-unversioned", "1.0.0"]
+                "status": {
+                  "const": "complete"
+                },
+                "failed_actors": {
+                  "maxItems": 0
+                },
+                "failed_actions": {
+                  "maxItems": 0
+                },
+                "fatal_failure": {
+                  "type": "null"
                 }
               }
             },
             {
               "properties": {
-                "migration_kind": { "const": "current_verify" },
-                "source_contract_version": { "const": "2.0.0" },
-                "rows": { "maxItems": 0 }
-              }
-            }
-          ]
-        },
-        {
-          "oneOf": [
-            {
-              "properties": {
-                "rows": {
-                  "type": "array",
-                  "items": { "$ref": "#/$defs/terminalApplyRow" }
+                "status": {
+                  "const": "partial"
                 },
-                "checks": {
-                  "type": "object",
-                  "required": ["no_unfinished_rows"],
-                  "properties": {
-                    "no_unfinished_rows": { "const": true }
-                  }
+                "applied_actions": {
+                  "minimum": 1
+                },
+                "failed_actions": {
+                  "minItems": 1
+                },
+                "fatal_failure": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "dream_cursor_updated": {
+                  "const": false
                 }
               }
             },
             {
               "properties": {
-                "rows": {
-                  "type": "array",
-                  "contains": { "$ref": "#/$defs/retryableApplyRow" },
-                  "minContains": 1
+                "status": {
+                  "const": "failed"
                 },
-                "checks": {
-                  "type": "object",
-                  "required": ["no_unfinished_rows"],
-                  "properties": {
-                    "no_unfinished_rows": { "const": false }
-                  }
+                "applied_actions": {
+                  "const": 0
+                },
+                "written_keys": {
+                  "maxItems": 0
+                },
+                "failed_actions": {
+                  "minItems": 1
+                },
+                "fatal_failure": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "dream_cursor_updated": {
+                  "const": false
                 }
-              }
-            }
-          ]
-        },
-        {
-          "oneOf": [
-            {
-              "properties": {
-                "status": { "const": "complete" },
-                "rows": {
-                  "type": "array",
-                  "items": { "$ref": "#/$defs/terminalApplyRow" }
-                },
-                "checks": { "$ref": "#/$defs/completeChecks" },
-                "exit_code": { "const": 0 }
-              }
-            },
-            {
-              "properties": {
-                "status": { "const": "partial" },
-                "rows": {
-                  "type": "array",
-                  "contains": { "$ref": "#/$defs/retryableApplyRow" },
-                  "minContains": 1
-                },
-                "checks": { "$ref": "#/$defs/partialChecks" },
-                "exit_code": { "const": 2 }
-              }
-            },
-            {
-              "properties": {
-                "status": { "const": "failed" },
-                "checks": {
-                  "anyOf": [
-                    {
-                      "properties": {
-                        "flat_files_empty": { "const": false }
-                      }
-                    },
-                    {
-                      "properties": {
-                        "soul_verified": { "const": false }
-                      }
-                    },
-                    {
-                      "properties": {
-                        "registry_verified": { "const": false }
-                      }
-                    },
-                    {
-                      "properties": {
-                        "memx_verified": { "const": false }
-                      }
-                    },
-                    {
-                      "properties": {
-                        "receipts_verified": { "const": false }
-                      }
-                    },
-                    {
-                      "properties": {
-                        "target_invariants_verified": { "const": false }
-                      }
-                    },
-                    {
-                      "properties": {
-                        "unknown_content_discarded": { "const": false }
-                      }
-                    }
-                  ]
-                },
-                "exit_code": { "const": 1 }
               }
             }
           ]

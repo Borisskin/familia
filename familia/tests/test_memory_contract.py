@@ -56,43 +56,101 @@ def _canonical_contract() -> dict[str, Any]:
 def _plan_report() -> dict[str, Any]:
     return {
         "schema_version": "2.0.0",
-        "phase": "plan",
-        "dry_run": True,
         "migration_kind": "legacy_upgrade",
         "source_contract_version": "1.0.0",
         "target_contract_version": "2.0.0",
-        "status": "planned",
-        "rows": [{"row_id": "1" * 64, "outcome": "planned"}],
-        "exit_code": 2,
-    }
-
-
-def _apply_report(*, migration_kind: str = "legacy_upgrade") -> dict[str, Any]:
-    source_version = "2.0.0" if migration_kind == "current_verify" else "1.0.0"
-    rows = [] if migration_kind == "current_verify" else [
-        {"row_id": "2" * 64, "outcome": "imported"}
-    ]
-    return {
-        "schema_version": "2.0.0",
-        "phase": "apply",
-        "dry_run": False,
-        "migration_kind": migration_kind,
-        "source_contract_version": source_version,
-        "target_contract_version": "2.0.0",
-        "status": "complete",
-        "rows": rows,
-        "checks": {
-            "flat_files_empty": True,
-            "soul_verified": True,
-            "registry_verified": True,
-            "memx_verified": True,
-            "receipts_verified": True,
-            "target_invariants_verified": True,
-            "no_unfinished_rows": True,
-            "unknown_content_discarded": True,
+        "workspace": "/srv/familia/workspace",
+        "known_actors": ["principal_alpha"],
+        "dry_run": True,
+        "status": "ready",
+        "actions": [
+            {
+                "phase": "files",
+                "component": "user_profile",
+                "source": "USER.md",
+                "destination": None,
+                "actor": None,
+                "candidate_actor": None,
+                "disposition": "erase_without_read",
+                "reason": "flat_memory_retired",
+            },
+            {
+                "phase": "files",
+                "component": "memory",
+                "source": "MEMORY.md",
+                "destination": None,
+                "actor": None,
+                "candidate_actor": None,
+                "disposition": "erase_without_read",
+                "reason": "flat_memory_retired",
+            },
+            {
+                "phase": "files",
+                "component": "memory",
+                "source": "memory/MEMORY.md",
+                "destination": None,
+                "actor": None,
+                "candidate_actor": None,
+                "disposition": "erase_without_read",
+                "reason": "flat_memory_retired",
+            },
+            {
+                "phase": "history",
+                "component": "history",
+                "source": "memory/history.jsonl",
+                "source_sha256": "1" * 64,
+                "actor": "principal_alpha",
+                "fact_id": "legacy-history",
+                "source_actors": ["principal_alpha"],
+                "cursors": [1],
+                "record_count": 1,
+                "destination": "private:principal_alpha:memory:legacy-history",
+                "disposition": "llm_required",
+                "reason": "history_requires_consolidation",
+            },
+        ],
+        "summary": {
+            "erase_without_read": 3,
+            "llm_required": 1,
         },
-        "exit_code": 0,
     }
+
+
+def _apply_report(*, status: str = "complete") -> dict[str, Any]:
+    reports = {
+        "complete": {
+            "status": "complete",
+            "applied_actions": 4,
+            "written_keys": [
+                "private:principal_alpha:memory:legacy-history"
+            ],
+            "failed_actors": [],
+            "failed_actions": [],
+            "fatal_failure": None,
+            "dream_cursor_updated": True,
+        },
+        "partial": {
+            "status": "partial",
+            "applied_actions": 1,
+            "written_keys": [
+                "private:principal_alpha:memory:legacy-history"
+            ],
+            "failed_actors": ["principal_beta"],
+            "failed_actions": ["history:principal_beta"],
+            "fatal_failure": "history:principal_beta",
+            "dream_cursor_updated": False,
+        },
+        "failed": {
+            "status": "failed",
+            "applied_actions": 0,
+            "written_keys": [],
+            "failed_actors": ["principal_alpha"],
+            "failed_actions": ["history:principal_alpha"],
+            "fatal_failure": "history:principal_alpha",
+            "dream_cursor_updated": False,
+        },
+    }
+    return deepcopy(reports[status])
 
 
 def test_contract_schema_declares_breaking_version_2() -> None:
@@ -171,7 +229,7 @@ def test_contract_records_simple_private_write_and_consolidation_rules() -> None
     assert "archive" not in contract
 
     assert contract["migration"]["exit_codes"] == {
-        "plan": {"planned": 2, "blocked_needs_review": 2},
+        "plan": {"ready": 0},
         "apply": {"complete": 0, "partial": 2, "failed": 1},
     }
 
@@ -245,8 +303,8 @@ def test_contract_keeps_only_migration_outcomes() -> None:
     }
     assert outcomes["migration_command"] == {
         "plan": {
-            "values": ["planned", "blocked_needs_review"],
-            "terminal": ["planned", "blocked_needs_review"],
+            "values": ["ready"],
+            "terminal": ["ready"],
         },
         "apply": {
             "values": ["complete", "partial", "failed"],
@@ -374,19 +432,44 @@ def test_old_contract_rules_are_rejected_by_schema() -> None:
     _assert_invalid(validator, old_private_rule)
 
 
-def test_migration_schema_accepts_plan_legacy_upgrade_and_current_verify_apply() -> None:
+def test_migration_schema_accepts_current_plan_and_all_apply_results() -> None:
     validator = _validator(MIGRATION_SCHEMA_PATH)
-    _assert_valid(validator, _plan_report())
-    _assert_valid(validator, _apply_report())
-    _assert_valid(validator, _apply_report(migration_kind="current_verify"))
+    plan = _plan_report()
+    assert plan["status"] == "ready"
+    assert plan["summary"] == {
+        disposition: sum(
+            action["disposition"] == disposition
+            for action in plan["actions"]
+        )
+        for disposition in {
+            action["disposition"] for action in plan["actions"]
+        }
+    }
+    assert {
+        "warnings",
+        "needs_review",
+        "blocked",
+        "blocked_needs_review",
+    }.isdisjoint(plan)
+    _assert_valid(validator, plan)
 
-    legacy_unversioned = _plan_report()
-    legacy_unversioned["source_contract_version"] = "legacy-unversioned"
-    _assert_valid(validator, legacy_unversioned)
+    expected_apply_fields = {
+        "status",
+        "applied_actions",
+        "written_keys",
+        "failed_actors",
+        "failed_actions",
+        "fatal_failure",
+        "dream_cursor_updated",
+    }
+    for status in ("complete", "partial", "failed"):
+        report = _apply_report(status=status)
+        assert set(report) == expected_apply_fields
+        assert {"warnings", "needs_review", "blocked"}.isdisjoint(report)
+        _assert_valid(validator, report)
 
 
 def test_current_verify_requires_distinct_machine_checks() -> None:
-    validator = _validator(MIGRATION_SCHEMA_PATH)
     required_checks = {
         "flat_files_empty",
         "soul_verified",
@@ -401,156 +484,98 @@ def test_current_verify_requires_distinct_machine_checks() -> None:
         _canonical_contract()["migration"]["current_verify"]["required_checks"]
     ) == required_checks
 
-    report = _apply_report(migration_kind="current_verify")
-    report["checks"] = {name: True for name in required_checks}
-    valid_errors = list(validator.iter_errors(report))
 
-    generic_report = _apply_report(migration_kind="current_verify")
-    generic_report["checks"] = {
-        "flat_files_empty": True,
-        "soul_verified": True,
-        "target_state_verified": True,
-        "no_unfinished_rows": True,
-        "unknown_content_discarded": True,
-    }
-    generic_report_accepted = not list(validator.iter_errors(generic_report))
-
-    missing_checks_accepted = []
-    for missing in sorted(required_checks):
-        incomplete = deepcopy(report)
-        del incomplete["checks"][missing]
-        if not list(validator.iter_errors(incomplete)):
-            missing_checks_accepted.append(missing)
-
-    assert not valid_errors, "\n".join(error.message for error in valid_errors)
-    assert generic_report_accepted is False
-    assert missing_checks_accepted == []
-
-
-def test_migration_schema_rejects_false_success_versions_and_inconsistent_outcomes() -> None:
+def test_migration_schema_rejects_obsolete_plan_states_fields_and_counts() -> None:
     validator = _validator(MIGRATION_SCHEMA_PATH)
 
-    dry_run_success = _plan_report()
-    dry_run_success["exit_code"] = 0
-    _assert_invalid(validator, dry_run_success)
+    for status in (
+        "planned",
+        "blocked_needs_review",
+        "ready_with_warnings",
+        "needs_review",
+    ):
+        obsolete_status = _plan_report()
+        obsolete_status["status"] = status
+        _assert_invalid(validator, obsolete_status)
 
-    dry_run_failure = _plan_report()
-    dry_run_failure["exit_code"] = 1
-    assert list(validator.iter_errors(dry_run_failure)), (
-        "plan + planned + exit_code=1 was accepted"
-    )
+    for field, value in (
+        ("warnings", 0),
+        ("needs_review", 0),
+        ("blocked", False),
+        ("exit_code", 0),
+        ("phase", "plan"),
+        ("rows", []),
+    ):
+        obsolete_field = _plan_report()
+        obsolete_field[field] = value
+        _assert_invalid(validator, obsolete_field)
 
-    missing_source = _apply_report()
+    for disposition in (
+        "conflict",
+        "quarantine_needs_review",
+        "skip_warning",
+        "dirty_legacy",
+    ):
+        obsolete_summary = _plan_report()
+        obsolete_summary["summary"][disposition] = 0
+        _assert_invalid(validator, obsolete_summary)
+
+    missing_source = _plan_report()
     del missing_source["source_contract_version"]
     _assert_invalid(validator, missing_source)
 
-    future_source = _apply_report()
+    future_source = _plan_report()
     future_source["source_contract_version"] = "3.0.0"
     _assert_invalid(validator, future_source)
 
-    wrong_target = _apply_report()
+    wrong_target = _plan_report()
     wrong_target["target_contract_version"] = "1.0.0"
     _assert_invalid(validator, wrong_target)
 
-    partial_zero = _apply_report()
-    partial_zero["status"] = "partial"
-    _assert_invalid(validator, partial_zero)
 
-    unchecked_complete = _apply_report()
-    unchecked_complete["checks"]["flat_files_empty"] = False
-    _assert_invalid(validator, unchecked_complete)
-
-    quarantine = _apply_report()
-    quarantine["rows"][0]["outcome"] = "quarantine_needs_review"
-    _assert_invalid(validator, quarantine)
-
-    current_verify_import = _apply_report(migration_kind="current_verify")
-    current_verify_import["rows"] = [{"row_id": "3" * 64, "outcome": "imported"}]
-    _assert_invalid(validator, current_verify_import)
-
-
-def test_migration_schema_rejects_inconsistent_non_complete_statuses() -> None:
+def test_migration_schema_rejects_obsolete_or_inconsistent_apply_results() -> None:
     validator = _validator(MIGRATION_SCHEMA_PATH)
 
-    partial_without_unfinished_row = _apply_report()
-    partial_without_unfinished_row.update(status="partial", exit_code=2)
+    for status in ("ready", "planned", "needs_review", "blocked_needs_review"):
+        obsolete_status = _apply_report()
+        obsolete_status["status"] = status
+        _assert_invalid(validator, obsolete_status)
 
-    partial_claims_no_unfinished_rows = _apply_report()
-    partial_claims_no_unfinished_rows.update(status="partial", exit_code=2)
-    partial_claims_no_unfinished_rows["rows"] = [
-        {"row_id": "4" * 64, "outcome": "retryable_failure"}
-    ]
-
-    failed_without_failure = _apply_report()
-    failed_without_failure.update(status="failed", exit_code=1)
-
-    accepted = [
-        name
-        for name, report in (
-            ("partial_without_unfinished_row", partial_without_unfinished_row),
-            ("partial_claims_no_unfinished_rows", partial_claims_no_unfinished_rows),
-            ("failed_without_failure", failed_without_failure),
-        )
-        if not list(validator.iter_errors(report))
-    ]
-    assert accepted == [], f"schema accepted inconsistent reports: {accepted}"
-
-
-def test_migration_schema_separates_plan_and_apply_status_precedence() -> None:
-    validator = _validator(MIGRATION_SCHEMA_PATH)
-
-    blocked_plan = _plan_report()
-    blocked_plan["status"] = "blocked_needs_review"
-    blocked_plan["rows"] = [
-        {"row_id": "5" * 64, "outcome": "blocked_needs_review"}
-    ]
-
-    partial_retryable = _apply_report()
-    partial_retryable.update(status="partial", exit_code=2)
-    partial_retryable["rows"] = [
-        {"row_id": "6" * 64, "outcome": "retryable_failure"}
-    ]
-    partial_retryable["checks"]["no_unfinished_rows"] = False
-
-    failed_substantive_check = _apply_report()
-    failed_substantive_check.update(status="failed", exit_code=1)
-    failed_substantive_check["checks"]["memx_verified"] = False
-
-    failed_retryable_substantive_check = deepcopy(partial_retryable)
-    failed_retryable_substantive_check.update(status="failed", exit_code=1)
-    failed_retryable_substantive_check["checks"]["memx_verified"] = False
-
-    for report in (
-        blocked_plan,
-        partial_retryable,
-        failed_substantive_check,
-        failed_retryable_substantive_check,
+    for field, value in (
+        ("warnings", 0),
+        ("needs_review", 0),
+        ("blocked", False),
+        ("exit_code", 0),
+        ("phase", "apply"),
+        ("rows", []),
+        ("checks", {}),
     ):
-        _assert_valid(validator, report)
+        obsolete_field = _apply_report()
+        obsolete_field[field] = value
+        _assert_invalid(validator, obsolete_field)
 
-    needs_review_complete = _apply_report()
-    needs_review_complete.update(status="needs_review", exit_code=2)
+    complete_with_failure = _apply_report()
+    complete_with_failure["fatal_failure"] = "history:principal_alpha"
+    complete_with_failure["failed_actions"] = ["history:principal_alpha"]
+    _assert_invalid(validator, complete_with_failure)
 
-    needs_review_retryable = deepcopy(partial_retryable)
-    needs_review_retryable["status"] = "needs_review"
+    for status in ("partial", "failed"):
+        missing_failure = _apply_report(status=status)
+        missing_failure["fatal_failure"] = None
+        missing_failure["failed_actions"] = []
+        _assert_invalid(validator, missing_failure)
 
-    failed_retryable_only = deepcopy(partial_retryable)
-    failed_retryable_only.update(status="failed", exit_code=1)
 
-    partial_with_substantive_failure = deepcopy(partial_retryable)
-    partial_with_substantive_failure["checks"]["memx_verified"] = False
+def test_migration_schema_keeps_plan_and_apply_shapes_distinct() -> None:
+    validator = _validator(MIGRATION_SCHEMA_PATH)
 
-    accepted = [
-        name
-        for name, report in (
-            ("needs_review_complete", needs_review_complete),
-            ("needs_review_retryable", needs_review_retryable),
-            ("failed_retryable_only", failed_retryable_only),
-            ("partial_with_substantive_failure", partial_with_substantive_failure),
-        )
-        if not list(validator.iter_errors(report))
-    ]
-    assert accepted == [], f"schema accepted forbidden apply reports: {accepted}"
+    plan_with_apply_field = _plan_report()
+    plan_with_apply_field["applied_actions"] = 0
+    _assert_invalid(validator, plan_with_apply_field)
+
+    apply_with_plan_field = _apply_report()
+    apply_with_plan_field["summary"] = {"erase_without_read": 3}
+    _assert_invalid(validator, apply_with_plan_field)
 
 
 def test_release_identity_and_runtime_bridge_select_contract_2() -> None:

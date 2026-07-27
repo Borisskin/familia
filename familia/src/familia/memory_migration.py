@@ -1,18 +1,8 @@
-"""Conflict-aware Familia memory migration.
-
-The original RP-090 API below plans and rehearses repair against an isolated
-snapshot.  The legacy-transition API additionally powers
-``familia migrate hybrid-storage``: it classifies flat workspace files, groups
-all actor-tagged history, and writes only explicit ``private:<actor>:...``
-destinations through injected memX callbacks.  Ambiguous ownership never fans
-out to every principal and never falls back to shared memory.
-"""
+"""Legacy history transition to private memory with unread flat-file cleanup."""
 
 from __future__ import annotations
 
 import argparse
-import base64
-import datetime as dt
 import hashlib
 import json
 import os
@@ -20,10 +10,9 @@ import re
 import stat
 import sys
 from pathlib import Path, PurePosixPath
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable
 
 
-MIGRATION_SCHEMA_VERSION = "1.0.0"
 SNAPSHOT_SCHEMA_VERSION = "1.0.0"
 SNAPSHOT_FORMAT_VERSION = "1.0.0"
 MEMORY_CONTRACT_VERSION = "2.0.0"
@@ -32,50 +21,9 @@ MEMORY_CONTRACT_MIGRATION_KINDS = {
     "1.0.0": "legacy_upgrade",
     "2.0.0": "current_verify",
 }
-DISPOSITIONS = (
-    "write",
-    "skip",
-    "conflict",
-    "dirty_legacy",
-    "llm_required",
-    "quarantine_needs_review",
-)
-UNRESOLVED_DISPOSITIONS = {
-    "conflict",
-    "dirty_legacy",
-    "llm_required",
-    "quarantine_needs_review",
-}
 
-LEGACY_TRANSITION_SCHEMA_VERSION = "1.0.0"
-_SIGNIFICANT_TOKEN = re.compile(r"[^\W\d_]{4,}", re.UNICODE)
-_SIGNIFICANT_STOP_WORDS = {
-    "будет",
-    "были",
-    "было",
-    "быть",
-    "всего",
-    "когда",
-    "который",
-    "может",
-    "нужно",
-    "после",
-    "потом",
-    "потому",
-    "просто",
-    "своей",
-    "свой",
-    "также",
-    "только",
-    "чтобы",
-    "этого",
-    "этот",
-    "from",
-    "have",
-    "that",
-    "this",
-    "with",
-}
+LEGACY_TRANSITION_SCHEMA_VERSION = "2.0.0"
+_PRINCIPAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 class MigrationError(RuntimeError):
@@ -87,7 +35,7 @@ class MigrationPreflightError(MigrationError):
 
 
 class MigrationBlockedError(MigrationError):
-    """Plan contains unresolved actions and therefore cannot be applied."""
+    """Plan fails the canonical transition contract and cannot be applied."""
 
 
 def memory_contract_migration_kind(source_contract_version: str) -> str:
@@ -101,20 +49,6 @@ def memory_contract_migration_kind(source_contract_version: str) -> str:
         ) from exc
 
 
-class MigrationTarget(Protocol):
-    def get_hash(self, destination: str) -> str | None: ...
-
-    def put_if_absent(
-        self, destination: str, value: bytes, expected_sha256: str
-    ) -> str: ...
-
-    def publish_cursor(self, actor: str, cursor: int) -> str: ...
-
-
-def _utc_now() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-
-
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
@@ -123,13 +57,6 @@ def _canonical_bytes(value: Any) -> bytes:
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
-
-
-def _safe_relative(value: str) -> str:
-    path = PurePosixPath(value)
-    if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
-        raise MigrationError("unsafe source identity")
-    return path.as_posix()
 
 
 def _write_private_atomic(path: Path, data: bytes) -> None:
@@ -147,19 +74,6 @@ def _write_private_atomic(path: Path, data: bytes) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
-
-
-def _append_journal(path: Path, event: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-    fd = os.open(path, flags, 0o600)
-    try:
-        payload = _canonical_bytes(event) + b"\n"
-        os.write(fd, payload)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def _snapshot_versions(snapshot_manifest: dict[str, Any]) -> None:
@@ -223,583 +137,6 @@ def validate_migration_preflight(
         raise MigrationPreflightError("target id invalid")
 
 
-def _action(
-    *,
-    phase: str,
-    component: str,
-    source_identity: str,
-    raw: bytes,
-    disposition: str,
-    reason: str,
-    actor: str | None = None,
-    destination: str | None = None,
-    source_order: int | None = None,
-    actor_order: int | None = None,
-    cursor: int | None = None,
-) -> dict[str, Any]:
-    if disposition not in DISPOSITIONS:
-        raise MigrationError("unknown disposition")
-    core = {
-        "phase": phase,
-        "component": component,
-        "source_identity": source_identity,
-        "source_sha256": _sha256(raw),
-        "source_bytes": len(raw),
-        "source_order": source_order,
-        "actor": actor,
-        "actor_order": actor_order,
-        "cursor": cursor,
-        "destination": destination,
-        "disposition": disposition,
-        "reason": reason,
-        "writes": 1 if disposition == "write" else 0,
-    }
-    return {"action_id": _sha256(_canonical_bytes(core)), **core}
-
-
-def _target_disposition(
-    destination: str,
-    source_sha256: str,
-    target_probe: Callable[[str], str | None],
-) -> tuple[str, str]:
-    try:
-        existing = target_probe(destination)
-    except Exception:  # noqa: BLE001 - an unavailable target is a conflict, never absence
-        return "conflict", "target_probe_failed"
-    if existing is None:
-        return "write", "target_absent"
-    if existing == source_sha256:
-        return "skip", "target_equal"
-    return "conflict", "target_diverged"
-
-
-def _heartbeat_template(raw: bytes) -> bool:
-    try:
-        text = raw.decode("utf-8").strip()
-    except UnicodeDecodeError:
-        return False
-    normalized = " ".join(text.lower().split())
-    return normalized in {"", "# heartbeat", "# heartbeat.md"} or (
-        "heartbeat" in normalized and "add tasks" in normalized and len(normalized) < 240
-    )
-
-
-def build_migration_plan(
-    *,
-    source_root: Path,
-    snapshot_manifest: dict[str, Any],
-    known_actors: set[str],
-    target_id: str,
-    target_probe: Callable[[str], str | None],
-    classifications: dict[str, Any],
-) -> dict[str, Any]:
-    """Build a deterministic, value-free migration plan from an isolated copy."""
-
-    _snapshot_versions(snapshot_manifest)
-    source_root = source_root.resolve(strict=True)
-    actors = {actor for actor in known_actors if isinstance(actor, str) and actor.strip()}
-    actions: list[dict[str, Any]] = []
-
-    flat = (
-        ("USER.md", "user_profile", "value:user_profile"),
-        ("memory/MEMORY.md", "memory", "value:memory"),
-        ("HEARTBEAT.md", "heartbeat", "value:heartbeat"),
-    )
-    for relative, component, suffix in flat:
-        path = source_root.joinpath(*PurePosixPath(relative).parts)
-        if not path.exists():
-            actions.append(
-                _action(
-                    phase="phase_a",
-                    component=component,
-                    source_identity=relative,
-                    raw=b"",
-                    disposition="skip",
-                    reason="source_missing",
-                )
-            )
-            continue
-        try:
-            raw = path.read_bytes()
-        except OSError:
-            actions.append(
-                _action(
-                    phase="phase_a",
-                    component=component,
-                    source_identity=relative,
-                    raw=b"",
-                    disposition="quarantine_needs_review",
-                    reason="source_unreadable",
-                )
-            )
-            continue
-        if not raw.strip() or (component == "heartbeat" and _heartbeat_template(raw)):
-            actions.append(
-                _action(
-                    phase="phase_a",
-                    component=component,
-                    source_identity=relative,
-                    raw=raw,
-                    disposition="skip",
-                    reason="empty_or_template",
-                )
-            )
-            continue
-        decision = classifications.get(relative)
-        if isinstance(decision, dict) and decision.get("disposition") == "write":
-            actor = decision.get("actor")
-            if actor not in actors:
-                actions.append(
-                    _action(
-                        phase="phase_a",
-                        component=component,
-                        source_identity=relative,
-                        raw=raw,
-                        actor=actor if isinstance(actor, str) else None,
-                        disposition="quarantine_needs_review",
-                        reason="classification_actor_unknown",
-                    )
-                )
-                continue
-            destination = f"private:{actor}:{suffix}"
-            disposition, reason = _target_disposition(destination, _sha256(raw), target_probe)
-            actions.append(
-                _action(
-                    phase="phase_a",
-                    component=component,
-                    source_identity=relative,
-                    raw=raw,
-                    actor=actor,
-                    destination=destination,
-                    disposition=disposition,
-                    reason=reason,
-                )
-            )
-            continue
-        default_disposition = {
-            "user_profile": "dirty_legacy",
-            "memory": "llm_required",
-            "heartbeat": "quarantine_needs_review",
-        }[component]
-        actions.append(
-            _action(
-                phase="phase_a",
-                component=component,
-                source_identity=relative,
-                raw=raw,
-                disposition=default_disposition,
-                reason="global_owner_ambiguous",
-            )
-        )
-
-    history_path = source_root / "memory" / "history.jsonl"
-    actor_orders: dict[str, int] = {}
-    seen_history: set[tuple[str, str]] = set()
-    history_lines = history_path.read_bytes().splitlines(keepends=True) if history_path.exists() else []
-    for line_number, raw in enumerate(history_lines, start=1):
-        source_identity = "memory/history.jsonl"
-        parsed: dict[str, Any] | None = None
-        try:
-            candidate = json.loads(raw.decode("utf-8"))
-            parsed = candidate if isinstance(candidate, dict) else None
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            parsed = None
-        valid_cursor = bool(
-            parsed is not None
-            and isinstance(parsed.get("cursor"), int)
-            and not isinstance(parsed.get("cursor"), bool)
-        )
-        valid_shape = bool(
-            parsed is not None
-            and parsed.get("schema_version") == 1
-            and valid_cursor
-            and isinstance(parsed.get("content"), str)
-            and isinstance(parsed.get("provenance"), dict)
-        )
-        if not valid_shape:
-            actions.append(
-                _action(
-                    phase="phase_b",
-                    component="history",
-                    source_identity=source_identity,
-                    raw=raw,
-                    source_order=line_number,
-                    disposition="quarantine_needs_review",
-                    reason="history_malformed_or_unknown_schema",
-                )
-            )
-            continue
-        actor = parsed.get("actor")
-        cursor = parsed["cursor"]
-        if not isinstance(actor, str) or not actor.strip():
-            actions.append(
-                _action(
-                    phase="phase_b",
-                    component="history",
-                    source_identity=source_identity,
-                    raw=raw,
-                    source_order=line_number,
-                    cursor=cursor,
-                    disposition="quarantine_needs_review",
-                    reason="history_actorless",
-                )
-            )
-            continue
-        if actor not in actors:
-            actions.append(
-                _action(
-                    phase="phase_b",
-                    component="history",
-                    source_identity=source_identity,
-                    raw=raw,
-                    source_order=line_number,
-                    actor=actor,
-                    cursor=cursor,
-                    disposition="quarantine_needs_review",
-                    reason="history_actor_unknown",
-                )
-            )
-            continue
-        raw_hash = _sha256(raw)
-        destination = f"private:{actor}:history:{raw_hash}"
-        identity = (actor, raw_hash)
-        if identity in seen_history:
-            actions.append(
-                _action(
-                    phase="phase_b",
-                    component="history",
-                    source_identity=source_identity,
-                    raw=raw,
-                    source_order=line_number,
-                    actor=actor,
-                    cursor=cursor,
-                    destination=destination,
-                    disposition="skip",
-                    reason="duplicate_source_record",
-                )
-            )
-            continue
-        seen_history.add(identity)
-        actor_orders[actor] = actor_orders.get(actor, 0) + 1
-        disposition, reason = _target_disposition(destination, raw_hash, target_probe)
-        actions.append(
-            _action(
-                phase="phase_b",
-                component="history",
-                source_identity=source_identity,
-                raw=raw,
-                source_order=line_number,
-                actor=actor,
-                actor_order=actor_orders[actor],
-                cursor=cursor,
-                destination=destination,
-                disposition=disposition,
-                reason=reason,
-            )
-        )
-
-    pair_path = source_root / "memory" / "legacy_pair_keys.json"
-    if pair_path.exists():
-        try:
-            pair_values = json.loads(pair_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            pair_values = ["<unreadable>"]
-        if not isinstance(pair_values, list):
-            pair_values = ["<invalid-shape>"]
-        for index, pair_value in enumerate(pair_values, start=1):
-            raw = _canonical_bytes(pair_value)
-            actions.append(
-                _action(
-                    phase="phase_b",
-                    component="legacy_pair_key",
-                    source_identity=f"memory/legacy_pair_keys.json#{index}",
-                    raw=raw,
-                    source_order=index,
-                    disposition="quarantine_needs_review",
-                    reason="legacy_pair_identity_ambiguous",
-                )
-            )
-
-    scheduler_path = source_root / "cron" / "jobs.json"
-    if scheduler_path.exists():
-        try:
-            scheduler = json.loads(scheduler_path.read_text(encoding="utf-8"))
-            jobs = scheduler.get("jobs", []) if isinstance(scheduler, dict) else []
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            jobs = [{"id": "unreadable", "payload": {}}]
-        for index, job in enumerate(jobs, start=1):
-            if not isinstance(job, dict):
-                job = {"id": f"invalid-{index}", "payload": {}}
-            payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-            target_actor = payload.get("targetActor", payload.get("target_actor"))
-            known_target = isinstance(target_actor, str) and target_actor in actors
-            actions.append(
-                _action(
-                    phase="phase_b",
-                    component="scheduler",
-                    source_identity=f"cron/jobs.json#{job.get('id', index)}",
-                    raw=_canonical_bytes(job),
-                    source_order=index,
-                    actor=target_actor if isinstance(target_actor, str) else None,
-                    disposition="skip" if known_target else "quarantine_needs_review",
-                    reason="scheduler_target_explicit" if known_target else "scheduler_target_ambiguous",
-                )
-            )
-
-    dream_cursor_path = source_root / "memory" / ".dream_cursor"
-    if dream_cursor_path.exists():
-        dream_cursor_raw = dream_cursor_path.read_bytes()
-        try:
-            dream_cursor_observed = dream_cursor_raw.decode("utf-8").strip()
-        except UnicodeDecodeError:
-            dream_cursor_observed = "<non-utf8>"
-    else:
-        dream_cursor_raw = b""
-        dream_cursor_observed = None
-
-    counts = {name: 0 for name in DISPOSITIONS}
-    for action in actions:
-        counts[action["disposition"]] += 1
-    migration_core = {
-        "schema_version": MIGRATION_SCHEMA_VERSION,
-        "snapshot_id": snapshot_manifest["snapshot_id"],
-        "target_id": target_id,
-        "actions": actions,
-    }
-    migration_id = _sha256(_canonical_bytes(migration_core))
-    return {
-        "schema_version": MIGRATION_SCHEMA_VERSION,
-        "migration_id": migration_id,
-        "created_at": _utc_now(),
-        "status": (
-            "blocked_needs_review"
-            if any(action["disposition"] in UNRESOLVED_DISPOSITIONS for action in actions)
-            else "planned"
-        ),
-        "dry_run": True,
-        "source": {
-            "snapshot_id": snapshot_manifest["snapshot_id"],
-            "snapshot_schema_version": snapshot_manifest["schema_version"],
-            "snapshot_format_version": snapshot_manifest["snapshot_format_version"],
-            "contract_version": MEMORY_CONTRACT_VERSION,
-            "dream_cursor": {
-                "observed": dream_cursor_observed,
-                "sha256": _sha256(dream_cursor_raw),
-                "used_for_selection": False,
-            },
-        },
-        "target": {"target_id": target_id, "isolated": True},
-        "actions": actions,
-        "summary": counts,
-    }
-
-
-def load_action_value(source_root: Path, action: dict[str, Any]) -> bytes:
-    """Reload an action value from the isolated source and verify its hash."""
-
-    if action.get("disposition") != "write":
-        raise MigrationError("only write actions have loadable values")
-    identity = _safe_relative(str(action["source_identity"]).split("#", 1)[0])
-    path = source_root.resolve(strict=True).joinpath(*PurePosixPath(identity).parts)
-    if action["component"] == "history":
-        order = action.get("source_order")
-        if not isinstance(order, int) or order < 1:
-            raise MigrationError("history source order invalid")
-        lines = path.read_bytes().splitlines(keepends=True)
-        if order > len(lines):
-            raise MigrationError("history source order missing")
-        value = lines[order - 1]
-    else:
-        value = path.read_bytes()
-    if _sha256(value) != action["source_sha256"] or len(value) != action["source_bytes"]:
-        raise MigrationError("source changed after planning")
-    return value
-
-
-def _journal_state(path: Path, plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    state: dict[str, dict[str, Any]] = {}
-    if not path.exists():
-        return state
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        event = json.loads(line)
-        if event.get("migration_id") != plan["migration_id"] or event.get("snapshot_id") != plan["source"]["snapshot_id"]:
-            raise MigrationError("journal identity mismatch")
-        action_id = event.get("action_id")
-        if isinstance(action_id, str):
-            state[action_id] = event
-    return state
-
-
-def _event(plan: dict[str, Any], **fields: Any) -> dict[str, Any]:
-    return {
-        "schema_version": MIGRATION_SCHEMA_VERSION,
-        "migration_id": plan["migration_id"],
-        "snapshot_id": plan["source"]["snapshot_id"],
-        "recorded_at": _utc_now(),
-        **fields,
-    }
-
-
-def apply_migration_plan(
-    plan: dict[str, Any],
-    target: MigrationTarget,
-    journal_path: Path,
-    value_loader: Callable[[dict[str, Any]], bytes],
-) -> dict[str, Any]:
-    """Apply a fully resolved plan with append-only per-action journal events."""
-
-    unresolved = [
-        action for action in plan.get("actions", [])
-        if action.get("disposition") in UNRESOLVED_DISPOSITIONS
-    ]
-    if unresolved:
-        raise MigrationBlockedError(f"unresolved migration actions: {len(unresolved)}")
-    state = _journal_state(journal_path, plan)
-    failed_actors: set[str] = set()
-    failed_actions: set[str] = set()
-
-    for action in plan["actions"]:
-        action_id = action["action_id"]
-        actor = action.get("actor")
-        if actor in failed_actors:
-            continue
-        if action["disposition"] != "write":
-            if action_id not in state:
-                event = _event(
-                    plan,
-                    action_id=action_id,
-                    actor=actor,
-                    component=action["component"],
-                    status="not_applied",
-                    disposition=action["disposition"],
-                )
-                _append_journal(journal_path, event)
-                state[action_id] = event
-            continue
-        destination = action["destination"]
-        prior = state.get(action_id)
-        if prior and prior.get("status") == "committed":
-            if target.get_hash(destination) == action["source_sha256"]:
-                continue
-            event = _event(
-                plan,
-                action_id=action_id,
-                actor=actor,
-                component=action["component"],
-                status="failed",
-                reason="committed_target_diverged",
-            )
-            _append_journal(journal_path, event)
-            state[action_id] = event
-            failed_actions.add(action_id)
-            if actor:
-                failed_actors.add(actor)
-            continue
-        try:
-            value = value_loader(action)
-            result = target.put_if_absent(destination, value, action["source_sha256"])
-            if result not in {"written", "equal"}:
-                raise MigrationError("target conflict")
-        except Exception as exc:  # noqa: BLE001 - failure is journaled and retryable
-            event = _event(
-                plan,
-                action_id=action_id,
-                actor=actor,
-                component=action["component"],
-                status="failed",
-                reason=type(exc).__name__,
-            )
-            _append_journal(journal_path, event)
-            state[action_id] = event
-            failed_actions.add(action_id)
-            if actor:
-                failed_actors.add(actor)
-            continue
-        event = _event(
-            plan,
-            action_id=action_id,
-            actor=actor,
-            component=action["component"],
-            status="committed",
-            result=result,
-            destination_sha256=action["source_sha256"],
-        )
-        _append_journal(journal_path, event)
-        state[action_id] = event
-
-    history_by_actor: dict[str, list[dict[str, Any]]] = {}
-    for action in plan["actions"]:
-        if (
-            action["component"] == "history"
-            and isinstance(action.get("actor"), str)
-            and isinstance(action.get("actor_order"), int)
-        ):
-            history_by_actor.setdefault(action["actor"], []).append(action)
-    for actor, records in history_by_actor.items():
-        if actor in failed_actors:
-            continue
-        records.sort(key=lambda value: value["actor_order"])
-        if [record["actor_order"] for record in records] != list(range(1, len(records) + 1)):
-            continue
-        durable = True
-        for record in records:
-            if record["disposition"] == "write":
-                current = state.get(record["action_id"])
-                if not current or current.get("status") != "committed":
-                    durable = False
-                    break
-            if target.get_hash(record["destination"]) != record["source_sha256"]:
-                durable = False
-                break
-        if not durable:
-            continue
-        cursor = max(record["cursor"] for record in records)
-        cursor_action_id = _sha256(f"{plan['migration_id']}:{actor}:cursor:{cursor}".encode())
-        prior = state.get(cursor_action_id)
-        if prior and prior.get("status") == "cursor_published":
-            continue
-        result = target.publish_cursor(actor, cursor)
-        if result in {"written", "equal"}:
-            event = _event(
-                plan,
-                action_id=cursor_action_id,
-                actor=actor,
-                component="history_cursor",
-                status="cursor_published",
-                cursor=cursor,
-                result=result,
-            )
-            _append_journal(journal_path, event)
-            state[cursor_action_id] = event
-        else:
-            failed_actions.add(cursor_action_id)
-
-    all_writes_durable = all(
-        target.get_hash(action["destination"]) == action["source_sha256"]
-        for action in plan["actions"]
-        if action["disposition"] == "write"
-    )
-    status_value = "complete" if all_writes_durable and not failed_actions else "partial"
-    _append_journal(
-        journal_path,
-        _event(
-            plan,
-            action_id=None,
-            actor=None,
-            component="migration",
-            status="run_completed",
-            result=status_value,
-        ),
-    )
-    return {
-        "status": status_value,
-        "failed_actors": sorted(failed_actors),
-        "failed_actions": sorted(failed_actions),
-    }
-
-
 def _memory_text(value: Any) -> str:
     """Normalize a decoded memX value without silently discarding structure."""
 
@@ -812,12 +149,10 @@ def _memory_text(value: Any) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _significant_tokens(value: str) -> set[str]:
-    return {
-        token
-        for token in _SIGNIFICANT_TOKEN.findall(value.casefold())
-        if token not in _SIGNIFICANT_STOP_WORDS
-    }
+def _canonical_actor(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return value if _PRINCIPAL_ID.fullmatch(value) else None
 
 
 def _history_source_digest(records: list[dict[str, Any]]) -> str:
@@ -833,13 +168,6 @@ def _history_source_digest(records: list[dict[str, Any]]) -> str:
     return _sha256(_canonical_bytes(stable))
 
 
-def _history_marker(actor: str, source_sha256: str) -> str:
-    return (
-        "familia-legacy-history-v1 "
-        f"actor={actor} source_sha256={source_sha256}"
-    )
-
-
 def _read_transition_history(
     workspace: Path,
     known_actors: set[str],
@@ -847,8 +175,7 @@ def _read_transition_history(
     """Read legacy history while preserving every valid recorded actor.
 
     Schema version selects the supported record layout; it never changes
-    identity.  Deployment-owner fallback is reserved for genuinely unscoped
-    legacy files, not actor-tagged history rows.
+    identity. Unknown actors are discarded instead of being reassigned.
     """
 
     groups: dict[str, list[dict[str, Any]]] = {}
@@ -910,8 +237,8 @@ def _read_transition_history(
     actor_rows: list[dict[str, Any]] = []
     for row in parsed_rows:
         record = row["record"]
-        actor = record.get("actor")
-        if not isinstance(actor, str) or not actor.strip():
+        actor = _canonical_actor(record.get("actor"))
+        if actor is None:
             issues.append(
                 {
                     "line": row["line"],
@@ -922,6 +249,7 @@ def _read_transition_history(
                 }
             )
             continue
+        record["actor"] = actor
         row["source_actor"] = actor
         actor_rows.append(row)
 
@@ -951,193 +279,61 @@ def _read_transition_history(
     return groups, issues
 
 
-def _dirty_candidate(
-    text: str,
-    history_groups: dict[str, list[dict[str, Any]]],
-) -> dict[str, Any] | None:
-    source_tokens = _significant_tokens(text)
-    if not source_tokens:
-        return None
-    best: dict[str, Any] | None = None
-    for actor, records in history_groups.items():
-        actor_tokens = _significant_tokens(
-            "\n".join(str(record.get("content") or "") for record in records)
-        )
-        common = source_tokens & actor_tokens
-        union = source_tokens | actor_tokens
-        jaccard = (len(common) / len(union)) if union else 0.0
-        candidate = {
-            "actor": actor,
-            "common_significant_tokens": len(common),
-            "jaccard": round(jaccard, 6),
-        }
-        if best is None or (
-            candidate["common_significant_tokens"], candidate["jaccard"]
-        ) > (best["common_significant_tokens"], best["jaccard"]):
-            best = candidate
-    if best and best["common_significant_tokens"] >= 10 and best["jaccard"] >= 0.10:
-        return best
-    return None
-
-
 def _transition_file_action(
     *,
-    workspace: Path,
     relative: str,
     component: str,
-    destination_suffix: str,
-    owner: str | None,
-    known_actors: set[str],
-    history_groups: dict[str, list[dict[str, Any]]],
-    get_value: Callable[[str], Any],
 ) -> dict[str, Any]:
-    path = workspace.joinpath(*PurePosixPath(relative).parts)
-    base = {
+    return {
         "phase": "files",
         "component": component,
         "source": relative,
         "destination": None,
         "actor": None,
         "candidate_actor": None,
+        "disposition": "erase_without_read",
+        "reason": "flat_memory_retired",
     }
-    if not path.exists():
-        return {**base, "disposition": "skip", "reason": "source_missing"}
-    try:
-        raw = path.read_bytes()
-        text = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
-    except (OSError, UnicodeDecodeError):
-        return {
-            **base,
-            "disposition": "quarantine_needs_review",
-            "reason": "source_unreadable",
-        }
-    base.update({"source_sha256": _sha256(raw), "source_bytes": len(raw)})
-    if not text.strip() or (component == "heartbeat" and _heartbeat_template(raw)):
-        return {**base, "disposition": "skip", "reason": "empty_or_template"}
-
-    if component in {"user_profile", "memory"}:
-        dirty = _dirty_candidate(text, history_groups)
-        owner_history = history_groups.get(owner or "", [])
-        same_owner_v0_memory = bool(
-            component == "memory"
-            and dirty is not None
-            and dirty["actor"] == owner
-            and owner_history
-            and all(
-                isinstance(record.get("provenance"), dict)
-                and record["provenance"].get("source") == "legacy_history_v0"
-                for record in owner_history
-            )
-        )
-        if dirty is not None and not same_owner_v0_memory:
-            return {
-                **base,
-                "disposition": "dirty_legacy",
-                "reason": "actor_history_overlap",
-                "candidate_actor": dirty["actor"],
-                "common_significant_tokens": dirty["common_significant_tokens"],
-                "jaccard": dirty["jaccard"],
-            }
-
-    if owner is None:
-        return {
-            **base,
-            "disposition": "quarantine_needs_review",
-            "reason": "legacy_owner_ambiguous",
-        }
-    if owner not in known_actors:
-        return {
-            **base,
-            "actor": owner,
-            "disposition": "quarantine_needs_review",
-            "reason": "legacy_owner_unknown",
-        }
-
-    destination = f"private:{owner}:{destination_suffix}"
-    base.update({"actor": owner, "destination": destination})
-    try:
-        existing = _memory_text(get_value(destination))
-    except Exception as exc:  # noqa: BLE001 - memX/auth failures are systemic
-        raise MigrationError("target probe failed") from exc
-    if not existing.strip():
-        return {**base, "disposition": "write", "reason": "target_absent"}
-    if existing == text:
-        return {**base, "disposition": "skip", "reason": "target_equal"}
-    return {**base, "disposition": "conflict", "reason": "target_diverged"}
 
 
 def build_legacy_transition_plan(
     *,
     workspace: Path,
     known_actors: set[str],
-    get_value: Callable[[str], Any],
-    legacy_owner: str | None = None,
 ) -> dict[str, Any]:
     """Plan the operational legacy-files/history transition without fan-out.
 
-    Flat files have no trustworthy owner in a multi-principal installation.
-    They are therefore written only when an explicit ``legacy_owner`` is
-    supplied (or the installation contains exactly one known actor). History
-    rows already carry ownership and are grouped for LLM consolidation into
-    the actor's private long-term memory.
+    Flat files have no trustworthy owner and are retired without being read.
+    History rows already carry ownership and are grouped for LLM consolidation
+    into the actor's private long-term memory.
     """
 
     workspace = workspace.resolve(strict=True)
     actors = {
-        actor.strip()
-        for actor in known_actors
-        if isinstance(actor, str) and actor.strip()
+        actor
+        for value in known_actors
+        if (actor := _canonical_actor(value)) is not None
     }
-    owner = legacy_owner.strip() if isinstance(legacy_owner, str) and legacy_owner.strip() else None
-    if owner is None and len(actors) == 1:
-        owner = next(iter(actors))
-
     history_groups, history_issues = _read_transition_history(workspace, actors)
     actions = [
         _transition_file_action(
-            workspace=workspace,
             relative="USER.md",
             component="user_profile",
-            destination_suffix="value:user_profile",
-            owner=owner,
-            known_actors=actors,
-            history_groups=history_groups,
-            get_value=get_value,
         ),
         _transition_file_action(
-            workspace=workspace,
+            relative="MEMORY.md",
+            component="memory",
+        ),
+        _transition_file_action(
             relative="memory/MEMORY.md",
             component="memory",
-            destination_suffix="value:memory",
-            owner=owner,
-            known_actors=actors,
-            history_groups=history_groups,
-            get_value=get_value,
-        ),
-        _transition_file_action(
-            workspace=workspace,
-            relative="HEARTBEAT.md",
-            component="heartbeat",
-            destination_suffix="value:heartbeat",
-            owner=owner,
-            known_actors=actors,
-            history_groups=history_groups,
-            get_value=get_value,
         ),
     ]
 
     for actor, records in sorted(history_groups.items()):
         source_sha256 = _history_source_digest(records)
-        destination = f"private:{actor}:value:memory"
-        marker = _history_marker(actor, source_sha256)
-        try:
-            existing = _memory_text(get_value(destination))
-        except Exception as exc:  # noqa: BLE001 - memX/auth failures are systemic
-            raise MigrationError("target probe failed") from exc
-        if marker in existing:
-            disposition, reason = "skip", "history_already_imported"
-        else:
-            disposition, reason = "llm_required", "history_requires_consolidation"
+        fact_id = "legacy-history"
+        destination = f"private:{actor}:memory:{fact_id}"
         actions.append(
             {
                 "phase": "history",
@@ -1145,22 +341,13 @@ def build_legacy_transition_plan(
                 "source": "memory/history.jsonl",
                 "source_sha256": source_sha256,
                 "actor": actor,
-                "source_actors": sorted(
-                    {
-                        (
-                            record.get("provenance", {}).get("legacy_actor")
-                            if isinstance(record.get("provenance"), dict)
-                            else None
-                        )
-                        or record["actor"]
-                        for record in records
-                    }
-                ),
+                "fact_id": fact_id,
+                "source_actors": sorted({record["actor"] for record in records}),
                 "cursors": [record["cursor"] for record in records],
                 "record_count": len(records),
                 "destination": destination,
-                "disposition": disposition,
-                "reason": reason,
+                "disposition": "llm_required",
+                "reason": "history_requires_consolidation",
             }
         )
 
@@ -1172,10 +359,11 @@ def build_legacy_transition_plan(
                 "source": "memory/history.jsonl",
                 "source_sha256": issue["source_sha256"],
                 "source_line": issue["line"],
-                "actor": issue["actor"],
+                "actor": None,
+                "source_actor": issue["actor"],
                 "cursor": issue["cursor"],
                 "destination": None,
-                "disposition": "skip_warning",
+                "disposition": "discarded_unknown",
                 "reason": issue["reason"],
             }
         )
@@ -1183,49 +371,18 @@ def build_legacy_transition_plan(
     counts: dict[str, int] = {}
     for action in actions:
         counts[action["disposition"]] = counts.get(action["disposition"], 0) + 1
-    unresolved = sum(
-        counts.get(name, 0)
-        for name in ("conflict", "quarantine_needs_review")
-    )
-    warnings = sum(counts.get(name, 0) for name in ("skip_warning", "dirty_legacy"))
     return {
         "schema_version": LEGACY_TRANSITION_SCHEMA_VERSION,
+        "migration_kind": "legacy_upgrade",
+        "source_contract_version": "1.0.0",
+        "target_contract_version": MEMORY_CONTRACT_VERSION,
         "workspace": str(workspace),
         "known_actors": sorted(actors),
-        "legacy_owner": owner,
         "dry_run": True,
-        "status": (
-            "needs_review"
-            if unresolved
-            else "ready_with_warnings"
-            if warnings
-            else "ready"
-        ),
+        "status": "ready",
         "actions": actions,
         "summary": counts,
-        "warnings": warnings,
     }
-
-
-def _legacy_file_destination(workspace: Path, component: str) -> Path:
-    name = {
-        "user_profile": "USER.md",
-        "memory": "MEMORY.md",
-        "heartbeat": "HEARTBEAT.md",
-    }[component]
-    return workspace / "legacy" / name
-
-
-def _move_applied_legacy_file(workspace: Path, action: dict[str, Any]) -> None:
-    source = workspace.joinpath(*PurePosixPath(action["source"]).parts)
-    destination = _legacy_file_destination(workspace, action["component"])
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        if destination.read_bytes() != source.read_bytes():
-            raise MigrationError("legacy destination conflict")
-        source.unlink()
-        return
-    os.replace(source, destination)
 
 
 def _write_dream_cursor(workspace: Path, cursor: int) -> None:
@@ -1317,17 +474,16 @@ async def apply_legacy_transition_plan(
     plan: dict[str, Any],
     workspace: Path,
     get_value: Callable[[str], Any],
-    set_value: Callable[[str, str], None],
+    ingestor: Any,
     consolidate_history: Callable[
         [str, list[dict[str, Any]], str], Awaitable[str]
     ],
 ) -> dict[str, Any]:
-    """Apply only safe plan actions and publish Dream cursor last.
+    """Apply history through the principal ingestor, then retire flat files.
 
-    ``history.jsonl`` is never deleted or moved. Actor-owned rows are sent to
-    the supplied LLM consolidator and merged into ``private:<actor>:value:memory``.
-    Any failed actor keeps the global Dream cursor unchanged so the transition
-    remains retryable.
+    ``history.jsonl`` and ``SOUL.md`` are never changed. The three contract
+    flat-memory files are replaced with empty files only after every required
+    actor-owned history write is confirmed. Dream cursor publication is last.
     """
 
     workspace = workspace.resolve(strict=True)
@@ -1336,23 +492,66 @@ async def apply_legacy_transition_plan(
     if plan.get("workspace") != str(workspace):
         raise MigrationBlockedError("legacy transition workspace mismatch")
 
-    file_suffixes = {
-        "user_profile": "value:user_profile",
-        "memory": "value:memory",
-        "heartbeat": "value:heartbeat",
+    actions = plan.get("actions")
+    if not isinstance(actions, list):
+        raise MigrationBlockedError("legacy transition actions missing")
+
+    expected_flat_actions = {
+        ("USER.md", "user_profile"),
+        ("MEMORY.md", "memory"),
+        ("memory/MEMORY.md", "memory"),
     }
-    for action in plan.get("actions", []):
-        destination = action.get("destination")
-        if destination is None:
+    flat_actions = [
+        action
+        for action in actions
+        if isinstance(action, dict) and action.get("phase") == "files"
+    ]
+    if (
+        len(flat_actions) != 3
+        or {
+            (action.get("source"), action.get("component"))
+            for action in flat_actions
+        }
+        != expected_flat_actions
+        or any(
+            action.get("destination") is not None
+            or action.get("disposition") != "erase_without_read"
+            for action in flat_actions
+        )
+    ):
+        raise MigrationBlockedError("legacy transition flat-file actions mismatch")
+
+    history_actions: list[dict[str, Any]] = []
+    for action in actions:
+        if not isinstance(action, dict):
+            raise MigrationBlockedError("legacy transition action is not an object")
+        if action.get("phase") == "files":
             continue
+        if (
+            action.get("phase") != "history"
+            or action.get("component") != "history"
+            or action.get("source") != "memory/history.jsonl"
+        ):
+            raise MigrationBlockedError("legacy transition history action mismatch")
         actor = action.get("actor")
-        expected: str | None = None
-        if action.get("phase") == "files" and action.get("component") in file_suffixes:
-            expected = f"private:{actor}:{file_suffixes[action['component']]}"
-        elif action.get("phase") == "history" and action.get("component") == "history":
-            expected = f"private:{actor}:value:memory"
-        if not isinstance(actor, str) or not actor or destination != expected:
+        if actor is None:
+            if (
+                action.get("destination") is not None
+                or action.get("disposition") != "discarded_unknown"
+            ):
+                raise MigrationBlockedError("invalid discarded history action")
+            continue
+        fact_id = action.get("fact_id")
+        expected = f"private:{actor}:memory:{fact_id}"
+        if (
+            not isinstance(actor, str)
+            or not actor
+            or fact_id != "legacy-history"
+            or action.get("destination") != expected
+            or not isinstance(action.get("cursors"), list)
+        ):
             raise MigrationBlockedError("non-private or mismatched migration destination")
+        history_actions.append(action)
 
     actors = set(plan.get("known_actors") or [])
     history_groups, _current_history_issues = _read_transition_history(workspace, actors)
@@ -1361,47 +560,8 @@ async def apply_legacy_transition_plan(
     written_keys: list[str] = []
     applied_actions = 0
     fatal_failure: str | None = None
-
-    for action in plan.get("actions", []):
-        file_is_ready = action.get("disposition") == "write" or (
-            action.get("disposition") == "skip"
-            and action.get("reason") == "target_equal"
-        )
-        if action.get("phase") != "files" or not file_is_ready:
-            continue
-        source = workspace.joinpath(*PurePosixPath(action["source"]).parts)
-        try:
-            raw = source.read_bytes()
-            if _sha256(raw) != action.get("source_sha256"):
-                raise MigrationError("source changed after dry-run")
-            text = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
-            destination = str(action["destination"])
-            existing = _memory_text(get_value(destination))
-            if existing.strip() and existing != text:
-                raise MigrationError("target changed after dry-run")
-            if existing != text:
-                set_value(destination, text)
-                if _memory_text(get_value(destination)) != text:
-                    raise MigrationError("target write not durable")
-                written_keys.append(destination)
-            _move_applied_legacy_file(workspace, action)
-            applied_actions += 1
-        except Exception as exc:  # noqa: BLE001 - result must remain actionable
-            fatal_failure = f"{action.get('component')}:{type(exc).__name__}"
-            failed_actions.append(fatal_failure)
-            break
-
-    history_actions = [
-        action
-        for action in plan.get("actions", [])
-        if action.get("phase") == "history"
-        and action.get("component") == "history"
-        and isinstance(action.get("actor"), str)
-        and isinstance(action.get("cursors"), list)
-    ]
-    completed_history_actors: set[str] = set()
     max_history_cursor: int | None = None
-    for action in ([] if fatal_failure else history_actions):
+    for action in history_actions:
         actor = action["actor"]
         records = history_groups.get(actor, [])
         try:
@@ -1411,143 +571,96 @@ async def apply_legacy_transition_plan(
             if cursors != action.get("cursors"):
                 raise MigrationError("history cursor set changed after dry-run")
             destination = str(action["destination"])
+            disposition = action.get("disposition")
+            if disposition != "llm_required":
+                raise MigrationError("history action is not approved for consolidation")
             existing = _memory_text(get_value(destination))
-            marker = _history_marker(actor, action["source_sha256"])
-            if marker not in existing:
-                if action.get("disposition") != "llm_required":
-                    raise MigrationError("history action is not approved for consolidation")
-                consolidated = (await consolidate_history(actor, records, existing)).strip()
-                if not consolidated:
-                    raise MigrationError("history consolidation returned empty memory")
-                cursor_list = ",".join(str(cursor) for cursor in cursors)
-                imported_at = _utc_now()
-                block = (
-                    "## Imported from history.jsonl\n\n"
-                    f"<!-- source=history.jsonl actor={actor} cursors={cursor_list} "
-                    f"migrated_at={imported_at} {marker} -->\n\n"
-                    f"{consolidated}\n"
-                )
-                merged = existing.rstrip() + ("\n\n" if existing.strip() else "") + block
-                set_value(destination, merged)
-                if _memory_text(get_value(destination)) != merged:
-                    raise MigrationError("history memory write not durable")
-                written_keys.append(destination)
-            completed_history_actors.add(actor)
+            consolidated = (
+                await consolidate_history(actor, records, existing)
+            ).strip()
+            if not consolidated:
+                raise MigrationError("history consolidation returned empty memory")
+            ingest_result = await ingestor.ingest(
+                server_principal=actor,
+                server_topic=None,
+                operation={
+                    "kind": "memory",
+                    "fact_id": action["fact_id"],
+                    "value": consolidated,
+                },
+            )
+            if (
+                not isinstance(ingest_result, str)
+                or not ingest_result.startswith("committed:")
+            ):
+                raise MigrationError("history memory write was not committed")
+            written_keys.append(destination)
             max_history_cursor = max(max_history_cursor or 0, max(cursors))
             applied_actions += 1
-        except Exception:  # noqa: BLE001 - actor remains retryable, details stay non-sensitive
+        except Exception:  # noqa: BLE001 - result remains non-sensitive and actionable
             failed_actors.add(actor)
             fatal_failure = f"history:{actor}"
             failed_actions.append(fatal_failure)
             break
 
-    unresolved_history = any(
-        action.get("phase") == "history"
-        and action.get("disposition") in {"conflict", "quarantine_needs_review"}
-        for action in plan.get("actions", [])
-    )
-    all_history_complete = bool(history_actions) and (
-        completed_history_actors == {action["actor"] for action in history_actions}
-        and not failed_actors
-        and not unresolved_history
-    )
-    if all_history_complete and max_history_cursor is not None:
-        _write_dream_cursor(workspace, max_history_cursor)
-
-    unresolved = [
-        action
-        for action in plan.get("actions", [])
-        if action.get("disposition") in {
-            "conflict",
-            "quarantine_needs_review",
-        }
-    ]
-    warnings = sum(
-        action.get("disposition") in {"skip_warning", "dirty_legacy"}
-        for action in plan.get("actions", [])
-    )
     if fatal_failure:
-        status_value = "fatal"
-    elif unresolved:
-        status_value = "partial" if applied_actions else "needs_review"
-    elif warnings:
-        status_value = "success_with_warnings"
-    else:
-        status_value = "success"
+        status_value = "partial" if applied_actions else "failed"
+        return {
+            "status": status_value,
+            "applied_actions": applied_actions,
+            "written_keys": sorted(set(written_keys)),
+            "failed_actors": sorted(failed_actors),
+            "failed_actions": sorted(failed_actions),
+            "fatal_failure": fatal_failure,
+            "dream_cursor_updated": False,
+        }
+
+    cleaned_files = 0
+    try:
+        for action in flat_actions:
+            source = workspace.joinpath(*PurePosixPath(action["source"]).parts)
+            _write_private_atomic(source, b"")
+            cleaned_files += 1
+    except Exception as exc:  # noqa: BLE001 - result remains non-sensitive
+        fatal_failure = f"files:{type(exc).__name__}"
+        failed_actions.append(fatal_failure)
+        return {
+            "status": "partial" if applied_actions or cleaned_files else "failed",
+            "applied_actions": applied_actions + cleaned_files,
+            "written_keys": sorted(set(written_keys)),
+            "failed_actors": sorted(failed_actors),
+            "failed_actions": sorted(failed_actions),
+            "fatal_failure": fatal_failure,
+            "dream_cursor_updated": False,
+        }
+
+    dream_cursor_updated = False
+    try:
+        if max_history_cursor is not None:
+            _write_dream_cursor(workspace, max_history_cursor)
+            dream_cursor_updated = True
+    except Exception as exc:  # noqa: BLE001 - result remains non-sensitive
+        fatal_failure = f"cursor:{type(exc).__name__}"
+        failed_actions.append(fatal_failure)
+        return {
+            "status": "partial",
+            "applied_actions": applied_actions + cleaned_files,
+            "written_keys": sorted(set(written_keys)),
+            "failed_actors": sorted(failed_actors),
+            "failed_actions": sorted(failed_actions),
+            "fatal_failure": fatal_failure,
+            "dream_cursor_updated": False,
+        }
+
     return {
-        "status": status_value,
-        "applied_actions": applied_actions,
+        "status": "complete",
+        "applied_actions": applied_actions + cleaned_files,
         "written_keys": sorted(set(written_keys)),
         "failed_actors": sorted(failed_actors),
         "failed_actions": sorted(failed_actions),
-        "fatal_failure": fatal_failure,
-        "needs_review": len(unresolved),
-        "warnings": warnings,
-        "dream_cursor_updated": bool(all_history_complete and max_history_cursor is not None),
+        "fatal_failure": None,
+        "dream_cursor_updated": dream_cursor_updated,
     }
-
-
-class IsolatedFileTarget:
-    """Atomic local target used only inside a marked isolated restore root."""
-
-    def __init__(self, root: Path):
-        self.root = root
-        self.values = root / "migration-state" / "values"
-        self.cursors = root / "migration-state" / "cursors"
-        self.values.mkdir(parents=True, exist_ok=True)
-        self.cursors.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.values.parent, 0o700)
-        os.chmod(self.values, 0o700)
-        os.chmod(self.cursors, 0o700)
-
-    @staticmethod
-    def _name(value: str) -> str:
-        return _sha256(value.encode("utf-8"))
-
-    def _path(self, destination: str) -> Path:
-        return self.values / f"{self._name(destination)}.json"
-
-    def _load(self, destination: str) -> dict[str, Any] | None:
-        path = self._path(destination)
-        if not path.exists():
-            return None
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if value.get("destination") != destination:
-            raise MigrationError("isolated target identity mismatch")
-        return value
-
-    def get_hash(self, destination: str) -> str | None:
-        value = self._load(destination)
-        return value.get("sha256") if value else None
-
-    def put_if_absent(self, destination: str, value: bytes, expected_sha256: str) -> str:
-        if _sha256(value) != expected_sha256:
-            raise MigrationError("target input hash mismatch")
-        existing = self._load(destination)
-        if existing:
-            return "equal" if existing.get("sha256") == expected_sha256 else "conflict"
-        record = {
-            "destination": destination,
-            "sha256": expected_sha256,
-            "value_base64": base64.b64encode(value).decode("ascii"),
-        }
-        _write_private_atomic(self._path(destination), _canonical_bytes(record) + b"\n")
-        return "written"
-
-    def publish_cursor(self, actor: str, cursor: int) -> str:
-        path = self.cursors / f"{self._name(actor)}.json"
-        current = None
-        if path.exists():
-            current_value = json.loads(path.read_text(encoding="utf-8"))
-            if current_value.get("actor") != actor:
-                return "conflict"
-            current = current_value.get("cursor")
-        if isinstance(current, int) and current > cursor:
-            return "conflict"
-        if current == cursor:
-            return "equal"
-        _write_private_atomic(path, _canonical_bytes({"actor": actor, "cursor": cursor}) + b"\n")
-        return "written"
 
 
 def _within(path: Path, parent: Path) -> bool:
@@ -1580,7 +693,12 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def cli(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Plan/rehearse isolated Familia memory repair")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Consolidate legacy history into private memory; "
+            "erase three flat memory files unread"
+        )
+    )
     parser.add_argument("--snapshot", type=Path, required=True)
     parser.add_argument("--target", type=Path, required=True)
     parser.add_argument("--source-root", type=Path)
@@ -1592,6 +710,11 @@ def cli(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        import asyncio
+
+        from familia.acl.graph_io import get_raw, resolve_admin_key
+        from familia.memx_client import memx_base_url
+        from familia.principal_memory_ingestor import PrincipalMemoryIngestor
         from scripts.compare_memory_state import load_and_validate_manifest
 
         snapshot_root = args.snapshot.resolve(strict=True)
@@ -1607,35 +730,67 @@ def cli(argv: list[str] | None = None) -> int:
             resolved_parent = output.absolute().parent.resolve(strict=True)
             if not _within(resolved_parent, target_root):
                 raise MigrationPreflightError("manifest and journal must stay in isolated target")
-        classifications = _load_json(args.classifications) if args.classifications else {}
-        target = IsolatedFileTarget(target_root)
-        plan = build_migration_plan(
-            source_root=source_root,
-            snapshot_manifest=snapshot,
+        plan = build_legacy_transition_plan(
+            workspace=source_root,
             known_actors=_load_known_actors(source_root),
-            target_id=marker["target_id"],
-            target_probe=target.get_hash,
-            classifications=classifications,
         )
         _write_private_atomic(args.manifest, _canonical_bytes(plan) + b"\n")
-        result: dict[str, Any] = {"status": "dry_run", "migration_id": plan["migration_id"]}
+        result: dict[str, Any] = {"status": "dry_run"}
         if args.apply:
-            result = apply_migration_plan(
-                plan,
-                target,
-                args.journal,
-                lambda action: load_action_value(source_root, action),
+            llm_required = any(
+                action.get("disposition") == "llm_required"
+                for action in plan["actions"]
             )
-            result["migration_id"] = plan["migration_id"]
+            if llm_required:
+                consolidator = make_configured_history_consolidator()
+            else:
+
+                async def consolidator(
+                    _actor: str,
+                    _records: list[dict[str, Any]],
+                    _existing: str,
+                ) -> str:
+                    raise RuntimeError(
+                        "history consolidator called without an approved history action"
+                    )
+
+            ingestor = PrincipalMemoryIngestor(
+                base_url=memx_base_url(),
+                api_key=resolve_admin_key(),
+            )
+            result = asyncio.run(
+                apply_legacy_transition_plan(
+                    plan=plan,
+                    workspace=source_root,
+                    get_value=get_raw,
+                    ingestor=ingestor,
+                    consolidate_history=consolidator,
+                )
+            )
         if args.json:
-            print(json.dumps(result, sort_keys=True))
+            print(json.dumps(result if args.apply else plan, sort_keys=True))
+        elif args.apply:
+            failed_actors = result.get("failed_actors") or []
+            error = result.get("error") or result.get("fatal_failure") or "-"
+            print(
+                f"status={result['status']} "
+                f"applied_actions={result.get('applied_actions', 0)} "
+                f"failed_actors={','.join(failed_actors) or '-'} "
+                f"error={error}"
+            )
         else:
             print(
-                f"migration={result['status']} id={plan['migration_id']} "
-                f"actions={len(plan['actions'])} unresolved="
-                f"{sum(plan['summary'][name] for name in UNRESOLVED_DISPOSITIONS)}"
+                f"migration={plan['status']} actions={len(plan['actions'])} "
+                f"llm_required={plan['summary'].get('llm_required', 0)} "
+                f"discarded_unknown="
+                f"{plan['summary'].get('discarded_unknown', 0)}"
             )
-        return 0 if result["status"] in {"dry_run", "complete"} else 1
+        return {
+            "dry_run": 0,
+            "complete": 0,
+            "partial": 2,
+            "failed": 1,
+        }.get(result["status"], 1)
     except (MigrationError, OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"migration=refused reason={exc}", file=sys.stderr)
         return 2

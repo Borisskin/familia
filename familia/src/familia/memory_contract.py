@@ -186,8 +186,8 @@ MEMORY_CONTRACT: Final[dict[str, Any]] = {
         },
         "migration_command": {
             "plan": {
-                "values": ["planned", "blocked_needs_review"],
-                "terminal": ["planned", "blocked_needs_review"],
+                "values": ["ready"],
+                "terminal": ["ready"],
             },
             "apply": {
                 "values": ["complete", "partial", "failed"],
@@ -301,8 +301,7 @@ MEMORY_CONTRACT: Final[dict[str, Any]] = {
         "plan_is_applied_evidence": False,
         "exit_codes": {
             "plan": {
-                "planned": 2,
-                "blocked_needs_review": 2,
+                "ready": 0,
             },
             "apply": {
                 "complete": 0,

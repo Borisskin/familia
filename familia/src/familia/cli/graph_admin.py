@@ -943,32 +943,18 @@ def cmd_memory_set(args: argparse.Namespace) -> int:
     return 0
 
 
-def _resolve_legacy_owner(args: argparse.Namespace) -> str | None:
-    """Resolve the one canonical owner used for unscoped legacy files.
-
-    The admin writes ``FAMILIA_OWNER_ACTOR`` into the deployment env on the
-    initial install.  Reusing it here makes update/restore migrations
-    deterministic while keeping ``--legacy-owner`` as an operator override.
-    """
-    explicit = getattr(args, "legacy_owner", None)
-    if isinstance(explicit, str) and explicit.strip():
-        return explicit.strip()
-    configured = os.environ.get("FAMILIA_OWNER_ACTOR")
-    if isinstance(configured, str) and configured.strip():
-        return configured.strip()
-    return None
-
-
 def cmd_migrate_hybrid_storage(args: argparse.Namespace) -> int:
-    """Move legacy files/history into actor-owned memX memory without fan-out."""
+    """Consolidate legacy history privately, then erase three flats unread."""
     import asyncio
 
-    from familia.acl.graph_io import get_raw
+    from familia.acl.graph_io import get_raw, resolve_admin_key
+    from familia.memx_client import memx_base_url
     from familia.memory_migration import (
         apply_legacy_transition_plan,
         build_legacy_transition_plan,
         make_configured_history_consolidator,
     )
+    from familia.principal_memory_ingestor import PrincipalMemoryIngestor
 
     if args.workspace:
         workspace = args.workspace.expanduser().resolve(strict=True)
@@ -985,31 +971,26 @@ def cmd_migrate_hybrid_storage(args: argparse.Namespace) -> int:
 
     _, raw = _load_principals_json()
     known_actors = {
-        str(entry["id"]).strip()
+        entry["id"]
         for entry in (raw.get("principals") or [])
-        if isinstance(entry, dict) and str(entry.get("id") or "").strip()
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str)
     }
     if not known_actors:
-        raise ValueError("no principals found; refusing legacy memory migration")
+        raise ValueError("no principals found; refusing legacy-history transition")
 
     plan = build_legacy_transition_plan(
         workspace=workspace,
         known_actors=known_actors,
-        get_value=get_raw,
-        legacy_owner=_resolve_legacy_owner(args),
     )
     if args.dry_run:
         if getattr(args, "json", False):
             print(json.dumps(plan, ensure_ascii=False, sort_keys=True))
         else:
-            needs_review = sum(
-                plan["summary"].get(name, 0)
-                for name in ("conflict", "quarantine_needs_review")
-            )
             print(
                 f"migration={plan['status']} actions={len(plan['actions'])} "
                 f"llm_required={plan['summary'].get('llm_required', 0)} "
-                f"warnings={plan.get('warnings', 0)} needs_review={needs_review}"
+                f"discarded_unknown="
+                f"{plan['summary'].get('discarded_unknown', 0)}"
             )
             print("Re-run with --apply after reviewing the JSON plan.")
         return 0
@@ -1025,12 +1006,16 @@ def cmd_migrate_hybrid_storage(args: argparse.Namespace) -> int:
         ) -> str:
             raise RuntimeError("history consolidator called without an approved history action")
 
+    ingestor = PrincipalMemoryIngestor(
+        base_url=memx_base_url(),
+        api_key=resolve_admin_key(),
+    )
     result = asyncio.run(
         apply_legacy_transition_plan(
             plan=plan,
             workspace=workspace,
             get_value=get_raw,
-            set_value=set_raw,
+            ingestor=ingestor,
             consolidate_history=consolidator,
         )
     )
@@ -1041,27 +1026,21 @@ def cmd_migrate_hybrid_storage(args: argparse.Namespace) -> int:
         applied_actions=result["applied_actions"],
         written_keys=result["written_keys"],
         failed_actors=result["failed_actors"],
-        needs_review=result["needs_review"],
-        warnings=result["warnings"],
         dream_cursor_updated=result["dream_cursor_updated"],
     )
-    payload = {"plan": plan, "result": result}
     if getattr(args, "json", False):
-        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     else:
         print(
             f"migration={result['status']} applied={result['applied_actions']} "
-            f"warnings={result['warnings']} needs_review={result['needs_review']} "
             f"failed_actors="
             f"{','.join(result['failed_actors']) or '-'}"
         )
-    non_fatal_statuses = {
-        "success",
-        "success_with_warnings",
-        "partial",
-        "needs_review",
-    }
-    return 0 if result["status"] in non_fatal_statuses else 1
+    return {
+        "complete": 0,
+        "partial": 2,
+        "failed": 1,
+    }.get(result["status"], 1)
 
 # ---------------------------------------------------------------------------
 # default-topic seed
@@ -1555,16 +1534,18 @@ def build_parser() -> argparse.ArgumentParser:
                        default=True)
     p_t2p.set_defaults(func=cmd_migrate_topic_to_principal)
 
-    # Hybrid storage migration: classify flat legacy files, consolidate every
-    # actor-tagged history group, and write only actor-owned memX values.
+    # Legacy-history transition: consolidate actor-tagged history privately,
+    # then erase the three flat memory files without reading them.
     p_hyb = pm_sub.add_parser("hybrid-storage",
                               parents=[json_parent],
-                              help="move legacy memory into actor-owned memX scopes")
+                              help=("consolidate legacy history into private memory; "
+                                    "erase three flat memory files unread"),
+                              description=(
+                                  "Consolidate legacy history into private memory; "
+                                  "erase three flat memory files unread"
+                              ))
     p_hyb.add_argument("--workspace", type=Path,
                        help="workspace override (defaults to configured NANOBOT_HOME)")
-    p_hyb.add_argument("--legacy-owner",
-                       help=("explicit owner for clean USER/MEMORY/HEARTBEAT files; "
-                             "defaults to FAMILIA_OWNER_ACTOR"))
     p_hyb.add_argument("--config", type=Path,
                        help="nanobot config used by the history LLM consolidator")
     p_hyb.add_argument("--apply", dest="dry_run", action="store_false",
@@ -1572,7 +1553,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_hyb.set_defaults(func=cmd_migrate_hybrid_storage)
 
     # memory ...  raw memX read/write (admin-side, used by admin app's
-    # /personality editor and by the hybrid-storage migration).
+    # /personality editor and by the hybrid-storage transition).
     pmem = sub.add_parser("memory", help="raw memX get/set (admin only)")
     pmem_sub = pmem.add_subparsers(dest="memory_cmd", required=True)
 
