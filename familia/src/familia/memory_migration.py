@@ -555,6 +555,20 @@ async def apply_legacy_transition_plan(
 
     actors = set(plan.get("known_actors") or [])
     history_groups, _current_history_issues = _read_transition_history(workspace, actors)
+    planned_history_digests = {
+        action["actor"]: action.get("source_sha256")
+        for action in history_actions
+    }
+    current_history_digests = {
+        actor: _history_source_digest(records)
+        for actor, records in history_groups.items()
+    }
+    if (
+        len(planned_history_digests) != len(history_actions)
+        or planned_history_digests != current_history_digests
+    ):
+        raise MigrationBlockedError("history changed after dry-run")
+
     failed_actions: list[str] = []
     failed_actors: set[str] = set()
     written_keys: list[str] = []

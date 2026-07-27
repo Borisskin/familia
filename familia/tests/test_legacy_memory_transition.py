@@ -729,6 +729,81 @@ class LegacyMemoryTransitionTests(unittest.TestCase):
             history_payload,
         )
 
+    def test_apply_blocks_new_known_actor_before_any_side_effect(self) -> None:
+        _write_history(
+            self.workspace,
+            [_history_record(1, "alice", "Факт Алисы")],
+        )
+        flat_paths = [
+            self.workspace / "USER.md",
+            self.workspace / "MEMORY.md",
+            self.workspace / "memory" / "MEMORY.md",
+        ]
+        for index, path in enumerate(flat_paths, start=1):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"legacy flat {index}".encode())
+        cursor_path = self.workspace / "memory" / ".dream_cursor"
+        cursor_path.write_bytes(b"0\n")
+
+        plan = memory_migration.build_legacy_transition_plan(
+            workspace=self.workspace,
+            known_actors={"alice", "bob"},
+        )
+        history_path = self.workspace / "memory" / "history.jsonl"
+        with history_path.open("ab") as stream:
+            stream.write(
+                json.dumps(
+                    _history_record(2, "bob", "Факт Боба"),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode("utf-8")
+                + b"\n"
+            )
+
+        protected_paths = [*flat_paths, history_path, cursor_path]
+        bytes_after_append = {
+            path: path.read_bytes()
+            for path in protected_paths
+        }
+        unexpected_calls: list[str] = []
+
+        def should_not_get(_key: str) -> None:
+            unexpected_calls.append("get_value")
+            raise AssertionError("get_value must not run")
+
+        async def should_not_consolidate(*_args: Any) -> str:
+            unexpected_calls.append("consolidate_history")
+            raise AssertionError("history consolidator must not run")
+
+        class GuardedIngestor:
+            async def ingest(self, **_kwargs: Any) -> str:
+                unexpected_calls.append("ingestor")
+                raise AssertionError("ingestor must not run")
+
+        with (
+            patch(
+                "familia.memory_migration._write_private_atomic",
+                side_effect=AssertionError("atomic writer must not run"),
+            ) as atomic_write,
+            self.assertRaises(memory_migration.MigrationBlockedError),
+        ):
+            asyncio.run(
+                memory_migration.apply_legacy_transition_plan(
+                    plan=plan,
+                    workspace=self.workspace,
+                    get_value=should_not_get,
+                    ingestor=GuardedIngestor(),
+                    consolidate_history=should_not_consolidate,
+                )
+            )
+
+        self.assertEqual(unexpected_calls, [])
+        atomic_write.assert_not_called()
+        self.assertEqual(
+            {path: path.read_bytes() for path in protected_paths},
+            bytes_after_append,
+        )
+
     def test_history_consolidator_requests_atomic_private_facts(self) -> None:
         class Provider:
             def __init__(self) -> None:
