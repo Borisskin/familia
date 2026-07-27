@@ -216,6 +216,173 @@ class SyntheticSnapshotMemoryContractBarrier(unittest.TestCase):
         return apply_result
 
     @staticmethod
+    def _task_5_repeat_connection_point(
+        *,
+        snapshot: object,
+        plan: dict[str, object],
+    ) -> dict[str, object]:
+        from familia.memory_migration import apply_legacy_transition_plan
+
+        approved_actions = [
+            action
+            for action in plan["actions"]
+            if action.get("disposition") == "llm_required"
+        ]
+        expected_by_actor = {
+            action["actor"]: action["destination"]
+            for action in approved_actions
+        }
+        assert len(expected_by_actor) == len(approved_actions)
+        assert len(expected_by_actor) >= 2
+        expected_actors = [
+            action["actor"] for action in approved_actions
+        ]
+        expected_action_keys = [
+            action["destination"] for action in approved_actions
+        ]
+        expected_keys = set(expected_by_actor.values())
+        assert all(
+            key == f"private:{actor}:memory:legacy-history"
+            for actor, key in expected_by_actor.items()
+        )
+        discarded_actors = {
+            action.get("source_actor")
+            for action in plan["actions"]
+            if action.get("disposition") == "discarded_unknown"
+            and isinstance(action.get("source_actor"), str)
+        }
+
+        class ExactKeyMemory:
+            def __init__(self) -> None:
+                self.values: dict[str, str] = {}
+                self.get_calls: list[str] = []
+                self.ingest_calls: list[dict[str, object]] = []
+                self.fail_actor = expected_actors[1]
+                self.failed_once = False
+
+            def get(self, key: str) -> str | None:
+                self.get_calls.append(key)
+                assert key in expected_keys
+                return self.values.get(key)
+
+            async def ingest(self, **kwargs: object) -> str:
+                call = dict(kwargs)
+                operation = call.get("operation")
+                assert set(call) == {
+                    "server_principal",
+                    "server_topic",
+                    "operation",
+                }
+                assert isinstance(operation, dict)
+                call["operation"] = dict(operation)
+                self.ingest_calls.append(call)
+
+                actor = call["server_principal"]
+                assert isinstance(actor, str)
+                assert actor in expected_by_actor
+                assert actor not in discarded_actors
+                assert call["server_topic"] is None
+                assert set(operation) == {"kind", "fact_id", "value"}
+                assert operation["kind"] == "memory"
+                assert operation["fact_id"] == "legacy-history"
+                assert isinstance(operation["value"], str)
+                key = f"private:{actor}:memory:{operation['fact_id']}"
+                assert key == expected_by_actor[actor]
+
+                if actor == self.fail_actor and not self.failed_once:
+                    self.failed_once = True
+                    return "retryable_failure: synthetic one-shot failure"
+                self.values[key] = operation["value"]
+                return f"committed: Stored at '{key}'"
+
+        memory = ExactKeyMemory()
+        consolidation_counts: dict[str, int] = {}
+
+        async def consolidate_history(
+            actor: str,
+            records: list[dict[str, object]],
+            existing_memory: str,
+        ) -> str:
+            assert actor in expected_by_actor
+            assert records
+            key = expected_by_actor[actor]
+            assert existing_memory == memory.values.get(key, "")
+            consolidation_counts[actor] = consolidation_counts.get(actor, 0) + 1
+            cursors = ",".join(str(record["cursor"]) for record in records)
+            return (
+                f"consolidated:{actor}:"
+                f"attempt:{consolidation_counts[actor]}:{cursors}"
+            )
+
+        def apply_once() -> dict[str, object]:
+            return asyncio.run(
+                apply_legacy_transition_plan(
+                    plan=plan,
+                    workspace=snapshot.workspace,
+                    get_value=memory.get,
+                    ingestor=memory,
+                    consolidate_history=consolidate_history,
+                )
+            )
+
+        first = apply_once()
+        first_key = expected_by_actor[expected_actors[0]]
+        assert first["status"] == "partial"
+        assert first["applied_actions"] == 1
+        assert first["written_keys"] == [first_key]
+        assert first["failed_actors"] == [expected_actors[1]]
+        assert set(memory.values) == {first_key}
+        assert [
+            call["server_principal"]
+            for call in memory.ingest_calls[:2]
+        ] == expected_actors[:2]
+
+        second = apply_once()
+        assert second["status"] == "complete"
+        assert set(second["written_keys"]) == expected_keys
+        assert set(memory.values) == expected_keys
+        keys_after_second = set(memory.values)
+        values_after_second = dict(memory.values)
+
+        third = apply_once()
+        assert third["status"] == "complete"
+        assert set(third["written_keys"]) == expected_keys
+        assert set(memory.values) == keys_after_second == expected_keys
+        assert all(
+            memory.values[key] != values_after_second[key]
+            for key in expected_keys
+        )
+
+        assert memory.get_calls == (
+            expected_action_keys[:2]
+            + expected_action_keys
+            + expected_action_keys
+        )
+        assert {
+            call["server_principal"] for call in memory.ingest_calls
+        } == set(expected_actors)
+        assert all(
+            call["server_topic"] is None
+            and call["operation"]["kind"] == "memory"
+            and call["operation"]["fact_id"] == "legacy-history"
+            for call in memory.ingest_calls
+        )
+        assert discarded_actors.isdisjoint(
+            call["server_principal"] for call in memory.ingest_calls
+        )
+        assert set(memory.values) == {
+            f"private:{actor}:memory:legacy-history"
+            for actor in expected_actors
+        }
+
+        return {
+            "partial": first,
+            "retry": second,
+            "repeat": third,
+            "physical_keys": sorted(memory.values),
+        }
+
+    @staticmethod
     def _task_7_restore_connection_point(
         *,
         snapshot: object,
@@ -320,9 +487,13 @@ class SyntheticSnapshotMemoryContractBarrier(unittest.TestCase):
             plan=plan,
             expected_end_state=expected_end_state,
         )
+        repeat_result = self._task_5_repeat_connection_point(
+            snapshot=snapshot,
+            plan=plan,
+        )
         restore_result = self._task_7_restore_connection_point(
             snapshot=snapshot,
-            apply_result=apply_result,
+            apply_result=repeat_result["repeat"],
             expected_end_state=expected_end_state,
         )
         actual_end_state = self._current_verify_connection_point(
@@ -335,6 +506,7 @@ class SyntheticSnapshotMemoryContractBarrier(unittest.TestCase):
         return {
             "plan": plan,
             "apply": apply_result,
+            "repeat": repeat_result,
             "restore": restore_result,
             "current_verify": actual_end_state,
         }

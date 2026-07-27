@@ -175,15 +175,25 @@ class PrincipalMemoryIngestor:
                         return f"committed: Stored at '{full_key}'"
                     if (
                         payload.get("ok") is True
-                        and payload.get("status") == "conflict"
+                        and (
+                            payload.get("status") == "conflict"
+                            or (
+                                not delete
+                                and payload.get("status") == "not_updated"
+                            )
+                        )
                         and payload.get("committed") is False
                         and payload.get("updated") is False
                         and payload.get("retryable") is True
-                        and payload.get("version") is not None
+                        and isinstance(payload.get("version"), (int, float))
+                        and not isinstance(payload.get("version"), bool)
                     ):
                         continue
                     return "error: memX did not confirm the conditional commit"
         except httpx.HTTPError as exc:
             return f"error: memX unreachable ({type(exc).__name__}: {exc})"
 
-        return f"retryable_failure: memX CAS conflict after {_MAX_CAS_ATTEMPTS} attempts"
+        return (
+            "retryable_failure: memX conditional commit failed after "
+            f"{_MAX_CAS_ATTEMPTS} attempts"
+        )
