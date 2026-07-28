@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from importlib.resources import files as pkg_files
 from pathlib import Path
 from typing import Any
@@ -16,9 +15,8 @@ class FamiliaContextExtension:
     # from ``None``: ``None`` means there is no actor, while this sentinel
     # means we must fail closed and avoid leaking single-tenant files.
     _CLIENT_FAILED = object()
-    # Cap bullets surfaced per peer in cross-principal index blocks. A peer
-    # with hundreds of shared keys would otherwise eat token budget and hide
-    # recent entries. MRU order means stale tail items are discarded first.
+    # Cap projected atomic names per foreign owner. Catalog order is oldest
+    # first, so projection walks it backwards and keeps the newest names.
     _PEER_INDEX_MAX_KEYS_PER_PEER = 40
     # Hard cap on bytes per stitched peer USER. Four KiB is enough for a
     # plausible self-description; bigger content is treated as prompt stuffing.
@@ -45,7 +43,7 @@ class FamiliaContextExtension:
         peer_client = self._principal_client(actor)
         graph_snapshot = self._load_graph_snapshot(peer_client)
         # Order matters. Product policy templates come first, then own
-        # USER/MEMORY, key indexes for rediscovery, and cross-principal context.
+        # USER/MEMORY, the atomic catalog, and authorized foreign names.
         sections = [
             *self._build_system_template_sections(),
             self._build_user_block(actor),
@@ -56,31 +54,7 @@ class FamiliaContextExtension:
                 heading="Private keys you've written",
                 scope_label="private",
             ),
-            self._build_key_index_block(
-                actor,
-                suffix="value:shared_index",
-                heading="Shared keys you've written",
-                scope_label="shared",
-            ),
-            self._build_peer_index_block(
-                actor,
-                suffix="value:shared_index",
-                scope_label="shared",
-                heading="Family members' shared keys",
-                relation="family",
-                client=peer_client,
-                graphs=graph_snapshot,
-            ),
-            self._build_peer_index_block(
-                actor,
-                suffix="value:private_index",
-                scope_label="private",
-                heading="Peers' private keys",
-                relation="peer",
-                client=peer_client,
-                graphs=graph_snapshot,
-            ),
-            self._build_peer_user_block(
+            self._build_peer_memory_projection_block(
                 actor,
                 client=peer_client,
                 graphs=graph_snapshot,
@@ -228,69 +202,45 @@ class FamiliaContextExtension:
         heading: str,
         scope_label: str,
     ) -> str:
-        """Render custom keys written by the current actor.
-
-        Used twice per turn: ``value:private_index`` and
-        ``value:shared_index``. These indexes are maintained by memory write
-        hooks so the model can rediscover custom keys across channel switches
-        without guessing names like ``profile`` or ``notes``.
-
-        Index entries may be legacy bare strings or current
-        ``{"name": str, "tags": [...]}`` objects. Output is newest first,
-        matching MRU eviction order.
-        """
+        """Render strict atomic names from the current actor's catalog."""
+        if suffix != "value:private_index" or scope_label != "private":
+            return ""
         client = self._principal_client(actor)
         if client is None or client is self._CLIENT_FAILED:
             return ""
         raw = client.get(suffix)
-        if not raw:
+        if raw is None:
             return ""
         try:
-            keys = json.loads(raw)
-        except ValueError:
+            from familia.acl.principal_memory import (
+                _decode_atomic_memory_catalog,
+            )
+        except ImportError:
             return ""
-        if not isinstance(keys, list):
+        entries = _decode_atomic_memory_catalog(raw)
+        if entries is None:
             return ""
-        names: list[str] = []
-        for entry in reversed(keys):
-            if isinstance(entry, str) and entry:
-                names.append(entry)
-            elif isinstance(entry, dict) and isinstance(entry.get("name"), str) and entry["name"]:
-                names.append(entry["name"])
+        names = [name for name, _tags in reversed(entries)]
         if not names:
             return ""
         bullet_list = "\n".join(f"- {name}" for name in names)
         return (
             f"# {heading}\n\n"
-            f"Custom ``{scope_label}:`` keys you stored in earlier "
-            "turns (any channel). To read one, call "
+            "Atomic private memory names stored in your catalog. "
+            "To read one, call "
             f"``memory_get`` with ``scope='{scope_label}'`` and the "
             "bare key name. Newest first.\n\n"
             f"{bullet_list}"
         )
 
-    def _build_peer_index_block(
+    def _build_peer_memory_projection_block(
         self,
         actor: str | None,
         *,
-        suffix: str,
-        scope_label: str,
-        heading: str,
-        relation: str,
         client: Any,
         graphs: tuple[dict[str, Any], dict[str, Any]] | None,
     ) -> str:
-        """Render custom keys written by related principals.
-
-        Reads ``private:<peer>:<suffix>`` through
-        ``PrincipalMemoryClient.get_other`` so the cross-principal read goes
-        through policy and memX ACLs. Empty bodies, denied reads and malformed
-        JSON are skipped silently.
-
-        ``relation`` is retained as presentation metadata. Candidate
-        principals are not authorized here; ``get_other`` applies the
-        canonical record-level decision.
-        """
+        """Render only authorized foreign atomic names, never values."""
         if (
             client is None
             or client is self._CLIENT_FAILED
@@ -298,100 +248,48 @@ class FamiliaContextExtension:
         ):
             return ""
         try:
-            from familia.acl import principal_memory
             from familia.principals import get_registry
         except ImportError:
             return ""
 
-        if relation not in {"peer", "family"}:
-            return ""
-
         try:
             registry = get_registry()
+            principal_ids = sorted(registry.ids)
         except Exception:  # noqa: BLE001
             return ""
 
-        family_graph, topics_graph = graphs
         sections: list[str] = []
-        for pid in registry.ids:
+        for pid in principal_ids:
             if pid == actor:
                 continue
-            raw = client.get_other(pid, suffix, graphs=graphs)
-            if not raw or not raw.strip():
-                continue
             try:
-                entries = json.loads(raw)
-            except ValueError:
+                names = client.project_other_memory_names(
+                    pid,
+                    graphs=graphs,
+                    limit=self._PEER_INDEX_MAX_KEYS_PER_PEER,
+                )
+                peer_principal = registry.get(pid)
+            except Exception:  # noqa: BLE001
+                return ""
+            if not names:
                 continue
-            if not isinstance(entries, list):
-                continue
-            filtered: list[str] = []
-            for entry in reversed(entries):
-                # Newest first; accept both legacy bare-string entries and
-                # current dict entries with explicit record tags.
-                if isinstance(entry, str) and entry:
-                    name = entry
-                    rec_tags: tuple[str, ...] = ()
-                elif isinstance(entry, dict):
-                    name = entry.get("name")
-                    if not isinstance(name, str) or not name:
-                        continue
-                    rec_tags = tuple(
-                        tag
-                        for tag in (entry.get("tags") or [])
-                        if isinstance(tag, str) and tag
-                    )
-                else:
-                    continue
-                try:
-                    decision = principal_memory.decide_memory_read(
-                        reader=actor,
-                        owner=pid,
-                        scope=scope_label,
-                        key=name,
-                        tags=rec_tags,
-                        family_graph=family_graph,
-                        topics_graph=topics_graph,
-                        static_policy=(
-                            principal_memory._NO_MATCHING_STATIC_POLICY
-                        ),
-                    )
-                except Exception:  # noqa: BLE001
-                    continue
-                if decision.allowed:
-                    filtered.append(name)
-            if not filtered:
-                continue
-            filtered = filtered[: self._PEER_INDEX_MAX_KEYS_PER_PEER]
-            peer_principal = registry.get(pid)
             display = (
                 peer_principal.display_name
                 if peer_principal and peer_principal.display_name
                 else pid
             )
-            bullets = "\n".join(f"- {name}" for name in filtered)
+            bullets = "\n".join(f"- {name}" for name in names)
             sections.append(f"## {pid} ({display})\n{bullets}")
 
         if not sections:
             return ""
 
-        if scope_label == "shared":
-            intro = (
-                "Custom ``shared:`` keys written by other family "
-                "members. Read with ``memory_get`` "
-                "``scope='shared'`` and the bare key name. Tag-ACL "
-                "still gates per-record visibility — a listed key may "
-                "return empty if the per-record tags exclude you."
-            )
-        else:
-            intro = (
-                "Custom ``private:`` keys of your peers. Read with "
-                "``memory_get(scope='private', actor='<their_id>', "
-                "key='<name>')``. Each listed name passed the same "
-                "canonical memory-read decision as the value itself."
-            )
-
-        return f"# {heading}\n\n{intro}\n\n" + "\n\n".join(sections)
+        intro = (
+            "Authorized atomic memory names from other principals. Read one "
+            "with ``memory_get(scope='private', actor='<their_id>', "
+            "key='<memory:name>')``. Values and raw catalogs are not projected."
+        )
+        return "# Family memory facts\n\n" + intro + "\n\n" + "\n\n".join(sections)
 
     def _build_peer_user_block(
         self,

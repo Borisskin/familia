@@ -1280,14 +1280,48 @@ class AgentLoop:
         """
         await self._connect_mcp()
         direct_actor_resolver = getattr(self, "_direct_actor_resolver", None)
-        if actor is None and direct_actor_resolver is not None:
+        metadata: dict[str, Any] = {}
+        if channel in {"telegram", "vk"}:
             # Direct cron/heartbeat paths bypass channel enrichment, so the
-            # optional adapter resolves an actor before ContextVars are pinned.
+            # trusted adapter must prove the private recipient before the loop
+            # may persist or archive anything for a server channel.
+            resolved_actor = (
+                direct_actor_resolver(channel, chat_id)
+                if direct_actor_resolver is not None
+                else None
+            )
+            trusted_actor = (
+                resolved_actor
+                if isinstance(resolved_actor, str) and resolved_actor
+                else None
+            )
+            if actor is not None and actor != trusted_actor:
+                raise ValueError(
+                    "explicit actor does not match trusted direct actor"
+                )
+            actor = trusted_actor
+            if actor is not None:
+                private_mode_proof = (
+                    {
+                        "private_mode": True,
+                        "is_group": False,
+                        "topic_id": None,
+                    }
+                    if channel == "telegram"
+                    else {
+                        "private_mode": True,
+                        "peer_id": chat_id,
+                        "from_id": chat_id,
+                    }
+                )
+                metadata["private_mode_proof"] = private_mode_proof
+        elif actor is None and direct_actor_resolver is not None:
             actor = direct_actor_resolver(channel, chat_id)
         msg = InboundMessage(
             channel=channel, sender_id=actor or "user", chat_id=chat_id,
             content=content, media=media or [],
             actor=actor,
+            metadata=metadata,
         )
         return await self._process_message(
             msg,

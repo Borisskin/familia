@@ -32,6 +32,7 @@ from familia.acl import codec, schema as acl_schema
 from familia.acl.graph_io import resolve_admin_key
 from familia.acl.principal_memory import (
     _NO_MATCHING_STATIC_POLICY,
+    _decode_atomic_memory_catalog,
     canonical_memory_tags,
     decide_memory_read,
     is_valid_atomic_memory_key,
@@ -479,28 +480,6 @@ def _trusted_read_value(response: Any) -> tuple[str, Any]:
     return "ok", value
 
 
-def _trusted_catalog_tags(value: Any, key: str) -> tuple[str, ...] | None:
-    """Return one exact catalog entry as a canonical tag set."""
-    try:
-        if isinstance(value, str):
-            value = json.loads(value)
-        if not isinstance(value, list):
-            return None
-        matches: list[tuple[str, ...]] = []
-        for entry in value:
-            if not isinstance(entry, dict) or entry.get("name") != key:
-                continue
-            tags = canonical_memory_tags(entry.get("tags"))
-            if tags is None:
-                return None
-            matches.append(tags)
-        if len(matches) != 1:
-            return None
-        return matches[0]
-    except Exception:  # noqa: BLE001
-        return None
-
-
 @tool_parameters(
     tool_parameters_schema(
         scope=StringSchema(SCOPE_DESC),
@@ -717,9 +696,17 @@ class MemoryGetTool(Tool):
                     return unavailable
                 if catalog_state != "ok" or catalog_value is None:
                     return denied
-                catalog_tags = _trusted_catalog_tags(catalog_value, key)
-                if catalog_tags is None:
+                catalog = _decode_atomic_memory_catalog(catalog_value)
+                if catalog is None:
                     return denied
+                matching_tags = [
+                    tags
+                    for name, tags in catalog
+                    if name == key
+                ]
+                if len(matching_tags) != 1:
+                    return denied
+                catalog_tags = matching_tags[0]
                 r = await client.get(
                     f"{base_url}/get",
                     headers={"x-api-key": proxy_key},

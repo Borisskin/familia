@@ -10,9 +10,9 @@ Two flavours of access:
 * :py:meth:`get` / :py:meth:`set` — own data, namespace is fixed to
   ``private:<self.principal_id>:``.
 
-* :py:meth:`get_other` — read a peer's namespace (e.g. spouse's
-  USER profile) **after** a synthetic policy-check. Never used to
-  write — cross-principal writes from chat are policy-denied through
+* :py:meth:`get_other` — read a peer's atomic fact only after an exact
+  trusted-catalog match and the canonical memory decision. Never used
+  to write — cross-principal writes from chat are policy-denied through
   the regular memory tools.
 
 This is the single point that ContextBuilder uses to assemble per-turn
@@ -23,9 +23,10 @@ a fallback path in ContextBuilder.
 
 from __future__ import annotations
 
+import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-import re
 from typing import Any
 
 from loguru import logger
@@ -56,6 +57,7 @@ _ORDINARY_VALUE_KEYS = frozenset(
 _FACT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _PRINCIPAL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _NO_MATCHING_STATIC_POLICY = "no_matching_rule"
+_ATOMIC_MEMORY_CATALOG_MAX_ENTRIES = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +92,45 @@ def canonical_memory_tags(tags: object) -> tuple[str, ...] | None:
         seen.add(tag)
         canonical.append(tag)
     return tuple(sorted(canonical))
+
+
+def _decode_atomic_memory_catalog(
+    raw: Any,
+) -> tuple[tuple[str, tuple[str, ...]], ...] | None:
+    """Decode one fail-closed catalog without accepting legacy entries."""
+    text = _coerce_to_str(raw)
+    if text is None:
+        return ()
+    try:
+        wrapped = codec.decode(text)
+        encoded = wrapped.value if wrapped is not None else text
+        if not isinstance(encoded, str):
+            return None
+        decoded = json.loads(encoded)
+    except Exception:  # noqa: BLE001
+        return None
+    if (
+        not isinstance(decoded, list)
+        or len(decoded) > _ATOMIC_MEMORY_CATALOG_MAX_ENTRIES
+    ):
+        return None
+
+    entries: list[tuple[str, tuple[str, ...]]] = []
+    seen: set[str] = set()
+    for entry in decoded:
+        if not isinstance(entry, dict) or set(entry) != {"name", "tags"}:
+            return None
+        name = entry["name"]
+        tags = canonical_memory_tags(entry["tags"])
+        if (
+            not is_valid_atomic_memory_key(name)
+            or tags is None
+            or name in seen
+        ):
+            return None
+        seen.add(name)
+        entries.append((name, tags))
+    return tuple(entries)
 
 
 def decide_memory_read(
@@ -405,35 +446,64 @@ class PrincipalMemoryClient:
             return None
         return family_graph, topics_graph
 
-    def get_other(
+    def _load_other_memory_catalog(
+        self,
+        other_id: str,
+    ) -> tuple[tuple[str, tuple[str, ...]], ...] | None:
+        """Read one foreign private catalog with the administrative key."""
+        try:
+            proxy_key = graph_io.resolve_admin_key()
+            if not isinstance(proxy_key, str) or not proxy_key:
+                return None
+            raw = get_raw(
+                self._other_key(other_id, "value:private_index"),
+                api_key=proxy_key,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "principal_memory catalog read failed for {}: {}",
+                other_id,
+                exc,
+            )
+            return None
+        return _decode_atomic_memory_catalog(raw)
+
+    def _read_other_memory_entry(
         self,
         other_id: str,
         suffix: str,
+        catalog_tags: tuple[str, ...],
         *,
-        graphs: tuple[dict[str, Any], dict[str, Any]] | None = None,
+        graphs: tuple[dict[str, Any], dict[str, Any]],
     ) -> str | None:
-        """Read another principal through the canonical memory-read decision."""
-        if other_id == self.principal_id:
-            return self.get(suffix)
+        """Read one fact whose exact catalog entry is already validated."""
+        if other_id == self.principal_id or not is_valid_atomic_memory_key(suffix):
+            return None
         full_key = self._other_key(other_id, suffix)
         try:
             proxy_key = graph_io.resolve_admin_key()
+            if not isinstance(proxy_key, str) or not proxy_key:
+                return None
             raw = get_raw(full_key, api_key=proxy_key)
         except Exception as exc:  # noqa: BLE001
             logger.warning("principal_memory.get_other({}): {}", other_id, exc)
             return None
-        if graphs is None:
-            graphs = self._load_graph_snapshot()
-        if graphs is None:
-            return None
-        family_graph, topics_graph = graphs
         text = _coerce_to_str(raw)
         if text is None:
             return None
-        wrapped = codec.decode(text)
-        tags = tuple(wrapped.tags) if wrapped is not None else ()
-        value = wrapped.value if wrapped is not None else text
         try:
+            family_graph, topics_graph = graphs
+            wrapped = codec.decode(text)
+            if wrapped is not None:
+                tags = canonical_memory_tags(wrapped.tags)
+                if tags is None or not isinstance(wrapped.value, str):
+                    return None
+                value = wrapped.value
+            else:
+                tags = ()
+                value = text
+            if tags != catalog_tags:
+                return None
             decision = decide_memory_read(
                 reader=self.principal_id,
                 owner=other_id,
@@ -444,6 +514,13 @@ class PrincipalMemoryClient:
                 topics_graph=topics_graph,
                 static_policy=_NO_MATCHING_STATIC_POLICY,
             )
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "principal_memory.get_other({}) invalid snapshot: {}",
+                other_id,
+                exc,
+            )
+            return None
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "principal_memory.get_other({}) decision failed: {}",
@@ -451,7 +528,105 @@ class PrincipalMemoryClient:
                 exc,
             )
             return None
-        return value if decision.allowed else None
+        return value if decision.allowed is True else None
+
+    def project_other_memory_names(
+        self,
+        other_id: str,
+        *,
+        graphs: tuple[dict[str, Any], dict[str, Any]] | None = None,
+        limit: int = 40,
+    ) -> tuple[str, ...]:
+        """Return newest authorized foreign atomic names, never their values."""
+        if (
+            other_id == self.principal_id
+            or not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or limit <= 0
+        ):
+            return ()
+        limit = min(limit, 40)
+        if graphs is None:
+            graphs = self._load_graph_snapshot()
+        if graphs is None:
+            return ()
+        try:
+            family_graph, topics_graph = graphs
+        except Exception:  # noqa: BLE001
+            return ()
+        catalog = self._load_other_memory_catalog(other_id)
+        if catalog is None:
+            return ()
+
+        allowed_names: list[str] = []
+        for name, tags in reversed(catalog):
+            if not tags:
+                continue
+            try:
+                preliminary = decide_memory_read(
+                    reader=self.principal_id,
+                    owner=other_id,
+                    scope="private",
+                    key=name,
+                    tags=tags,
+                    family_graph=family_graph,
+                    topics_graph=topics_graph,
+                    static_policy=_NO_MATCHING_STATIC_POLICY,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "principal_memory catalog projection failed for {}: {}",
+                    other_id,
+                    exc,
+                )
+                return ()
+            if preliminary.allowed is not True:
+                continue
+            value = self._read_other_memory_entry(
+                other_id,
+                name,
+                tags,
+                graphs=graphs,
+            )
+            if value is None:
+                continue
+            allowed_names.append(name)
+            if len(allowed_names) == limit:
+                break
+        return tuple(allowed_names)
+
+    def get_other(
+        self,
+        other_id: str,
+        suffix: str,
+        *,
+        graphs: tuple[dict[str, Any], dict[str, Any]] | None = None,
+    ) -> str | None:
+        """Read another principal through the canonical memory-read decision."""
+        if other_id == self.principal_id:
+            return self.get(suffix)
+        if not is_valid_atomic_memory_key(suffix):
+            return None
+        catalog = self._load_other_memory_catalog(other_id)
+        if catalog is None:
+            return None
+        matching_tags = [
+            tags
+            for name, tags in catalog
+            if name == suffix
+        ]
+        if len(matching_tags) != 1:
+            return None
+        if graphs is None:
+            graphs = self._load_graph_snapshot()
+        if graphs is None:
+            return None
+        return self._read_other_memory_entry(
+            other_id,
+            suffix,
+            matching_tags[0],
+            graphs=graphs,
+        )
 
 
 def _coerce_to_str(raw: Any) -> str | None:
@@ -464,8 +639,7 @@ def _coerce_to_str(raw: Any) -> str | None:
         return None
     if isinstance(raw, str):
         return raw
-    import json as _json
     try:
-        return _json.dumps(raw, ensure_ascii=False)
+        return json.dumps(raw, ensure_ascii=False)
     except Exception:  # noqa: BLE001
         return str(raw)
