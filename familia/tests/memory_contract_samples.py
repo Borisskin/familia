@@ -164,6 +164,9 @@ EXPECTED_MEMORY_READ_DECISIONS: tuple[dict[str, Any], ...] = (
         "relation_direction": "forward",
         "allowed": True,
         "reason": "family_common_topic",
+        "catalog": [
+            {"name": "memory:fact_spouse", "tags": ["topic_shared"]},
+        ],
         "visibility": {"memory_get": True, "history": True, "index": True},
     },
     {
@@ -176,9 +179,9 @@ EXPECTED_MEMORY_READ_DECISIONS: tuple[dict[str, Any], ...] = (
         "static_policy": "no_matching_rule",
         "relation": "parent_of",
         "relation_direction": "forward",
-        "allowed": True,
-        "reason": "family_common_topic",
-        "visibility": {"memory_get": True, "history": True, "index": True},
+        "allowed": False,
+        "reason": None,
+        "visibility": {"memory_get": False, "history": False, "index": False},
     },
     {
         "case": "parent_reverse_common_topic",
@@ -260,9 +263,9 @@ EXPECTED_MEMORY_READ_DECISIONS: tuple[dict[str, Any], ...] = (
         "static_policy": "deny",
         "relation": "spouse_of",
         "relation_direction": "reverse",
-        "allowed": True,
-        "reason": "family_legacy_untagged",
-        "visibility": {"memory_get": True, "history": True, "index": True},
+        "allowed": False,
+        "reason": None,
+        "visibility": {"memory_get": False, "history": False, "index": False},
     },
     {
         "case": "same_topic_without_family_relation",
@@ -330,9 +333,9 @@ EXPECTED_MEMORY_READ_DECISIONS: tuple[dict[str, Any], ...] = (
         "static_policy": "no_matching_rule",
         "relation": None,
         "relation_direction": "none",
-        "allowed": True,
-        "reason": "pair_member",
-        "visibility": {"memory_get": True, "history": True, "index": True},
+        "allowed": False,
+        "reason": None,
+        "visibility": {"memory_get": False, "history": False, "index": False},
     },
     {
         "case": "pair_non_member",
@@ -358,9 +361,9 @@ EXPECTED_MEMORY_READ_DECISIONS: tuple[dict[str, Any], ...] = (
         "static_policy": "no_matching_rule",
         "relation": "spouse_of",
         "relation_direction": "reverse",
-        "allowed": True,
-        "reason": "shared_family_relation",
-        "visibility": {"memory_get": True, "history": True, "index": True},
+        "allowed": False,
+        "reason": None,
+        "visibility": {"memory_get": False, "history": False, "index": False},
     },
 )
 

@@ -12,6 +12,7 @@
     "pair_codec",
     "failure_rules",
     "storage",
+    "recall",
     "write_routing",
     "updates",
     "consolidation",
@@ -101,7 +102,8 @@
         "legacy_combined_key",
         "legacy_combined_role",
         "pending_migration_key",
-        "fact_topics"
+        "fact_topics",
+        "private_catalog"
       ],
       "properties": {
         "profile_key": {
@@ -124,6 +126,87 @@
             "assigned_by": "server",
             "homogeneous_reader_set": true
           }
+        },
+        "private_catalog": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "key",
+            "entry",
+            "max_entries",
+            "overflow",
+            "update",
+            "delete"
+          ],
+          "properties": {
+            "key": {
+              "const": "private:<principal>:value:private_index"
+            },
+            "entry": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "tags"
+              ],
+              "properties": {
+                "name": {
+                  "const": "memory:<fact_id>"
+                },
+                "tags": {
+                  "const": "server_topic_tags"
+                }
+              }
+            },
+            "max_entries": {
+              "const": 256
+            },
+            "overflow": {
+              "const": "catalog_full_without_eviction"
+            },
+            "update": {
+              "const": "atomic_with_fact"
+            },
+            "delete": {
+              "const": "atomic_with_fact"
+            }
+          }
+        }
+      }
+    },
+    "recall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "own_catalog",
+        "foreign_projection",
+        "foreign_value_projection",
+        "foreign_catalog_projection",
+        "foreign_profile_projection",
+        "max_names_per_owner",
+        "legacy_history_fact_id"
+      ],
+      "properties": {
+        "own_catalog": {
+          "const": "trusted_private_catalog"
+        },
+        "foreign_projection": {
+          "const": "authorized_fact_names_only"
+        },
+        "foreign_value_projection": {
+          "const": false
+        },
+        "foreign_catalog_projection": {
+          "const": false
+        },
+        "foreign_profile_projection": {
+          "const": false
+        },
+        "max_names_per_owner": {
+          "const": 40
+        },
+        "legacy_history_fact_id": {
+          "const": "legacy-history"
         }
       }
     },
@@ -283,7 +366,8 @@
       "additionalProperties": false,
       "required": [
         "legacy_row",
-        "migration_command"
+        "migration_command",
+        "memory_mutation"
       ],
       "properties": {
         "legacy_row": {
@@ -291,6 +375,139 @@
         },
         "migration_command": {
           "type": "object"
+        },
+        "memory_mutation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "committed",
+            "catalog_full",
+            "deleted",
+            "absent",
+            "conflict"
+          ],
+          "properties": {
+            "committed": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "committed",
+                "updated",
+                "retryable",
+                "version"
+              ],
+              "properties": {
+                "committed": {
+                  "const": true
+                },
+                "updated": {
+                  "const": true
+                },
+                "retryable": {
+                  "const": false
+                },
+                "version": {
+                  "const": "new_number"
+                }
+              }
+            },
+            "catalog_full": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "committed",
+                "updated",
+                "retryable",
+                "version"
+              ],
+              "properties": {
+                "committed": {
+                  "const": false
+                },
+                "updated": {
+                  "const": false
+                },
+                "retryable": {
+                  "const": false
+                },
+                "version": {
+                  "const": "current_number_or_null"
+                }
+              }
+            },
+            "deleted": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "committed",
+                "updated",
+                "retryable",
+                "version"
+              ],
+              "properties": {
+                "committed": {
+                  "const": true
+                },
+                "updated": {
+                  "const": true
+                },
+                "retryable": {
+                  "const": false
+                },
+                "version": {
+                  "const": "previous_number_or_null"
+                }
+              }
+            },
+            "absent": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "committed",
+                "updated",
+                "retryable",
+                "version"
+              ],
+              "properties": {
+                "committed": {
+                  "const": true
+                },
+                "updated": {
+                  "const": false
+                },
+                "retryable": {
+                  "const": false
+                },
+                "version": {
+                  "const": null
+                }
+              }
+            },
+            "conflict": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "committed",
+                "updated",
+                "retryable",
+                "version"
+              ],
+              "properties": {
+                "committed": {
+                  "const": false
+                },
+                "updated": {
+                  "const": false
+                },
+                "retryable": {
+                  "const": true
+                },
+                "version": {
+                  "const": "current_number_or_null"
+                }
+              }
+            }
+          }
         }
       }
     },

@@ -10,11 +10,156 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import pytest
+
 from memory_contract_samples import (
     EXPECTED_MEMORY_READ_DECISIONS,
     synthetic_source_digest,
     write_synthetic_snapshot,
 )
+
+
+@pytest.mark.asyncio
+async def test_real_legacy_row_reaches_catalog_and_fresh_owner_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from test_memory_recall_end_to_end import _MemxTransport
+    from test_memory_index_consistency import InProcessRedis
+
+    import main as memx_main
+    import store
+    import validate_api
+
+    from familia import principals as principals_mod
+    from familia.acl import graph_io, principal_memory
+    from familia.memory_migration import (
+        apply_legacy_transition_plan,
+        build_legacy_transition_plan,
+    )
+    from familia.nanobot_extension.context import FamiliaContextExtension
+    from familia.principal_memory_ingestor import PrincipalMemoryIngestor
+    from familia.principals import Principal, PrincipalRegistry
+
+    workspace = tmp_path / "workspace"
+    memory_dir = workspace / "memory"
+    memory_dir.mkdir(parents=True)
+    (workspace / "SOUL.md").write_text("soul", encoding="utf-8")
+    (workspace / "USER.md").write_text("retired user", encoding="utf-8")
+    (workspace / "MEMORY.md").write_text("retired memory", encoding="utf-8")
+    (memory_dir / "MEMORY.md").write_text(
+        "retired nested memory",
+        encoding="utf-8",
+    )
+    history_row = {
+        "schema_version": 1,
+        "cursor": 1,
+        "timestamp": "2026-07-27 12:00",
+        "actor": "owner",
+        "content": "legacy row content",
+        "provenance": {
+            "source": "migration-e2e",
+            "idempotency_key": "legacy-row-1",
+        },
+    }
+    (memory_dir / "history.jsonl").write_text(
+        json.dumps(history_row, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    backend = InProcessRedis()
+    monkeypatch.setattr(store, "_redis", backend)
+    monkeypatch.setattr(validate_api, "supabase", None)
+    monkeypatch.setitem(
+        validate_api.LOCAL_ACL,
+        "automatic-writer-key",
+        ["private:*"],
+    )
+    monkeypatch.setattr(memx_main, "validate_schema", lambda *_args: None)
+
+    async def publish(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(memx_main, "publish", publish)
+    monkeypatch.setattr(
+        principals_mod,
+        "_registry",
+        PrincipalRegistry(
+            [
+                Principal(
+                    id="owner",
+                    display_name="Owner",
+                    memx_key="owner-key",
+                )
+            ]
+        ),
+    )
+
+    def raw_value(key: str, **_kwargs):
+        record = store.get_value(key)
+        return None if record is None else record["value"]
+
+    def graph_value(key: str, **_kwargs):
+        raw = raw_value(key)
+        return json.loads(raw) if isinstance(raw, str) else raw
+
+    monkeypatch.setattr(graph_io, "get_raw", raw_value)
+    monkeypatch.setattr(principal_memory, "get_raw", raw_value)
+    monkeypatch.setattr(graph_io, "load_graph_value", graph_value)
+    monkeypatch.setattr(graph_io, "resolve_admin_key", lambda: "internal-admin")
+
+    transport = _MemxTransport(memx_main, api_key="automatic-writer-key")
+    monkeypatch.setattr(
+        "familia.principal_memory_ingestor.httpx.AsyncClient",
+        lambda **_kwargs: transport,
+    )
+    ingestor = PrincipalMemoryIngestor(
+        base_url="http://memx.test",
+        api_key="automatic-writer-key",
+    )
+    plan = build_legacy_transition_plan(
+        workspace=workspace,
+        known_actors={"owner"},
+    )
+
+    async def consolidate_history(
+        actor: str,
+        records: list[dict[str, object]],
+        existing_memory: str,
+    ) -> str:
+        assert actor == "owner"
+        assert [record["cursor"] for record in records] == [1]
+        assert existing_memory == ""
+        return "MIGRATED_LEGACY_HISTORY_VALUE"
+
+    report = await apply_legacy_transition_plan(
+        plan=plan,
+        workspace=workspace,
+        get_value=raw_value,
+        ingestor=ingestor,
+        consolidate_history=consolidate_history,
+    )
+
+    assert report["status"] == "complete"
+    assert report["written_keys"] == [
+        "private:owner:memory:legacy-history",
+    ]
+    fact_record = store.get_value("private:owner:memory:legacy-history")
+    assert fact_record is not None
+    assert fact_record["value"] == "MIGRATED_LEGACY_HISTORY_VALUE"
+    catalog_record = store.get_value("private:owner:value:private_index")
+    assert catalog_record is not None
+    assert json.loads(catalog_record["value"]) == [
+        {"name": "memory:legacy-history", "tags": []},
+    ]
+
+    fresh_prompt = "\n\n".join(
+        FamiliaContextExtension(workspace).build_sections(
+            actor="owner",
+            channel="test",
+        )
+    )
+    assert "memory:legacy-history" in fresh_prompt
 
 
 @dataclass
@@ -955,7 +1100,9 @@ class SyntheticSnapshotMemoryContractBarrier(unittest.TestCase):
                 "index": decision.allowed,
             }
             assert decision.allowed is row["allowed"]
-            assert decision.reason == row["reason"]
+            assert isinstance(decision.reason, str) and decision.reason
+            if row["reason"] is not None:
+                assert decision.reason == row["reason"]
             assert actual_visibility == row["visibility"]
             decision_cases.append(row["case"])
 

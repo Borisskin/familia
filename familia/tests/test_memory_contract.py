@@ -234,6 +234,60 @@ def test_contract_records_simple_private_write_and_consolidation_rules() -> None
     }
 
 
+def test_contract_records_catalog_recall_and_exact_mutation_outcomes() -> None:
+    contract = _canonical_contract()
+
+    assert contract["storage"]["private_catalog"] == {
+        "key": "private:<principal>:value:private_index",
+        "entry": {"name": "memory:<fact_id>", "tags": "server_topic_tags"},
+        "max_entries": 256,
+        "overflow": "catalog_full_without_eviction",
+        "update": "atomic_with_fact",
+        "delete": "atomic_with_fact",
+    }
+    assert contract["recall"] == {
+        "own_catalog": "trusted_private_catalog",
+        "foreign_projection": "authorized_fact_names_only",
+        "foreign_value_projection": False,
+        "foreign_catalog_projection": False,
+        "foreign_profile_projection": False,
+        "max_names_per_owner": 40,
+        "legacy_history_fact_id": "legacy-history",
+    }
+    assert contract["outcomes"]["memory_mutation"] == {
+        "committed": {
+            "committed": True,
+            "updated": True,
+            "retryable": False,
+            "version": "new_number",
+        },
+        "catalog_full": {
+            "committed": False,
+            "updated": False,
+            "retryable": False,
+            "version": "current_number_or_null",
+        },
+        "deleted": {
+            "committed": True,
+            "updated": True,
+            "retryable": False,
+            "version": "previous_number_or_null",
+        },
+        "absent": {
+            "committed": True,
+            "updated": False,
+            "retryable": False,
+            "version": None,
+        },
+        "conflict": {
+            "committed": False,
+            "updated": False,
+            "retryable": True,
+            "version": "current_number_or_null",
+        },
+    }
+
+
 def test_contract_records_registry_access_unknown_flat_file_and_soul_rules() -> None:
     contract = _canonical_contract()
 
@@ -246,12 +300,17 @@ def test_contract_records_registry_access_unknown_flat_file_and_soul_rules() -> 
     assert set(access["family_relation_kinds"]) == FAMILY_RELATIONS
     assert access["family_relation_direction_matters"] is False
     assert access["common_topic_requires_family_relation"] is True
-    assert access["common_topic_ordinary_memory_overrides"] == [
-        "secret",
-        "explicit_deny",
-        "no_matching_static_rule",
+    assert "common_topic_ordinary_memory_overrides" not in access
+    assert access["legacy_untagged_memory_available_to_family"] is False
+    assert access["pair_scope"] == "deny"
+    assert access["shared_scope"] == "deny"
+    assert access["service_keys_owner_only"] is True
+    assert access["secret_records_owner_only"] is True
+    assert access["foreign_atomic_fact_requires"] == [
+        "trusted_catalog_match",
+        "direct_family_relation",
+        "verified_common_topic",
     ]
-    assert access["legacy_untagged_memory_available_to_family"] is True
     assert "transaction_candidate_internal_only" not in access
 
     assert contract["unknown_content"] == {
@@ -287,10 +346,10 @@ def test_contract_records_registry_access_unknown_flat_file_and_soul_rules() -> 
     ]
 
 
-def test_contract_keeps_only_migration_outcomes() -> None:
+def test_contract_keeps_exact_migration_and_memory_mutation_outcomes() -> None:
     outcomes = _canonical_contract()["outcomes"]
 
-    assert set(outcomes) == {"legacy_row", "migration_command"}
+    assert set(outcomes) == {"legacy_row", "migration_command", "memory_mutation"}
     assert outcomes["legacy_row"] == {
         "values": [
             "imported",
@@ -793,8 +852,12 @@ def test_shared_expected_decision_table_covers_next_task_matrix() -> None:
         assert graph_edge in graph_edges
         assert {row["reader"], row["owner"]} <= shared_topic_members
         assert "topic_shared" in row["tags"]
-        assert row["allowed"] is True
-        assert row["reason"] == "family_common_topic"
+        if case == "parent_forward_common_topic_secret":
+            assert row["allowed"] is False
+            assert row["reason"] is None
+        else:
+            assert row["allowed"] is True
+            assert row["reason"] == "family_common_topic"
 
     explicit_deny = rows_by_case["spouse_forward_common_topic_explicit_deny"]
     assert explicit_deny["static_policy"] == "deny"
@@ -802,7 +865,12 @@ def test_shared_expected_decision_table_covers_next_task_matrix() -> None:
 
     secret = rows_by_case["parent_forward_common_topic_secret"]
     assert "secret" in secret["tags"]
-    assert secret["allowed"] is True
+    assert secret["allowed"] is False
+
+    catalog_grant = rows_by_case["spouse_forward_common_topic_explicit_deny"]
+    assert catalog_grant["catalog"] == [
+        {"name": catalog_grant["key"], "tags": catalog_grant["tags"]},
+    ]
 
     candidate = rows_by_case["transaction_candidate_hidden_from_related_reader"]
     assert candidate["reader"] != candidate["owner"]
