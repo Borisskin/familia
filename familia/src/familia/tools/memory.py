@@ -336,20 +336,19 @@ def _resolve_full_key(
 ) -> tuple[str | None, str | None]:
     """Return (full_key, error).  Full key is None when input is invalid.
 
-    ``target_actor`` allows cross-principal reads of ``private:`` scope:
-    when set and different from ``actor_id``, the key resolves to
-    ``private:<target_actor>:<key>``. Permission to actually read is
-    enforced downstream (is_peer check + secret-tag filter in
-    MemoryGetTool.execute). ``target_actor`` is rejected for non-private
-    scopes — ``shared:`` is global, ``pair:`` already names the other
-    principal via scope syntax.
+    ``target_actor`` selects another principal only for ``private:`` scope.
+    The public ``MemoryGetTool`` permits that read only for an exact
+    ``memory:<fact_id>`` after a matching catalog entry and tags, a direct
+    family relation, and a confirmed common topic. Service slots remain
+    owner-only. ``shared`` and ``pair`` are not readable through that tool.
 
-    For ``pair:`` scope we accept two forms:
+    For internal key normalization, ``pair:`` accepts two forms:
       * ``pair:<other_id>`` — documented form, just the other principal.
       * ``pair:<a>_<b>`` — already-canonical form (sorted pair). LLMs
         frequently pass this back after seeing it in stored values, and
         previously the tool re-sorted ``[actor, "<a>_<b>"]`` producing a
         bogus ``pair:<a>_<b>_<actor>:<key>`` that always failed policy.
+    ``MemoryGetTool`` rejects both forms before policy or storage access.
     """
     if not key:
         return None, "Error: 'key' is required"
@@ -362,11 +361,10 @@ def _resolve_full_key(
         owner = (target_actor or actor_id).strip()
         if not owner:
             return None, "Error: 'actor' must be a non-empty principal id"
-        # All private:<owner>:<key> reads flow through the same gate
-        # (is_peer + secret-tag). Reserved value:* slots (user_profile,
-        # memory, heartbeat, *_index) are no longer special-cased — a
-        # peer can read them by default; the owner narrows specific
-        # records back to themselves with the ``secret`` tag.
+        # This only constructs the key; it does not grant access. Cross-owner
+        # reads require an exact memory:<fact_id>, catalog/tag agreement, a
+        # direct family relation, and a common topic. Service slots are
+        # owner-only.
         return f"private:{owner}:{key}", None
     if scope.startswith("pair:"):
         if target_actor and target_actor != actor_id:
