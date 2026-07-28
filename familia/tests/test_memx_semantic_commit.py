@@ -175,10 +175,10 @@ def test_delete_endpoint_checks_acl_and_publishes_actual_deletion(
     import store
 
     request = SimpleNamespace(
-        state=SimpleNamespace(namespaced_key="tenant:private:alice:memory:employment"),
+        state=SimpleNamespace(namespaced_key="tenant:private:alice:value:heartbeat"),
         json=AsyncMock(
             return_value={
-                "key": "private:alice:memory:employment",
+                "key": "private:alice:value:heartbeat",
                 "expected_ts": 41.0,
             }
         ),
@@ -202,18 +202,18 @@ def test_delete_endpoint_checks_acl_and_publishes_actual_deletion(
 
     validate.assert_awaited_once_with(
         request,
-        "private:alice:memory:employment",
+        "private:alice:value:heartbeat",
         action="write",
     )
     delete_value.assert_called_once_with(
-        "tenant:private:alice:memory:employment",
+        "tenant:private:alice:value:heartbeat",
         expected_ts=41.0,
     )
     publish.assert_awaited_once_with(
-        "tenant:private:alice:memory:employment",
+        "tenant:private:alice:value:heartbeat",
         {
             "event": "delete",
-            "key": "tenant:private:alice:memory:employment",
+            "key": "tenant:private:alice:value:heartbeat",
         },
         event="value",
     )
@@ -234,10 +234,10 @@ def test_delete_endpoint_does_not_publish_missing_repeat(
     import store
 
     request = SimpleNamespace(
-        state=SimpleNamespace(namespaced_key="tenant:private:alice:memory:missing"),
+        state=SimpleNamespace(namespaced_key="tenant:private:alice:value:heartbeat"),
         json=AsyncMock(
             return_value={
-                "key": "private:alice:memory:missing",
+                "key": "private:alice:value:heartbeat",
                 "expected_ts": None,
             }
         ),
@@ -285,7 +285,44 @@ def test_corrupt_value_is_observable_not_absent(monkeypatch: pytest.MonkeyPatch)
         store.get_value("private:alice:value:memory")
 
 
-def test_sdk_exposes_updated_false_as_retryable_semantic_result(
+@pytest.mark.parametrize(
+    ("status", "committed", "updated", "retryable", "version"),
+    (
+        ("committed", True, True, False, 12.0),
+        ("catalog_full", False, False, False, None),
+        ("deleted", True, True, False, None),
+        ("absent", True, False, False, None),
+        ("conflict", False, False, True, 11.0),
+    ),
+)
+def test_store_exposes_exact_five_outcome_machine_table(
+    status: str,
+    committed: bool,
+    updated: bool,
+    retryable: bool,
+    version: float | None,
+) -> None:
+    from store import MutationResult
+
+    payload = MutationResult(
+        status=status,
+        committed=committed,
+        updated=updated,
+        retryable=retryable,
+        version=version,
+    ).as_payload()
+
+    assert payload == {
+        "ok": True,
+        "status": status,
+        "committed": committed,
+        "updated": updated,
+        "retryable": retryable,
+        "version": version,
+    }
+
+
+def test_sdk_exposes_conflict_as_retryable_semantic_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from memx_sdk import client as sdk
@@ -301,7 +338,7 @@ def test_sdk_exposes_updated_false_as_retryable_semantic_result(
             return {
                 "ok": True,
                 "updated": False,
-                "status": "not_updated",
+                "status": "conflict",
                 "committed": False,
                 "retryable": True,
             }
@@ -309,7 +346,7 @@ def test_sdk_exposes_updated_false_as_retryable_semantic_result(
     monkeypatch.setattr(sdk.httpx, "post", lambda *_args, **_kwargs: Response())
     result = sdk.memxContext("key", "http://memx.invalid").set("k", "v")
     assert isinstance(result, result_type)
-    assert result.status == "not_updated"
+    assert result.status == "conflict"
     assert result.committed is False
     assert result.retryable is True
 

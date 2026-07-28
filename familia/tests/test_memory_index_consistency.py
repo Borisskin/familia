@@ -61,7 +61,7 @@ class InProcessPipeline:
     def __init__(self, backend: InProcessRedis) -> None:
         self.backend = backend
         self.watched: dict[str, int] = {}
-        self.pending: list[tuple[str, str]] = []
+        self.pending: list[tuple[str, str, str | None]] = []
 
     def __enter__(self):
         return self
@@ -80,14 +80,21 @@ class InProcessPipeline:
         return None
 
     def set(self, key: str, value: str) -> None:
-        self.pending.append((key, value))
+        self.pending.append(("set", key, value))
+
+    def delete(self, key: str) -> None:
+        self.pending.append(("delete", key, None))
 
     def execute(self) -> list[bool]:
         with self.backend.lock:
             if any(self.backend.versions[key] != version for key, version in self.watched.items()):
                 raise redis.WatchError
-            for key, value in self.pending:
-                self.backend.data[key] = value
+            for operation, key, value in self.pending:
+                if operation == "delete":
+                    self.backend.data.pop(key, None)
+                else:
+                    assert value is not None
+                    self.backend.data[key] = value
                 self.backend.versions[key] += 1
             return [True] * len(self.pending)
 
@@ -108,6 +115,30 @@ def _atomic_api():
     error_type = getattr(store, "CorruptRecordError", None)
     assert inspect.isclass(error_type)
     return store, error_type
+
+
+def _catalog_record(entries: list[dict[str, object]], *, ts: float = 5.0) -> str:
+    return json.dumps(
+        {
+            "value": json.dumps(entries, separators=(",", ":"), sort_keys=True),
+            "ts": ts,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _catalog_entries(backend: InProcessRedis, store, index_key: str):
+    raw = backend.get(store._redis_key(index_key))
+    if raw is None:
+        return []
+    return json.loads(json.loads(raw)["value"])
+
+
+def _index_remove_api(store) -> None:
+    assert "index_remove" in inspect.signature(store.delete_value).parameters, (
+        "store.delete_value has no atomic catalog removal"
+    )
 
 
 def test_parallel_atomic_appends_retain_every_index_entry(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -195,6 +226,38 @@ def test_expected_ts_conflict_leaves_value_and_index_unchanged(
     assert backend.get(store._redis_key(index_key)) == index_before
 
 
+def test_conflict_can_report_null_version_without_partial_catalog_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, _ = _atomic_api()
+    backend = InProcessRedis()
+    monkeypatch.setattr(store, "_redis", backend)
+    value_key = "private:alice:memory:missing"
+    index_key = "private:alice:value:private_index"
+
+    result = store.set_value(
+        value_key,
+        "must not be written",
+        expected_ts=7.0,
+        index_update={
+            "key": index_key,
+            "entry": {"name": "memory:missing", "tags": []},
+            "max_entries": 256,
+        },
+    )
+
+    assert result.as_payload() == {
+        "ok": True,
+        "status": "conflict",
+        "committed": False,
+        "updated": False,
+        "retryable": True,
+        "version": None,
+    }
+    assert backend.get(store._redis_key(value_key)) is None
+    assert backend.get(store._redis_key(index_key)) is None
+
+
 def test_matching_expected_ts_commits_value_and_index_together(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -224,3 +287,285 @@ def test_matching_expected_ts_commits_value_and_index_together(
     assert json.loads(backend.get(store._redis_key(value_key)))["value"] == "after"
     index_record = json.loads(backend.get(store._redis_key(index_key)))
     assert json.loads(index_record["value"]) == [{"name": "after", "tags": []}]
+
+
+def test_clock_collision_still_commits_with_a_new_numeric_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, _ = _atomic_api()
+    backend = InProcessRedis()
+    monkeypatch.setattr(store, "_redis", backend)
+    monkeypatch.setattr(store.time, "time", lambda: 10.0)
+    value_key = "private:alice:memory:clock-collision"
+    index_key = "private:alice:value:private_index"
+    backend.put(
+        store._redis_key(value_key),
+        json.dumps({"value": "before", "ts": 10.0}),
+    )
+    backend.put(
+        store._redis_key(index_key),
+        _catalog_record(
+            [{"name": "memory:clock-collision", "tags": []}],
+            ts=10.0,
+        ),
+    )
+
+    result = store.set_value(
+        value_key,
+        "after",
+        expected_ts=10.0,
+        index_update={
+            "key": index_key,
+            "entry": {"name": "memory:clock-collision", "tags": []},
+            "max_entries": 256,
+        },
+    )
+
+    assert result.status == "committed"
+    assert result.committed is True
+    assert result.updated is True
+    assert result.retryable is False
+    assert isinstance(result.version, (int, float))
+    assert result.version > 10.0
+    assert json.loads(backend.get(store._redis_key(value_key)))["value"] == "after"
+
+
+def test_full_catalog_rejects_new_name_without_evicting_or_writing_fact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, _ = _atomic_api()
+    backend = InProcessRedis()
+    monkeypatch.setattr(store, "_redis", backend)
+    index_key = "private:alice:value:private_index"
+    value_key = "private:alice:memory:new-fact"
+    entries = [
+        {"name": f"memory:fact-{number}", "tags": []}
+        for number in range(256)
+    ]
+    catalog_before = _catalog_record(entries)
+    backend.put(store._redis_key(index_key), catalog_before)
+
+    result = store.set_value(
+        value_key,
+        "must not be written",
+        expected_ts=None,
+        index_update={
+            "key": index_key,
+            "entry": {"name": "memory:new-fact", "tags": []},
+            "max_entries": 256,
+        },
+    )
+
+    assert result.as_payload() == {
+        "ok": True,
+        "status": "catalog_full",
+        "committed": False,
+        "updated": False,
+        "retryable": False,
+        "version": None,
+    }
+    assert backend.get(store._redis_key(value_key)) is None
+    assert backend.get(store._redis_key(index_key)) == catalog_before
+    assert _catalog_entries(backend, store, index_key)[0]["name"] == "memory:fact-0"
+
+
+def test_existing_name_updates_when_catalog_has_256_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, _ = _atomic_api()
+    backend = InProcessRedis()
+    monkeypatch.setattr(store, "_redis", backend)
+    monkeypatch.setattr(store.time, "time", lambda: 11.0)
+    index_key = "private:alice:value:private_index"
+    value_key = "private:alice:memory:fact-0"
+    entries = [
+        {"name": f"memory:fact-{number}", "tags": []}
+        for number in range(256)
+    ]
+    backend.put(store._redis_key(index_key), _catalog_record(entries))
+    backend.put(
+        store._redis_key(value_key),
+        json.dumps({"value": "old", "ts": 10.0}),
+    )
+
+    result = store.set_value(
+        value_key,
+        "new",
+        expected_ts=10.0,
+        index_update={
+            "key": index_key,
+            "entry": {"name": "memory:fact-0", "tags": ["topic_work"]},
+            "max_entries": 256,
+        },
+    )
+
+    assert result.status == "committed"
+    catalog = _catalog_entries(backend, store, index_key)
+    assert len(catalog) == 256
+    assert {"name": "memory:fact-0", "tags": ["topic_work"]} in catalog
+
+
+def test_delete_removes_fact_and_exact_catalog_name_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, _ = _atomic_api()
+    _index_remove_api(store)
+    backend = InProcessRedis()
+    monkeypatch.setattr(store, "_redis", backend)
+    index_key = "private:alice:value:private_index"
+    value_key = "private:alice:memory:fact"
+    backend.put(
+        store._redis_key(value_key),
+        json.dumps({"value": "old", "ts": 10.0}),
+    )
+    backend.put(
+        store._redis_key(index_key),
+        _catalog_record(
+            [
+                {"name": "memory:fact", "tags": ["topic_work"]},
+                {"name": "memory:keep", "tags": []},
+            ]
+        ),
+    )
+
+    result = store.delete_value(
+        value_key,
+        expected_ts=10.0,
+        index_remove={"key": index_key, "name": "memory:fact"},
+    )
+
+    assert result.as_payload() == {
+        "ok": True,
+        "status": "deleted",
+        "committed": True,
+        "updated": True,
+        "retryable": False,
+        "version": 10.0,
+    }
+    assert backend.get(store._redis_key(value_key)) is None
+    assert _catalog_entries(backend, store, index_key) == [
+        {"name": "memory:keep", "tags": []},
+    ]
+
+
+def test_delete_cleans_orphan_catalog_name_and_safe_repeat_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, _ = _atomic_api()
+    _index_remove_api(store)
+    backend = InProcessRedis()
+    monkeypatch.setattr(store, "_redis", backend)
+    index_key = "private:alice:value:private_index"
+    value_key = "private:alice:memory:orphan"
+    backend.put(
+        store._redis_key(index_key),
+        _catalog_record([{"name": "memory:orphan", "tags": []}]),
+    )
+    operation = {
+        "key": index_key,
+        "name": "memory:orphan",
+    }
+
+    removed = store.delete_value(
+        value_key,
+        expected_ts=None,
+        index_remove=operation,
+    )
+    repeated = store.delete_value(
+        value_key,
+        expected_ts=None,
+        index_remove=operation,
+    )
+
+    assert removed.as_payload() == {
+        "ok": True,
+        "status": "deleted",
+        "committed": True,
+        "updated": True,
+        "retryable": False,
+        "version": None,
+    }
+    assert repeated.as_payload() == {
+        "ok": True,
+        "status": "absent",
+        "committed": True,
+        "updated": False,
+        "retryable": False,
+        "version": None,
+    }
+    assert _catalog_entries(backend, store, index_key) == []
+
+
+def test_delete_conflict_leaves_fact_and_catalog_byte_identical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, _ = _atomic_api()
+    _index_remove_api(store)
+    backend = InProcessRedis()
+    monkeypatch.setattr(store, "_redis", backend)
+    index_key = "private:alice:value:private_index"
+    value_key = "private:alice:memory:fact"
+    fact_before = json.dumps({"value": "old", "ts": 10.0})
+    catalog_before = _catalog_record([{"name": "memory:fact", "tags": []}])
+    backend.put(store._redis_key(value_key), fact_before)
+    backend.put(store._redis_key(index_key), catalog_before)
+
+    result = store.delete_value(
+        value_key,
+        expected_ts=9.0,
+        index_remove={"key": index_key, "name": "memory:fact"},
+    )
+
+    assert result.as_payload() == {
+        "ok": True,
+        "status": "conflict",
+        "committed": False,
+        "updated": False,
+        "retryable": True,
+        "version": 10.0,
+    }
+    assert backend.get(store._redis_key(value_key)) == fact_before
+    assert backend.get(store._redis_key(index_key)) == catalog_before
+
+
+def test_delete_from_full_catalog_frees_space_for_next_fact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, _ = _atomic_api()
+    _index_remove_api(store)
+    backend = InProcessRedis()
+    monkeypatch.setattr(store, "_redis", backend)
+    monkeypatch.setattr(store.time, "time", lambda: 11.0)
+    index_key = "private:alice:value:private_index"
+    old_key = "private:alice:memory:fact-0"
+    entries = [
+        {"name": f"memory:fact-{number}", "tags": []}
+        for number in range(256)
+    ]
+    backend.put(store._redis_key(index_key), _catalog_record(entries))
+    backend.put(
+        store._redis_key(old_key),
+        json.dumps({"value": "old", "ts": 10.0}),
+    )
+
+    removed = store.delete_value(
+        old_key,
+        expected_ts=10.0,
+        index_remove={"key": index_key, "name": "memory:fact-0"},
+    )
+    created = store.set_value(
+        "private:alice:memory:new-fact",
+        "new",
+        expected_ts=None,
+        index_update={
+            "key": index_key,
+            "entry": {"name": "memory:new-fact", "tags": []},
+            "max_entries": 256,
+        },
+    )
+
+    assert removed.status == "deleted"
+    assert created.status == "committed"
+    catalog = _catalog_entries(backend, store, index_key)
+    assert len(catalog) == 256
+    assert any(item["name"] == "memory:new-fact" for item in catalog)
