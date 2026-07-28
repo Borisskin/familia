@@ -1,156 +1,117 @@
-# Policy & access control
+# Policy and access control
 
-Two layers cooperate to decide what one principal can do to another's
-data:
+Familia denies access by default. Every new record belongs to the speaker and
+is physically stored only in that person's private memory.
 
-1. **Family graph (`shared:family.graph`)** — declares peer-edges
-   like `spouse_of`, `guardian_of`, `parent_of`. Reachability through
-   these edges defines who can ask the bot about whom.
-2. **`policy.yaml`** — an explicit allow/deny matrix on top of the
-   graph. Defaults are deny-all; rules whitelist specific
-   (actor-role → target-role → tool/scope) tuples.
+## Family graph
 
-Every privileged decision is appended to `audit.jsonl`.
-
-## The family graph
-
-Stored as JSON in memX scope `shared:family.graph`, edited only via
-`familia` CLI on the VM (chat actors cannot write it — see
-[`security.md`](security.md), guarantee #2).
-
-Example (sanitized):
+The family graph stores principals and relationships:
 
 ```json
 {
-  "principals": {
-    "p_a": { "role": "admin" },
-    "p_b": { "role": "member" }
-  },
+  "nodes": [
+    {"id": "person_a", "type": "principal"},
+    {"id": "person_b", "type": "principal"}
+  ],
   "edges": [
-    { "from": "p_a", "to": "p_b", "type": "spouse_of" }
+    {"from": "person_a", "to": "person_b", "rel": "spouse_of"}
   ]
 }
 ```
 
-Edge types currently honored:
+Five relationships are supported:
 
-- `spouse_of` — bidirectional, full peer access.
-- `guardian_of` — directional, guardian → ward only. Used for parents
-  of an adult dependent who needs help managing their data.
-- `parent_of` — directional, parent → child only **and** explicitly
-  not the reverse, even if both edges exist (asymmetric by design;
-  child principals can't auto-introspect their parents).
+- `spouse_of`;
+- `parent_of`;
+- `guardian_of`;
+- `owner_of`;
+- `caregiver_of`.
 
-`role: child` is hard-wired to refuse reverse `parent_of` traversal
-regardless of graph state. This prevents misconfiguration from
-exposing parents' data to a teen account.
+A relationship is only one input to read authorization. It does not expose a
+related person's entire memory or chat history, and it never permits writing
+to that person's private memory. Read authorization depends on the existence
+of a direct supported family relationship between the principals; the
+direction in which its edge is stored neither grants nor removes access.
+
+For example, `spouse_of` requires an exact private-catalog entry, a direct
+relationship, and a verified common topic before it permits reading a foreign
+`memory:<fact_id>`. `guardian_of` without a common topic does not grant access:
+reading the foreign fact is denied. No family relationship replaces the
+catalog and topic checks.
+
+The graph is changed only in Admin. The model cannot create principals or
+change relationships from chat.
+
+## Topics
+
+A topic is an existing entry in the topic graph managed by Admin. Memory uses
+it only as a server-verified `topic_id` visibility tag. It never changes the
+fact's physical storage location.
+
+- An explicitly named existing accessible topic is attached to the private
+  fact.
+- If the topic exists but has no common links, the tag is kept and the person
+  is told that the topic is not shared with anyone.
+- If the topic is missing or unavailable, the fact is saved privately without
+  a topic tag; the person is told that the topic is unavailable or not
+  configured.
+- If the destination is unclear, the record stays private or the model asks
+  one short question.
+
+Topics and topic links are created only in Admin. Automatic topic creation
+from chat is forbidden.
+
+Legacy physical `shared` and `pair` storage, a static rule, or a missing topic
+tag never grants a separate foreign-read permission.
+
+## Write, update, and delete
+
+A principal can write only to their own private memory. An administrator role
+in chat does not permit writing for another person. Mentioning another person
+does not change ownership either: that fact remains in the speaker's memory.
+
+An ordinary fact has a stable `fact_id`. The memX server assigns and returns
+the technical `ts` version; the model and client do not send, assign, or
+create it. Updates and deletes target the exact `fact_id` and version
+previously returned through the trusted server path, without scanning all
+memory before every write.
+
+“Do not save” means:
+
+- skip a fact that has not been written;
+- delete the exact fact if it was already saved;
+- remove excluded material during chat compaction and do not write it.
+
+A chat compaction result always goes only to the current principal's private
+memory and carries no topic tag.
+
+If a write fails or remains unconfirmed, the source messages remain available
+and the compaction boundary does not move. A conflict can be retried safely
+after a fresh point read; a full catalog does not lose the message or evict an
+existing name.
 
 ## `policy.yaml`
 
-Lives at `familia/policy.yaml` (template at
-`familia/policy.example.yaml`). Read at gateway start; restart to
-apply changes (or use the admin app's **Personality** screen which
-includes a policy editor + restart).
-
-Skeleton:
-
-```yaml
-version: 1
-defaults:
-  decision: deny
-
-rules:
-  - id: spouses-share-memory-read
-    when:
-      actor.role: member
-      target.role: member
-      edge: spouse_of
-      tool: memory_read
-    decision: allow
-    log: true
-
-  - id: admin-overrides
-    when:
-      actor.role: admin
-    decision: allow
-    log: true
-
-  - id: peer-write-via-buttons-only
-    when:
-      tool: memory_write
-      target.kind: peer
-    decision: deny
-    reason: "writes to peer require explicit interactive consent (see send_buttons)"
-```
-
-Every rule that fires writes one entry to `audit.jsonl` if `log: true`.
-The `id` field is required and shows up in the audit log so you can
-trace which rule allowed or denied an action.
+The server applies `policy.yaml` after identity is established and before a
+read or write. The baseline decision is deny. Policy may permit reading a
+specific fact only when the relationship, existing topic, topic links, and
+server tag all match. Policy cannot permit a write to foreign private memory.
+Foreign profiles, service keys, catalogs, and facts tagged `secret` remain
+unavailable even when a topic is shared.
 
 ## Audit log
 
-`audit.jsonl` is one JSON object per line. Always read with `jq` — never
-trust line order to be temporally consistent (it's appended at the
-moment of decision, but multi-thread writes can interleave). Common
-event types:
+Every policy decision is appended to `audit.jsonl`. The record contains time,
+principal, action, destination, decision, and reason. Secrets and fact values
+are not logged.
 
-| Event | When |
-| --- | --- |
-| `policy_decision` | every `allow` or `deny` from `policy.yaml` |
-| `tag_acl_decision` | a tag-write or tag-read goes through reachability |
-| `graph_edit` | `familia` CLI mutates a graph |
-| `peer_edge_proposal` | a principal proposes a peer-edge (admin must approve) |
-| `peer_edge_approved` | admin approves it via the admin app |
-| `memory_write` | every write to memX (regardless of allow/deny) |
-| `dream_consolidate` | nightly consolidator pass |
+Graphs and topics are edited in Admin, so their changes must also be tied to
+an operator action in the audit log.
 
-The admin app's **Audit** screen tails the file with filters; the
-**familia-audit** CLI on the VM does the same offline.
+## Children and dependants
 
-Sample entry:
-
-```json
-{
-  "ts": "2026-04-30T10:12:34Z",
-  "event": "policy_decision",
-  "actor": "p_a",
-  "target": "p_b",
-  "tool": "memory_read",
-  "rule": "spouses-share-memory-read",
-  "decision": "allow"
-}
-```
-
-## Peer-edge approval flow
-
-When a principal in chat asks "tell me about my partner's schedule"
-and there's no `spouse_of` edge yet, the bot:
-
-1. Refuses the read (deny logged with reason `no_peer_edge`).
-2. Sends a button-message to that principal: "Propose
-   `spouse_of` with `<other>`?"
-3. If they tap **yes**, a `peer_edge_proposal` is logged.
-4. The admin sees it on the **Pending** screen of the admin app.
-5. Admin approves → `peer_edge_approved` logged + edge added to
-   `shared:family.graph`.
-6. Future reads succeed.
-
-This intentionally keeps the human in the loop — no chat-only path
-can grant peer access.
-
-## Children-as-principals
-
-When a child becomes a principal (gets a phone, you add them to
-`principals.json`):
-
-1. Set `role: child`.
-2. Migrate the topic representing them with
-   `familia migrate topic-to-principal <name>` (see
-   [`security.md`](security.md), *Migration paths*).
-3. Their parents keep `parent_of` edges pointing **to** them. Reverse
-   traversal stays blocked. The child can ask about themselves; they
-   cannot ask about their parents.
-
-This asymmetry is deliberate: it lets parents see school topics they
-already managed, while preventing a teen account from introspecting
-its parents' marital topics, work, finances, etc.
+The `guardian_of` relationship does not grant automatic or full access in
+either direction. A single foreign `memory:<fact_id>` can be read only when a
+direct supported family relationship exists regardless of storage direction,
+the catalog entry and tags match exactly, and a verified common topic links
+the principals. The guardian cannot write for the child.

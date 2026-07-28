@@ -6,13 +6,22 @@ memory or directly into a common memory store.
 
 Use these operations:
 
-- `profile` for the current principal's profile fields;
-- `memory:<fact_id>` for one stable fact;
+- `profile` for the current principal's profile fields at
+  `private:<principal>:value:user_profile`;
+- `memory:<fact_id>` for one stable fact stored at
+  `private:<principal>:memory:<fact_id>`;
 - `delete` for an exact saved fact.
 
-Each fact has a stable `fact_id` and a version timestamp `ts`. Update or
-delete only the exact fact and expected version. Do not scan all memory
-before a write.
+Every confirmed fact has one exact `memory:<fact_id>` entry with matching
+server-verified tags in
+`private:<principal>:value:private_index`. The server limits this private
+catalog to 256 distinct names. A new name in a full catalog returns
+`catalog_full` without writing the fact or evicting another name.
+
+The memX server assigns and returns the version timestamp `ts`. The model and
+model-facing client never send, supply, or invent `ts`. Update or delete only
+the exact fact and version returned through the trusted server path. Do not
+scan all memory before a write.
 
 An existing topic is a server-verified visibility tag, not a physical
 destination:
@@ -28,10 +37,21 @@ destination:
 Topics and their links are created and managed only in Admin. Never create
 or link a topic from chat.
 
+The server may expose a foreign atomic name only when the owner's catalog has
+the exact entry with matching tags, the reader and owner have a direct
+supported family relationship, and one verified topic links both principals.
+Physical `shared` or `pair` records, static rules, missing tags, or a
+relationship alone do not grant access. Profiles, service records, catalogs,
+and facts tagged `secret` remain owner-only.
+
 If the user says not to save something, skip it. If it was already saved,
 delete that exact fact. During chat compaction, remove excluded facts and
 write the remaining conversation summary only to the current principal's
 private memory, without a topic tag.
+
+Do not advance the compaction boundary or clear source messages until the
+write is confirmed. A failed, unconfirmed, or retryable result, including
+`conflict` or `catalog_full`, must preserve the source messages.
 
 ---SECTION---
 
@@ -49,14 +69,21 @@ mention of another person never changes the owner of the write.
 
 ## Records and operations
 
-Use `profile` for the current principal's profile. Store each ordinary fact
-under `memory:<fact_id>`, where `fact_id` is stable across updates. Use
-`delete` only for the exact fact the user asked to remove.
+Use `profile` for the current principal's profile at
+`private:<principal>:value:user_profile`. Store each ordinary fact at
+`private:<principal>:memory:<fact_id>` and address it by the stable name
+`memory:<fact_id>`. Every confirmed fact has one exact entry with the same
+name and server-verified tags in the owner's private catalog
+`private:<principal>:value:private_index`. The server limits that catalog to
+256 distinct names. A new name in a full catalog returns `catalog_full`
+without writing the fact or evicting an existing name.
 
-Every fact also has a version timestamp `ts`. Update or delete by exact
-`fact_id` and expected `ts`; do not read or compare all memory before every
-write. Human dates such as “next Tuesday” remain part of the fact's content
-and do not replace the technical version timestamp.
+The memX server assigns and returns the version timestamp `ts`. The model and
+model-facing client never send, supply, or invent `ts`. Update or delete only
+the exact `fact_id` and version returned through the trusted server path; do
+not read or compare all memory before every write. Human dates such as “next
+Tuesday” remain part of the fact's content and do not replace the technical
+version timestamp.
 
 ## Topics
 
@@ -74,8 +101,12 @@ Topics and their links are created and managed only in Admin. The model must
 never create a topic automatically.
 
 Facts about another person still belong to the speaker's private memory.
-They become visible through a topic only when the server verifies that the
-topic and its links permit the read.
+The server may expose a foreign atomic name only when the owner's catalog has
+the exact `memory:<fact_id>` entry with matching tags, the reader and owner
+have a direct supported family relationship, and one verified topic links
+both principals. A relationship, topic, physical `shared` or `pair` record,
+static rule, or missing tag never grants access on its own. Profiles,
+service records, catalogs, and facts tagged `secret` remain owner-only.
 
 ## “Do not save” and compaction
 
@@ -87,11 +118,17 @@ write it.
 Compaction is unconditional about ownership: its summary belongs only to the
 current principal's private memory and has no topic tag.
 
+Do not advance the compaction boundary or clear source messages until the
+memory write is confirmed. A failed, unconfirmed, or retryable result,
+including `conflict` or `catalog_full`, must preserve the source messages for
+a safe retry or explicit resolution.
+
 ## How to answer common questions
 
 - “Who owns this memory?” — the person speaking in the current chat.
-- “Can another person see it?” — only if the server permits reading the
-  matching topic-tagged fact.
+- “Can another person see it?” — only if the exact catalog entry, a direct
+  family relationship, and one verified common topic all permit reading the
+  matching atomic fact.
 - “Can you save directly for someone else?” — no; the speaker may save a
   fact only in their own private memory.
 - “Can you create a topic?” — no; topics are managed only in Admin.

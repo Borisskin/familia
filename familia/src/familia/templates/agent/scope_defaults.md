@@ -1,36 +1,54 @@
-# Memory Scope Defaults
+# Memory Destination Defaults
 
-The family is the default unit of trust. Day-to-day coordination data
-should flow freely between peer-edge principals (spouses, guardians).
-Use scope decisions to express *intent*, not as a privacy wall:
+Every new memory record is physically stored only in the current
+principal's private memory. Never write into another principal's private
+memory or directly into a common memory store.
 
-- **`scope='private'` (default for personal facts).** Records you write
-  here are readable by every peer-edge principal in the family graph
-  unless you tag them with `secret`. This is the right place for the
-  current user's appointments, errands, work plans, profile bits — a
-  spouse asking the assistant later should be able to see them.
-- **`scope='private'` + `tags=['secret']` (genuinely owner-only).** Use
-  this when the user explicitly says "don't tell my partner", "between
-  us", "for a surprise", or when the content is health / therapy /
-  financial / credentials. The `secret` tag narrows visibility back to
-  the owner alone — even peers see neither value nor key name.
-- **`scope='shared'` (household-wide).** Use for facts that concern
-  the whole family and every member should see (the family calendar,
-  household rules, kid's schedule).
-- **`scope='pair:<other>'` (two-person record).** Use only when the
-  record is jointly authored by exactly two principals and meaningless
-  to others — a couple's vacation plan, a parent-child agreement.
+Use these operations:
 
-Cross-principal reads:
+- `profile` for the current principal's profile fields at
+  `private:<principal>:value:user_profile`;
+- `memory:<fact_id>` for one stable fact stored at
+  `private:<principal>:memory:<fact_id>`;
+- `delete` for an exact saved fact.
 
-- A peer's custom `private:` keys (without `secret` tag) are surfaced
-  by name in the "Peers' private keys" block of your system prompt.
-  Fetch a specific value with
-  `memory_get(scope='private', actor='<peer_id>', key='<name>')`.
-- Reserved value:* slots (`value:user_profile`, `value:memory`,
-  `value:heartbeat`) flow through the same gate: peer-readable by
-  default, owner-only when tagged `secret`. Use `actor='<peer_id>'`
-  with these key names to read a peer's profile, scratchpad, or
-  heartbeat list.
-- Writing into another principal's namespace is never allowed from the
-  chat tools. Each principal writes only their own records.
+Every confirmed fact has one exact `memory:<fact_id>` entry with matching
+server-verified tags in
+`private:<principal>:value:private_index`. The server limits this private
+catalog to 256 distinct names. A new name in a full catalog returns
+`catalog_full` without writing the fact or evicting another name.
+
+The memX server assigns and returns the version timestamp `ts`. The model and
+model-facing client never send, supply, or invent `ts`. Update or delete only
+the exact fact and version returned through the trusted server path. Do not
+scan all memory before a write.
+
+An existing topic is a server-verified visibility tag, not a physical
+destination:
+
+- if the user explicitly names an existing accessible topic, save the
+  fact in their private memory with that `topic_id`;
+- if the topic exists but has no common links, keep the tag and tell the
+  user that the topic is not shared with anyone;
+- if the topic is missing or unavailable, save privately without a topic
+  tag and tell the user that the topic is unavailable or not configured;
+- if the destination is unclear, save privately or ask one short question.
+
+Topics and their links are created and managed only in Admin. Never create
+or link a topic from chat.
+
+The server may expose a foreign atomic name only when the owner's catalog has
+the exact entry with matching tags, the reader and owner have a direct
+supported family relationship, and one verified topic links both principals.
+Physical `shared` or `pair` records, static rules, missing tags, or a
+relationship alone do not grant access. Profiles, service records, catalogs,
+and facts tagged `secret` remain owner-only.
+
+If the user says not to save something, skip it. If it was already saved,
+delete that exact fact. During chat compaction, remove excluded facts and
+write the remaining conversation summary only to the current principal's
+private memory, without a topic tag.
+
+Do not advance the compaction boundary or clear source messages until the
+write is confirmed. A failed, unconfirmed, or retryable result, including
+`conflict` or `catalog_full`, must preserve the source messages.
