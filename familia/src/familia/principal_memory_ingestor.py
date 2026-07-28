@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable
 from typing import Any
@@ -14,6 +15,27 @@ from familia.principals import get_registry
 
 _MAX_CAS_ATTEMPTS = 3
 _FACT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_SEMANTIC_RESULT_FIELDS = frozenset(
+    {"ok", "status", "committed", "updated", "retryable", "version"}
+)
+
+
+def _parse_memx_version(value: Any, *, allow_none: bool) -> float | None:
+    if value is None:
+        if allow_none:
+            return None
+        raise ValueError
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError
+    try:
+        converted = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError from exc
+    if not math.isfinite(converted):
+        raise ValueError
+    if isinstance(value, int) and int(converted) != value:
+        raise ValueError
+    return converted
 
 
 class PrincipalMemoryIngestor:
@@ -117,18 +139,43 @@ class PrincipalMemoryIngestor:
                     if current_payload is None:
                         expected_ts: float | None = None
                     elif isinstance(current_payload, dict):
-                        expected_ts = current_payload.get("ts")
-                        if (
-                            not isinstance(expected_ts, (int, float))
-                            or isinstance(expected_ts, bool)
-                        ):
+                        try:
+                            expected_ts = _parse_memx_version(
+                                current_payload.get("ts"),
+                                allow_none=False,
+                            )
+                        except ValueError:
                             return "error: memX current record has invalid ts"
                     else:
                         return "error: memX current record is invalid"
 
                     write_payload: dict[str, Any] = {"key": full_key}
-                    if not delete:
+                    if delete:
+                        write_payload["index_remove"] = {
+                            "key": (
+                                f"private:{server_principal}:"
+                                "value:private_index"
+                            ),
+                            "name": f"memory:{fact_id}",
+                        }
+                    else:
                         write_payload["value"] = stored_value
+                        if kind == "memory":
+                            write_payload["index_update"] = {
+                                "key": (
+                                    f"private:{server_principal}:"
+                                    "value:private_index"
+                                ),
+                                "entry": {
+                                    "name": f"memory:{fact_id}",
+                                    "tags": (
+                                        [server_topic]
+                                        if server_topic is not None
+                                        else []
+                                    ),
+                                },
+                                "max_entries": 256,
+                            }
                     write_payload["expected_ts"] = expected_ts
                     committed = await client.post(
                         f"{self._base_url}/{'delete' if delete else 'set'}",
@@ -143,6 +190,15 @@ class PrincipalMemoryIngestor:
                         return "error: memX returned a non-JSON semantic result"
                     if not isinstance(payload, dict):
                         return "error: memX returned a non-object semantic result"
+                    if frozenset(payload) != _SEMANTIC_RESULT_FIELDS:
+                        return "error: memX did not confirm the conditional commit"
+                    try:
+                        version = _parse_memx_version(
+                            payload["version"],
+                            allow_none=True,
+                        )
+                    except ValueError:
+                        return "error: memX did not confirm the conditional commit"
                     if (
                         delete
                         and payload.get("ok") is True
@@ -150,7 +206,6 @@ class PrincipalMemoryIngestor:
                         and payload.get("committed") is True
                         and payload.get("updated") is True
                         and payload.get("retryable") is False
-                        and payload.get("version") is not None
                     ):
                         return f"deleted: Removed '{full_key}'"
                     if (
@@ -160,7 +215,7 @@ class PrincipalMemoryIngestor:
                         and payload.get("committed") is True
                         and payload.get("updated") is False
                         and payload.get("retryable") is False
-                        and payload.get("version") is None
+                        and version is None
                     ):
                         return f"absent: Already removed '{full_key}'"
                     if (
@@ -170,23 +225,27 @@ class PrincipalMemoryIngestor:
                         and payload.get("committed") is True
                         and payload.get("updated") is True
                         and payload.get("retryable") is False
-                        and payload.get("version") is not None
+                        and version is not None
                     ):
                         return f"committed: Stored at '{full_key}'"
                     if (
-                        payload.get("ok") is True
-                        and (
-                            payload.get("status") == "conflict"
-                            or (
-                                not delete
-                                and payload.get("status") == "not_updated"
-                            )
+                        kind == "memory"
+                        and payload.get("ok") is True
+                        and payload.get("status") == "catalog_full"
+                        and payload.get("committed") is False
+                        and payload.get("updated") is False
+                        and payload.get("retryable") is False
+                    ):
+                        return (
+                            "catalog_full: Personal memory catalog is full; "
+                            f"did not store '{full_key}'"
                         )
+                    if (
+                        payload.get("ok") is True
+                        and payload.get("status") == "conflict"
                         and payload.get("committed") is False
                         and payload.get("updated") is False
                         and payload.get("retryable") is True
-                        and isinstance(payload.get("version"), (int, float))
-                        and not isinstance(payload.get("version"), bool)
                     ):
                         continue
                     return "error: memX did not confirm the conditional commit"

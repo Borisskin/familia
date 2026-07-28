@@ -454,15 +454,24 @@ async def test_ingestor_uses_server_principal_and_conditional_semantic_write(
         headers={"x-api-key": "automatic-writer-key"},
         params={"key": expected_key},
     )
+    expected_payload = {
+        "key": expected_key,
+        "value": operation["value"],
+        "expected_ts": 41.0,
+    }
+    if operation["kind"] == "memory":
+        expected_payload["index_update"] = {
+            "key": "private:member_a:value:private_index",
+            "entry": {"name": "memory:fact-17", "tags": []},
+            "max_entries": 256,
+        }
     client.post.assert_awaited_once_with(
         "http://mock-memx:8000/set",
         headers={"x-api-key": "automatic-writer-key"},
-        json={
-            "key": expected_key,
-            "value": operation["value"],
-            "expected_ts": 41.0,
-        },
+        json=expected_payload,
     )
+    if operation["kind"] == "profile":
+        assert "index_update" not in client.post.await_args.kwargs["json"]
 
 
 @pytest.mark.asyncio
@@ -494,6 +503,21 @@ async def test_ingestor_stores_two_memory_facts_as_two_atomic_keys(
         "private:member_a:memory:fact-b",
     ]
     assert all(not key.endswith(":value:memory") for key in written_keys)
+    assert [
+        call.kwargs["json"]["index_update"]
+        for call in client.post.await_args_list
+    ] == [
+        {
+            "key": "private:member_a:value:private_index",
+            "entry": {"name": "memory:fact-a", "tags": []},
+            "max_entries": 256,
+        },
+        {
+            "key": "private:member_a:value:private_index",
+            "entry": {"name": "memory:fact-b", "tags": []},
+            "max_entries": 256,
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -529,7 +553,14 @@ async def test_ingestor_deletes_exact_private_fact_with_current_revision(
     client.post.assert_awaited_once_with(
         "http://mock-memx:8000/delete",
         headers={"x-api-key": "automatic-writer-key"},
-        json={"key": full_key, "expected_ts": 41.0},
+        json={
+            "key": full_key,
+            "expected_ts": 41.0,
+            "index_remove": {
+                "key": "private:member_a:value:private_index",
+                "name": "memory:employment.current",
+            },
+        },
     )
 
 
@@ -556,6 +587,10 @@ async def test_ingestor_treats_absent_private_fact_as_successful_delete_repeat(
 
     assert result == "absent: Already removed 'private:member_a:memory:employment.current'"
     assert client.post.await_args.kwargs["json"]["expected_ts"] is None
+    assert client.post.await_args.kwargs["json"]["index_remove"] == {
+        "key": "private:member_a:value:private_index",
+        "name": "memory:employment.current",
+    }
 
 
 @pytest.mark.asyncio
@@ -599,6 +634,52 @@ async def test_ingestor_rereads_delete_after_semantic_conflict(
         pending.kwargs["json"]["expected_ts"]
         for pending in client.post.await_args_list
     ] == [41.0, 42.0]
+    assert all(
+        pending.kwargs["json"]["index_remove"]
+        == {
+            "key": "private:member_a:value:private_index",
+            "name": "memory:employment.current",
+        }
+        for pending in client.post.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_ingestor_confirms_orphan_catalog_name_deletion_with_null_version(
+    principal_registry: PrincipalRegistry,
+) -> None:
+    ingestor = _ingestor_class()(
+        base_url="http://mock-memx:8000",
+        api_key="automatic-writer-key",
+    )
+    orphan_removed = _response(
+        {
+            "ok": True,
+            "status": "deleted",
+            "committed": True,
+            "updated": True,
+            "retryable": False,
+            "version": None,
+        }
+    )
+
+    with patch("familia.principal_memory_ingestor.httpx.AsyncClient") as client_cls:
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=_response(None, status_code=404))
+        client.post = AsyncMock(return_value=orphan_removed)
+        client_cls.return_value.__aenter__.return_value = client
+
+        result = await ingestor.ingest(
+            server_principal="member_a",
+            server_topic=None,
+            operation={"kind": "delete", "fact_id": "orphan"},
+        )
+
+    assert result == "deleted: Removed 'private:member_a:memory:orphan'"
+    assert client.post.await_args.kwargs["json"]["index_remove"] == {
+        "key": "private:member_a:value:private_index",
+        "name": "memory:orphan",
+    }
 
 
 @pytest.mark.asyncio
@@ -630,6 +711,14 @@ async def test_ingestor_encodes_verified_topic_only_in_atomic_private_value(
     payload = client.post.await_args.kwargs["json"]
     assert payload["key"] == "private:member_a:memory:fact-topic"
     assert payload["value"] == codec.encode("topic fact", ["confirmed_household_topic"])
+    assert payload["index_update"] == {
+        "key": "private:member_a:value:private_index",
+        "entry": {
+            "name": "memory:fact-topic",
+            "tags": ["confirmed_household_topic"],
+        },
+        "max_entries": 256,
+    }
     assert "confirmed_household_topic" not in payload["key"]
     server_topic_validator.assert_called_once_with("confirmed_household_topic")
 
@@ -740,25 +829,101 @@ async def test_ingestor_cas_conflict_rereads_new_ts_before_second_commit(
         pending.kwargs["json"]["expected_ts"]
         for pending in client.post.await_args_list
     ] == [41.0, 42.0]
+    assert all(
+        pending.kwargs["json"]["index_update"]
+        == {
+            "key": "private:member_a:value:private_index",
+            "entry": {"name": "memory:fact-cas", "tags": []},
+            "max_entries": 256,
+        }
+        for pending in client.post.await_args_list
+    )
 
 
 @pytest.mark.asyncio
-async def test_ingestor_retries_canonical_not_updated_after_rereading_ts(
+async def test_ingestor_treats_catalog_full_as_final_unconfirmed_result(
     principal_registry: PrincipalRegistry,
 ) -> None:
     ingestor = _ingestor_class()(
         base_url="http://mock-memx:8000",
         api_key="automatic-writer-key",
     )
-    full_key = "private:member_a:memory:fact-not-updated"
-    not_updated = _response(
+    catalog_full = _response(
         {
             "ok": True,
-            "status": "not_updated",
+            "status": "catalog_full",
+            "committed": False,
+            "updated": False,
+            "retryable": False,
+            "version": None,
+        }
+    )
+
+    with patch("familia.principal_memory_ingestor.httpx.AsyncClient") as client_cls:
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=_response(None, status_code=404))
+        client.post = AsyncMock(return_value=catalog_full)
+        client_cls.return_value.__aenter__.return_value = client
+
+        result = await ingestor.ingest(
+            server_principal="member_a",
+            server_topic=None,
+            operation={"kind": "memory", "fact_id": "full", "value": "new"},
+        )
+
+    assert "catalog_full" in result
+    assert not result.startswith(("committed:", "retryable_failure:"))
+    client.get.assert_awaited_once()
+    client.post.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ingestor_never_confirms_write_when_catalog_operation_errors(
+    principal_registry: PrincipalRegistry,
+) -> None:
+    ingestor = _ingestor_class()(
+        base_url="http://mock-memx:8000",
+        api_key="automatic-writer-key",
+    )
+
+    with patch("familia.principal_memory_ingestor.httpx.AsyncClient") as client_cls:
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=_response(None, status_code=404))
+        client.post = AsyncMock(
+            return_value=_response(
+                {"detail": {"status": "corruption_needs_repair"}},
+                status_code=409,
+            )
+        )
+        client_cls.return_value.__aenter__.return_value = client
+
+        result = await ingestor.ingest(
+            server_principal="member_a",
+            server_topic=None,
+            operation={"kind": "memory", "fact_id": "broken", "value": "new"},
+        )
+
+    assert result == "error: memX write status 409"
+    assert not result.startswith(("committed:", "deleted:", "absent:"))
+
+
+@pytest.mark.asyncio
+async def test_ingestor_rereads_exact_fact_after_conflict_with_null_version(
+    principal_registry: PrincipalRegistry,
+) -> None:
+    ingestor = _ingestor_class()(
+        base_url="http://mock-memx:8000",
+        api_key="automatic-writer-key",
+    )
+    full_key = "private:member_a:memory:fact-null-conflict"
+    conflict = _response(
+        {
+            "ok": True,
+            "status": "conflict",
             "committed": False,
             "updated": False,
             "retryable": True,
-            "version": 41.0,
+            "version": None,
         }
     )
 
@@ -767,11 +932,11 @@ async def test_ingestor_retries_canonical_not_updated_after_rereading_ts(
         client.get = AsyncMock(
             side_effect=[
                 _response({"value": "old", "ts": 41.0}),
-                _response({"value": "concurrent", "ts": 42.0}),
+                _response(None, status_code=404),
             ]
         )
         client.post = AsyncMock(
-            side_effect=[not_updated, _committed_response()]
+            side_effect=[conflict, _committed_response()]
         )
         client_cls.return_value.__aenter__.return_value = client
 
@@ -780,7 +945,7 @@ async def test_ingestor_retries_canonical_not_updated_after_rereading_ts(
             server_topic=None,
             operation={
                 "kind": "memory",
-                "fact_id": "fact-not-updated",
+                "fact_id": "fact-null-conflict",
                 "value": "new",
             },
         )
@@ -798,15 +963,13 @@ async def test_ingestor_retries_canonical_not_updated_after_rereading_ts(
         for pending in client.post.await_args_list
     ] == [
         (full_key, 41.0),
-        (full_key, 42.0),
+        (full_key, None),
     ]
 
 
-@pytest.mark.parametrize("status", ["conflict", "not_updated"])
 @pytest.mark.asyncio
 async def test_ingestor_exhausts_conditional_retries_with_one_generic_failure(
     principal_registry: PrincipalRegistry,
-    status: str,
 ) -> None:
     ingestor = _ingestor_class()(
         base_url="http://mock-memx:8000",
@@ -828,7 +991,7 @@ async def test_ingestor_exhausts_conditional_retries_with_one_generic_failure(
                 _response(
                     {
                         "ok": True,
-                        "status": status,
+                        "status": "conflict",
                         "committed": False,
                         "updated": False,
                         "retryable": True,
@@ -884,7 +1047,7 @@ async def test_ingestor_exhausts_conditional_retries_with_one_generic_failure(
             {"kind": "memory", "fact_id": "fact-invalid", "value": "new"},
         ),
         (
-            "not_updated",
+            "unexpected_status",
             41.0,
             {"kind": "delete", "fact_id": "fact-invalid"},
         ),
@@ -907,7 +1070,7 @@ async def test_ingestor_exhausts_conditional_retries_with_one_generic_failure(
     ids=[
         "status-list",
         "status-object",
-        "delete-not-updated",
+        "delete-unexpected-status",
         "version-bool",
         "version-string",
         "version-object",
@@ -995,10 +1158,10 @@ async def test_ingestor_does_not_report_non_committed_semantic_result_as_success
         base_url="http://mock-memx:8000",
         api_key="automatic-writer-key",
     )
-    not_updated = _response(
+    rejected_result = _response(
         {
             "ok": True,
-            "status": "not_updated",
+            "status": "unexpected_status",
             "committed": False,
             "updated": False,
             "retryable": False,
@@ -1009,7 +1172,7 @@ async def test_ingestor_does_not_report_non_committed_semantic_result_as_success
     with patch("familia.principal_memory_ingestor.httpx.AsyncClient") as client_cls:
         client = AsyncMock()
         client.get = AsyncMock(return_value=_response({"value": "old", "ts": 9.0}))
-        client.post = AsyncMock(return_value=not_updated)
+        client.post = AsyncMock(return_value=rejected_result)
         client_cls.return_value.__aenter__.return_value = client
 
         result = await ingestor.ingest(
