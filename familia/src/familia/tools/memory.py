@@ -434,8 +434,8 @@ _TAGS_DESC = (
     "from the family graphs (principals or topics) that the current actor "
     "has access to. The record is then visible to anyone whose reachable "
     "tag-set intersects with these. Used for cross-cutting access (e.g. "
-    "[varya, school] makes a record visible to anyone connected to "
-    "principal varya OR the school topic). Omit for legacy scope-only ACL."
+    "[child, school] makes a record visible to anyone connected to "
+    "principal child OR the school topic). Omit for legacy scope-only ACL."
 )
 
 

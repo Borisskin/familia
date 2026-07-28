@@ -58,7 +58,9 @@ def test_decide_memory_read_follows_canonical_matrix(row: dict[str, Any]) -> Non
     decision = _decide(row)
 
     assert decision.allowed is row["allowed"]
-    assert decision.reason == row["reason"]
+    assert isinstance(decision.reason, str) and decision.reason
+    if row["reason"] is not None:
+        assert decision.reason == row["reason"]
     assert {
         surface: decision.allowed
         for surface in ("history", "index", "memory_get")
@@ -75,12 +77,14 @@ def test_decide_memory_read_reason_is_stable(row: dict[str, Any]) -> None:
     second = _decide(row)
 
     assert (first.allowed, first.reason) == (second.allowed, second.reason)
-    assert first.reason == row["reason"]
+    assert isinstance(first.reason, str) and first.reason
+    if row["reason"] is not None:
+        assert first.reason == row["reason"]
 
 
 def _assert_direct_decision(
     expected_allowed: bool,
-    expected_reason: str,
+    expected_reason: str | None,
     *,
     reader: str = "principal_alpha",
     owner: str = "principal_beta",
@@ -113,7 +117,9 @@ def _assert_direct_decision(
     assert topics == original_topics
     assert (first.allowed, first.reason) == (second.allowed, second.reason)
     assert first.allowed is expected_allowed
-    assert first.reason == expected_reason
+    assert isinstance(first.reason, str) and first.reason
+    if expected_reason is not None:
+        assert first.reason == expected_reason
 
 
 @pytest.mark.parametrize(
@@ -151,7 +157,6 @@ def test_malformed_recognized_keys_are_invalid(key: str) -> None:
 @pytest.mark.parametrize(
     "key",
     (
-        "memory:fact_allowed",
         "value:user_profile",
         "value:memory",
         "value:heartbeat",
@@ -159,27 +164,59 @@ def test_malformed_recognized_keys_are_invalid(key: str) -> None:
         "value:shared_index",
     ),
 )
-def test_exact_ordinary_key_forms_use_family_topic_rules(key: str) -> None:
-    _assert_direct_decision(True, "family_common_topic", key=key)
+def test_service_value_keys_remain_owner_only_even_with_family_topic(
+    key: str,
+) -> None:
+    _assert_direct_decision(False, None, key=key)
+
+
+def test_atomic_fact_uses_family_topic_rules() -> None:
+    _assert_direct_decision(
+        True,
+        "family_common_topic",
+        key="memory:fact_allowed",
+    )
 
 
 @pytest.mark.parametrize(
-    ("static_policy", "allowed", "reason"),
+    "key",
     (
-        ("allow", True, "static_policy_allow"),
-        ("deny", False, "static_policy_deny"),
+        "value:user_profile",
+        "value:memory",
+        "value:heartbeat",
+        "value:private_index",
+        "value:shared_index",
     ),
 )
-def test_static_policy_is_used_for_valid_ordinary_record_outside_graph_rules(
+def test_owner_can_read_own_service_value(key: str) -> None:
+    _assert_direct_decision(
+        True,
+        "owner_self",
+        reader="principal_alpha",
+        owner="principal_alpha",
+        key=key,
+        tags=[],
+    )
+
+
+def test_secret_atomic_fact_remains_owner_only_despite_common_topic() -> None:
+    _assert_direct_decision(
+        False,
+        None,
+        key="memory:secret_fact",
+        tags=["topic_shared", "secret"],
+    )
+
+
+@pytest.mark.parametrize("static_policy", ("allow", "deny"))
+def test_static_policy_cannot_replace_family_topic_contract(
     static_policy: str,
-    allowed: bool,
-    reason: str,
 ) -> None:
     family = family_graph_sample()
     family["edges"] = []
     _assert_direct_decision(
-        allowed,
-        reason,
+        False,
+        None,
         reader="principal_gamma",
         owner="principal_alpha",
         key="memory:static_fact",
@@ -212,7 +249,6 @@ def test_pending_migration_is_owner_only() -> None:
     (
         ("unknown:owner_self", "invalid_key"),
         ("memory:", "invalid_key"),
-        ("history:owner_source", "internal_transaction_candidate"),
     ),
 )
 def test_owner_self_does_not_override_key_restrictions(
@@ -227,6 +263,18 @@ def test_owner_self_does_not_override_key_restrictions(
         key=key,
         tags=[],
         static_policy="allow",
+    )
+
+
+def test_owner_can_read_own_valid_internal_history_record() -> None:
+    _assert_direct_decision(
+        True,
+        "owner_self",
+        reader="principal_alpha",
+        owner="principal_alpha",
+        key="history:owner_source",
+        tags=[],
+        static_policy="deny",
     )
 
 
@@ -659,16 +707,17 @@ def test_reader_and_owner_must_be_registered_principals_before_allow(
 
 
 @pytest.mark.parametrize(
-    ("branch", "allowed_reason"),
+    ("branch", "expected_allowed", "expected_reason"),
     (
-        ("self", "owner_self"),
-        ("pair", "pair_member"),
-        ("static", "static_policy_allow"),
+        ("self", True, "owner_self"),
+        ("pair", False, None),
+        ("static", False, None),
     ),
 )
-def test_registered_principals_reach_existing_allow_branches(
+def test_only_owner_reaches_legacy_allow_branch_without_family_topic(
     branch: str,
-    allowed_reason: str,
+    expected_allowed: bool,
+    expected_reason: str | None,
 ) -> None:
     if branch == "self":
         reader = owner = "principal_alpha"
@@ -689,8 +738,8 @@ def test_registered_principals_reach_existing_allow_branches(
         static_policy = "allow"
 
     _assert_direct_decision(
-        True,
-        allowed_reason,
+        expected_allowed,
+        expected_reason,
         reader=reader,
         owner=owner,
         scope=scope,

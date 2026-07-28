@@ -51,8 +51,3 @@ __pycache__/
 # Editor / IDE
 .idea/
 .vscode/
-
-# MCP code-index
-.code-index/
-.mcp.json
-AGENTS.md

@@ -176,7 +176,7 @@ def test_audit_tags_json_shape(audit_file, capsys, fake_store):
         json.dumps({"ts": now, "kind": "tag_acl_decision",
                     "actor": "member_a", "op": "write",
                     "full_key": "shared:x",
-                    "record_tags": ["varya", "school"],
+                    "record_tags": ["child", "school"],
                     "decision": "allow"}) + "\n"
         + json.dumps({"ts": now, "kind": "tag_acl_decision",
                       "actor": "nanny", "op": "write",
@@ -194,7 +194,7 @@ def test_audit_tags_json_shape(audit_file, capsys, fake_store):
     assert payload["edits_count"] == 1
     # tag frequency
     tag_freqs = {tf["tag"]: tf["count"] for tf in payload["tag_frequency"]}
-    assert tag_freqs.get("varya") == 1
+    assert tag_freqs.get("child") == 1
     assert tag_freqs.get("finance") == 1
     # denials surfaced
     assert any(e["actor"] == "nanny" for e in payload["denials"])

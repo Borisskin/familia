@@ -154,15 +154,30 @@ When the user clicks **Install** or **Update VM**, the admin app:
 
 ## Update flow in detail
 
-`bootstrap.sh MODE=update` differs from `MODE=install`:
+`bootstrap.sh MODE=update` performs the transition in a strict order:
 
-- skips `dirs` (directories already exist) and `seed_graph` (family graph already exists);
-- keeps `prereqs`, `docker`, and `probe_mirrors` in case the VM changed since the previous deploy or new mirror requirements appeared;
-- `compose up -d --force-recreate` guarantees containers are recreated for the new image.
+1. stop the gateway and all other writer processes;
+2. build the new image;
+3. start memX only, reconcile its ACL, restart it, and wait for health;
+4. run the memory transition once:
+
+```bash
+familia migrate hybrid-storage --apply --json
+```
+
+5. only on `complete`, start the gateway, wait for health, repair permissions,
+   and clean up transition data.
+
+`partial` and `failed` abort the update: the gateway stays stopped and the
+version is not advanced. `prereqs`, `docker`, and `probe_mirrors` remain in the
+flow in case the VM or mirror requirements changed.
 
 ### Atomic `SOURCE_VERSION`
 
-`/opt/familia/SOURCE_VERSION` contains backend semver and is written **only after** `wait_healthy`, meaning after the gateway container passes healthcheck. If update fails halfway, the file keeps the old value, and on next connect admin truthfully shows that the VM still runs the old version and update must be repeated.
+`/opt/familia/SOURCE_VERSION` contains backend semver and is written only
+after the whole sequence succeeds: memory transition completed, the gateway
+is running and healthy, permissions are repaired, and transition data is
+cleaned up. If any step is incomplete, the file keeps its old value.
 
 ### Where the VM version is read from
 
@@ -215,6 +230,6 @@ If none is set and upstream is unreachable (5-second probe), `bootstrap.sh` pick
 - [`quickstart.md`](quickstart.md) — user installation path.
 - [`operations.md`](operations.md) — backup/restore, diagnostics, key rotation, mirror fallbacks.
 - [`architecture.md`](architecture.md) — why gateway/memX/policy are arranged this way.
-- [`policy.md`](policy.md) — privilege/ACL model and peer-edge.
+- [`policy.md`](policy.md) — private-write and topic-based read rules.
 - [`security.md`](security.md) — threat model and what counts as a privileged operation.
 - [`release.md`](release.md) — release pipeline for admin and backend.

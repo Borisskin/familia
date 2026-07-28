@@ -278,16 +278,16 @@ def test_seed_topics_dry_run_changes_nothing(fake_store):
     store, _ = fake_store
     store[graph_admin.FAMILY_KEY]["nodes"] = [
         {"id": "owner", "type": "principal"},
-        {"id": "varya", "type": "subject", "kind": "person",
+        {"id": "child", "type": "subject", "kind": "person",
          "aliases": ["alias_a"]},
     ]
     store[graph_admin.FAMILY_KEY]["edges"] = [
-        {"from": "owner", "to": "varya", "rel": "parent_of"},
+        {"from": "owner", "to": "child", "rel": "parent_of"},
     ]
     rc = _run(["migrate", "seed-topics-from-subjects"])  # dry-run default
     assert rc == 0
     # Subject still in family.graph; topics.graph untouched
-    assert any(n["id"] == "varya"
+    assert any(n["id"] == "child"
                for n in store[graph_admin.FAMILY_KEY]["nodes"])
     assert store[graph_admin.TOPICS_KEY]["nodes"] == []
 
@@ -296,27 +296,27 @@ def test_seed_topics_apply_moves_subject(fake_store):
     store, _ = fake_store
     store[graph_admin.FAMILY_KEY]["nodes"] = [
         {"id": "owner", "type": "principal"},
-        {"id": "varya", "type": "subject", "kind": "person",
+        {"id": "child", "type": "subject", "kind": "person",
          "aliases": ["alias_a"]},
         {"id": "syava", "type": "subject", "kind": "pet",
          "aliases": ["alias_b"]},
     ]
     store[graph_admin.FAMILY_KEY]["edges"] = [
-        {"from": "owner", "to": "varya", "rel": "parent_of"},
+        {"from": "owner", "to": "child", "rel": "parent_of"},
         {"from": "owner", "to": "syava", "rel": "owner_of"},
     ]
     rc = _run(["migrate", "seed-topics-from-subjects", "--apply"])
     assert rc == 0
     family_ids = [n["id"] for n in store[graph_admin.FAMILY_KEY]["nodes"]]
     assert "owner" in family_ids
-    assert "varya" not in family_ids
+    assert "child" not in family_ids
     assert "syava" not in family_ids
     topic_ids = [n["id"] for n in store[graph_admin.TOPICS_KEY]["nodes"]]
-    assert sorted(topic_ids) == ["syava", "varya"]
+    assert sorted(topic_ids) == ["syava", "child"]
     # concerns edges with proper concerns_as
     edges = store[graph_admin.TOPICS_KEY]["edges"]
     by_topic = {e["from"]: e for e in edges}
-    assert by_topic["varya"]["concerns_as"] == "parent_of"
+    assert by_topic["child"]["concerns_as"] == "parent_of"
     assert by_topic["syava"]["concerns_as"] == "owner_of"
 
 
@@ -325,7 +325,7 @@ def test_seed_topics_idempotent(fake_store):
     store, _ = fake_store
     store[graph_admin.FAMILY_KEY]["nodes"] = [{"id": "owner", "type": "principal"}]
     store[graph_admin.TOPICS_KEY]["nodes"] = [
-        {"id": "varya", "type": "topic", "kind": "person", "aliases": ["alias_a"]}
+        {"id": "child", "type": "topic", "kind": "person", "aliases": ["alias_a"]}
     ]
     rc = _run(["migrate", "seed-topics-from-subjects", "--apply"])
     assert rc == 0
@@ -340,18 +340,18 @@ def test_topic_to_principal_dry_run(fake_store):
         {"id": "member_a", "type": "principal"},
     ]
     store[graph_admin.TOPICS_KEY]["nodes"] = [
-        {"id": "varya", "type": "topic", "kind": "person", "aliases": ["alias_a"]}
+        {"id": "child", "type": "topic", "kind": "person", "aliases": ["alias_a"]}
     ]
     store[graph_admin.TOPICS_KEY]["edges"] = [
-        {"from": "varya", "to": "owner", "rel": "concerns",
+        {"from": "child", "to": "owner", "rel": "concerns",
          "concerns_as": "parent_of"},
-        {"from": "varya", "to": "member_a", "rel": "concerns",
+        {"from": "child", "to": "member_a", "rel": "concerns",
          "concerns_as": "parent_of"},
     ]
-    rc = _run(["migrate", "topic-to-principal", "varya"])  # dry default
+    rc = _run(["migrate", "topic-to-principal", "child"])  # dry default
     assert rc == 0
     # nothing changed
-    assert any(n["id"] == "varya"
+    assert any(n["id"] == "child"
                for n in store[graph_admin.TOPICS_KEY]["nodes"])
 
 
@@ -362,26 +362,26 @@ def test_topic_to_principal_apply_atomic(fake_store):
         {"id": "member_a", "type": "principal"},
     ]
     store[graph_admin.TOPICS_KEY]["nodes"] = [
-        {"id": "varya", "type": "topic", "kind": "person", "aliases": ["alias_a"]}
+        {"id": "child", "type": "topic", "kind": "person", "aliases": ["alias_a"]}
     ]
     store[graph_admin.TOPICS_KEY]["edges"] = [
-        {"from": "varya", "to": "owner", "rel": "concerns",
+        {"from": "child", "to": "owner", "rel": "concerns",
          "concerns_as": "parent_of"},
-        {"from": "varya", "to": "member_a", "rel": "concerns",
+        {"from": "child", "to": "member_a", "rel": "concerns",
          "concerns_as": "parent_of"},
     ]
-    rc = _run(["migrate", "topic-to-principal", "varya", "--apply"])
+    rc = _run(["migrate", "topic-to-principal", "child", "--apply"])
     assert rc == 0
     family_ids = [n["id"] for n in store[graph_admin.FAMILY_KEY]["nodes"]]
-    assert "varya" in family_ids
+    assert "child" in family_ids
     family_edges = store[graph_admin.FAMILY_KEY]["edges"]
     rels = sorted(
         (e["from"], e["rel"], e["to"]) for e in family_edges
     )
-    assert ("member_a", "parent_of", "varya") in rels
-    assert ("owner", "parent_of", "varya") in rels
+    assert ("member_a", "parent_of", "child") in rels
+    assert ("owner", "parent_of", "child") in rels
     # topic gone
-    assert all(n["id"] != "varya"
+    assert all(n["id"] != "child"
                for n in store[graph_admin.TOPICS_KEY]["nodes"])
 
 
