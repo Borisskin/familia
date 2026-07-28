@@ -32,7 +32,9 @@ from familia.acl import codec, schema as acl_schema
 from familia.acl.graph_io import resolve_admin_key
 from familia.acl.principal_memory import (
     _NO_MATCHING_STATIC_POLICY,
+    canonical_memory_tags,
     decide_memory_read,
+    is_valid_atomic_memory_key,
 )
 from familia.acl.peers import is_peer
 from familia.acl.reachable import reachable_tag_ids
@@ -48,12 +50,12 @@ from familia.roles import get_effective_roles
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
 SCOPE_DESC = (
-    "Memory scope: 'shared' (visible to the whole family) or "
-    "'private' (default: only the current actor; readable by peer-edge "
-    "principals when 'actor' parameter names a peer). "
-    "Cross-principal access is gated by the family graph (is_peer) plus "
-    "per-record tags. Records tagged 'secret' stay owner-only even with "
-    "an active peer-edge."
+    "Memory read scope. Only 'private' is accepted; 'shared' and 'pair' "
+    "are rejected before policy or storage access. Own private keys are "
+    "read as their owner. When 'actor' names another owner, only an exact "
+    "memory:<fact_id> may pass that owner's exact trusted catalog entry, "
+    "a direct family relation, and an exact common topic. Service, internal, "
+    "migration, and secret records remain owner-only."
 )
 
 # Opt-out tag: a record carrying this tag is readable only by its owner,
@@ -61,6 +63,8 @@ SCOPE_DESC = (
 # does not want to share with peers despite the family-by-default model
 # (gifts, therapy/health notes, work secrets).
 SECRET_TAG = "secret"
+_PEER_STORE_UNAVAILABLE = "Error: memory store unavailable"
+_PEER_DENIED_REASON = "foreign_read_denied"
 
 # Synthetic tags that don't refer to a graph identity (principal id or
 # topic id). They are ACL-modifiers, not reachability handles, so
@@ -102,6 +106,8 @@ async def _fetch_raw_graph(
     api_key: str,
     key: str,
     base_url: str,
+    *,
+    fail_on_unavailable: bool = False,
 ) -> dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -112,15 +118,28 @@ async def _fetch_raw_graph(
             )
     except httpx.HTTPError as exc:
         logger.warning("memX graph {} unreachable: {}", key, exc)
+        if fail_on_unavailable:
+            raise
         return _empty_graph_mapping()
-    if r.status_code == 404 or r.status_code == 403:
+    try:
+        status_code = r.status_code
+    except Exception:  # noqa: BLE001
         return _empty_graph_mapping()
-    if r.status_code >= 400:
-        logger.warning("memX graph {} {}: {}", key, r.status_code, r.text[:200])
+    if type(status_code) is not int:
+        return _empty_graph_mapping()
+    if status_code >= 500:
+        if fail_on_unavailable:
+            raise RuntimeError("memX graph storage unavailable")
+        logger.warning("memX graph {} returned {}", key, status_code)
+        return _empty_graph_mapping()
+    if status_code in {403, 404}:
+        return _empty_graph_mapping()
+    if status_code != 200:
+        logger.warning("memX graph {} returned {}", key, status_code)
         return _empty_graph_mapping()
     try:
         payload = r.json()
-    except ValueError:
+    except Exception:  # noqa: BLE001
         return _empty_graph_mapping()
     if payload is None:
         return _empty_graph_mapping()
@@ -128,7 +147,7 @@ async def _fetch_raw_graph(
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)
-        except ValueError:
+        except Exception:  # noqa: BLE001
             # SR-10: fail-closed.
             logger.warning("memX graph {} value is malformed JSON", key)
             return _empty_graph_mapping()
@@ -421,20 +440,75 @@ _TAGS_DESC = (
 
 _ACTOR_PARAM_DESC = (
     "Optional principal id whose namespace to read. Defaults to the "
-    "current actor (own namespace). Only valid for 'private' scope. "
-    "When the named principal is a peer in the family graph "
-    "(spouse_of / guardian_of edge, role:child excluded), reads any "
-    "of their private records — custom keys AND reserved value:* "
-    "slots (value:memory, value:user_profile, value:heartbeat, "
-    "*_index). Records tagged 'secret' by the owner are never "
-    "returned cross-actor and yield 'no value stored'."
+    "current actor (own namespace) and is valid only for 'private'. "
+    "For another owner, only an exact memory:<fact_id> with an exact "
+    "trusted catalog entry can proceed to family-relation and common-topic "
+    "authorization. Service, internal, migration, and secret records are "
+    "owner-only; a denial is indistinguishable from a missing value."
 )
+
+
+def _trusted_read_value(response: Any) -> tuple[str, Any]:
+    """Classify one memX response without exposing record existence."""
+    try:
+        status_code = response.status_code
+    except Exception:  # noqa: BLE001
+        return "denied", None
+    if type(status_code) is not int:
+        return "denied", None
+    if status_code >= 500:
+        return "unavailable", None
+    if status_code != 200:
+        return "denied", None
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001
+        return "denied", None
+    try:
+        if (
+            not isinstance(payload, dict)
+            or "value" not in payload
+            or "ts" not in payload
+            or not isinstance(payload["ts"], (int, float))
+            or isinstance(payload["ts"], bool)
+        ):
+            return "denied", None
+        value = payload["value"]
+    except Exception:  # noqa: BLE001
+        return "denied", None
+    return "ok", value
+
+
+def _trusted_catalog_tags(value: Any, key: str) -> tuple[str, ...] | None:
+    """Return one exact catalog entry as a canonical tag set."""
+    try:
+        if isinstance(value, str):
+            value = json.loads(value)
+        if not isinstance(value, list):
+            return None
+        matches: list[tuple[str, ...]] = []
+        for entry in value:
+            if not isinstance(entry, dict) or entry.get("name") != key:
+                continue
+            tags = canonical_memory_tags(entry.get("tags"))
+            if tags is None:
+                return None
+            matches.append(tags)
+        if len(matches) != 1:
+            return None
+        return matches[0]
+    except Exception:  # noqa: BLE001
+        return None
 
 
 @tool_parameters(
     tool_parameters_schema(
         scope=StringSchema(SCOPE_DESC),
-        key=StringSchema("Bare memory key (no scope prefix; e.g. 'todo', 'grocery_list')"),
+        key=StringSchema(
+            "Exact key inside the private namespace. Own reads may use the "
+            "owner's valid keys. A cross-owner read requires a non-empty exact "
+            "memory:<fact_id> whose full tag list matches the exact owner catalog."
+        ),
         actor=StringSchema(_ACTOR_PARAM_DESC, nullable=True),
         required=["scope", "key"],
     )
@@ -452,20 +526,17 @@ class MemoryGetTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Read a value from scoped family memory (memX).\n\n"
-            "Private owner reads are always self-access. Cross-owner "
-            "private reads require a family relation plus an exact "
-            "common topic, or a legacy untagged record. Secret and "
-            "static deny do not override canonical common-topic allow; "
-            "the same topic without a family relation is denied. "
-            "Service records are owner-only service data, and history "
-            "records are internal transaction data.\n"
-            "Shared values are visible to the family. Pair values are "
-            "limited to the exact members of the pair.\n\n"
-            "Your own custom keys appear in the 'Private/Shared keys "
-            "you've written' system-prompt blocks; peers' custom keys "
-            "appear in the cross-principal index blocks. Reserved "
-            "slots are not indexed — read them by their fixed names."
+            "Read a value from family memory using only `private`; "
+            "`shared` and `pair` are rejected before policy or storage "
+            "access. Own private reads use the current owner.\n\n"
+            "A cross-owner read accepts only an exact non-empty "
+            "`memory:<fact_id>`. It first requires an exact owner catalog "
+            "entry, then fetches the fact and requires its full tag list to "
+            "match. The canonical decision then requires a direct family "
+            "relation and an exact common topic. Owner-only service records, "
+            "internal transaction history, migration state, and secret "
+            "records are never returned cross-owner. A denial is "
+            "indistinguishable from a missing value."
         )
 
     @property
@@ -479,30 +550,67 @@ class MemoryGetTool(Tool):
         actor: str | None = None,
         **kwargs: Any,
     ) -> str:
+        normalized_scope = (scope or "").strip()
+        if normalized_scope != "private":
+            return (
+                "Error: memory_get accepts only 'private' scope; "
+                "use scope='private'. 'shared' and 'pair' are not readable."
+            )
         actor_id, api_key, err = _current_actor_and_key()
         if err:
             return err
         target_actor = (actor or "").strip() or None
-        full_key, err = _resolve_full_key(
-            scope, key, actor_id, target_actor=target_actor,
-        )
-        if err:
-            return err
         is_peer_read = (
-            scope == "private"
-            and target_actor is not None
+            target_actor is not None
             and target_actor != actor_id
         )
         if is_peer_read:
-            if get_registry().get(target_actor) is None:
-                return f"(no value stored at '{full_key}')"
-            return await self._read_peer_private(
-                actor_id=actor_id,
-                peer_id=target_actor,
-                full_key=full_key,
-                key=key,
-                api_key=api_key,
-            )
+            full_key = f"private:{target_actor}:{key}"
+            result = f"(no value stored at '{full_key}')"
+            audit_decision = "deny"
+            audit_reason = _PEER_DENIED_REASON
+            audit_tags: tuple[str, ...] = ()
+            try:
+                if (
+                    is_valid_atomic_memory_key(key)
+                    and get_registry().get(target_actor) is not None
+                ):
+                    (
+                        result,
+                        audit_decision,
+                        audit_reason,
+                        audit_tags,
+                    ) = await self._read_peer_private(
+                        actor_id=actor_id,
+                        peer_id=target_actor,
+                        full_key=full_key,
+                        key=key,
+                        api_key=api_key,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("peer-private read failed: {}", exc)
+                result = _PEER_STORE_UNAVAILABLE
+                audit_decision = "error"
+                audit_reason = "store_unavailable"
+                audit_tags = ()
+            try:
+                audit.log_event(
+                    "peer_private_read",
+                    actor=actor_id,
+                    peer=target_actor,
+                    key=full_key,
+                    decision=audit_decision,
+                    reason=audit_reason,
+                    tags=list(audit_tags),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return result
+        full_key, err = _resolve_full_key(
+            normalized_scope, key, actor_id, target_actor=target_actor,
+        )
+        if err:
+            return err
         if not full_key.startswith("pair:"):
             decision = get_engine().evaluate(
                 PolicyContext(action="memory.read", actor=actor_id, to_chat=full_key)
@@ -576,69 +684,94 @@ class MemoryGetTool(Tool):
         full_key: str,
         key: str,
         api_key: str,
-    ) -> str:
+    ) -> tuple[str, str, str, tuple[str, ...]]:
         """Fetch, decode and authorize one cross-principal private read."""
+        no_value = f"(no value stored at '{full_key}')"
+        denied = (no_value, "deny", _PEER_DENIED_REASON, ())
+        unavailable = (
+            _PEER_STORE_UNAVAILABLE,
+            "error",
+            "store_unavailable",
+            (),
+        )
         try:
             proxy_key = resolve_admin_key()
         except Exception as exc:  # noqa: BLE001
             logger.warning("peer-private: admin key unavailable: {}", exc)
-            try:
-                audit.log_event(
-                    "peer_private_read", actor=actor_id, peer=peer_id,
-                    key=full_key, decision="deny", reason="no_admin_key",
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            return f"Error: peer-read backend unavailable for '{full_key}'"
+            return unavailable
+        if not isinstance(proxy_key, str) or not proxy_key:
+            return unavailable
         base_url = self._base_url_override or memx_base_url()
-        family = await _fetch_raw_graph(
-            api_key, "shared:family.graph", base_url
-        )
-        topics = await _fetch_raw_graph(
-            api_key, "shared:topics.graph", base_url
-        )
+        catalog_key = f"private:{peer_id}:value:private_index"
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
+                catalog_response = await client.get(
+                    f"{base_url}/get",
+                    headers={"x-api-key": proxy_key},
+                    params={"key": catalog_key},
+                )
+                catalog_state, catalog_value = _trusted_read_value(
+                    catalog_response
+                )
+                if catalog_state == "unavailable":
+                    return unavailable
+                if catalog_state != "ok" or catalog_value is None:
+                    return denied
+                catalog_tags = _trusted_catalog_tags(catalog_value, key)
+                if catalog_tags is None:
+                    return denied
                 r = await client.get(
                     f"{base_url}/get",
                     headers={"x-api-key": proxy_key},
                     params={"key": full_key},
                 )
         except httpx.HTTPError as exc:
-            return f"Error: memX unreachable ({type(exc).__name__}: {exc})"
-        if r.status_code == 404:
-            try:
-                audit.log_event(
-                    "peer_private_read", actor=actor_id, peer=peer_id,
-                    key=full_key, decision="not_found",
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            return f"(no value stored at '{full_key}')"
-        if r.status_code >= 400:
-            return f"Error: memX {r.status_code}: {r.text[:200]}"
-        try:
-            payload = r.json()
-        except ValueError:
-            return f"(no value stored at '{full_key}')"
-        if payload is None:
-            return f"(no value stored at '{full_key}')"
-        if isinstance(payload, dict):
-            value = payload.get("value", payload)
-        else:
-            value = payload
+            logger.warning(
+                "peer-private storage transport failed: {}",
+                type(exc).__name__,
+            )
+            return unavailable
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "peer-private storage request failed: {}",
+                type(exc).__name__,
+            )
+            return unavailable
+        fact_state, value = _trusted_read_value(r)
+        if fact_state == "unavailable":
+            return unavailable
+        if fact_state != "ok":
+            return denied
         if value is None:
-            return f"(no value stored at '{full_key}')"
-        wrapped = codec.decode(value) if isinstance(value, str) else None
-        if wrapped is not None:
-            record_tags = tuple(wrapped.tags)
-            effective_value: Any = wrapped.value
-        elif isinstance(value, (dict, list)):
-            record_tags = ()
-            effective_value = json.dumps(value, ensure_ascii=False)
-        else:
-            record_tags = ()
-            effective_value = str(value)
+            return denied
+        try:
+            wrapped = codec.decode(value) if isinstance(value, str) else None
+            if wrapped is not None:
+                record_tags = canonical_memory_tags(wrapped.tags)
+                if record_tags is None or not isinstance(wrapped.value, str):
+                    return denied
+                effective_value = wrapped.value
+            elif isinstance(value, str):
+                record_tags = ()
+                effective_value = value
+            else:
+                return denied
+        except Exception:  # noqa: BLE001
+            return denied
+        if record_tags != catalog_tags:
+            return denied
+        family = await _fetch_raw_graph(
+            api_key,
+            "shared:family.graph",
+            base_url,
+            fail_on_unavailable=True,
+        )
+        topics = await _fetch_raw_graph(
+            api_key,
+            "shared:topics.graph",
+            base_url,
+            fail_on_unavailable=True,
+        )
         try:
             decision = decide_memory_read(
                 reader=actor_id,
@@ -652,20 +785,15 @@ class MemoryGetTool(Tool):
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("peer-private decision failed: {}", exc)
-            return f"(no value stored at '{full_key}')"
-        try:
-            audit.log_event(
-                "peer_private_read", actor=actor_id, peer=peer_id,
-                key=full_key,
-                decision="allow" if decision.allowed else "deny",
-                reason=decision.reason,
-                tags=sorted(record_tags),
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        if not decision.allowed:
-            return f"(no value stored at '{full_key}')"
-        return effective_value
+            return denied
+        reason = (
+            decision.reason
+            if isinstance(decision.reason, str) and decision.reason
+            else _PEER_DENIED_REASON
+        )
+        if decision.allowed is not True:
+            return no_value, "deny", reason, ()
+        return effective_value, "allow", reason, record_tags
 
 
 @tool_parameters(

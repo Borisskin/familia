@@ -1,14 +1,9 @@
-"""Tests for the family-by-default ``private:`` peer-read path.
-
-Covers the Variant-A design (0.3.0) where ``private:<owner>:<key>``
-records are readable by peer-edge principals unless tagged ``secret``,
-with three reserved value:* slots (memory, user_profile, heartbeat)
-that stay owner-only even with a peer-edge.
-"""
+"""Tests for catalog-gated foreign ``private:`` atomic-fact reads."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
@@ -147,12 +142,7 @@ def test_resolve_target_actor_rejected_for_pair(registry):
     "value:heartbeat",
 ])
 def test_reserved_value_keys_resolve_cross_actor(registry, reserved):
-    """Reserved value:* slots resolve to the named peer's namespace.
-
-    Under the family-by-default model (0.3.0 + reserved opening), the
-    resolver no longer folds reserved keys back to the caller — they
-    flow through the same is_peer + secret-tag gate as custom keys.
-    """
+    """The resolver recognizes service keys; authorization still denies them."""
     full, err = _resolve_full_key(
         "private", reserved, "spouse", target_actor="owner",
     )
@@ -199,6 +189,24 @@ class _FakeHttpxClient:
         return self._response
 
 
+class _MappedHttpxClient:
+    def __init__(self, responses: dict[str, _FakeHttpxResponse]):
+        self._responses = responses
+        self.calls: list[dict[str, Any]] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url, *, headers=None, params=None):
+        call = {"url": url, "headers": headers, "params": params}
+        self.calls.append(call)
+        key = params["key"]
+        return self._responses.get(key, _FakeHttpxResponse(404, text="not found"))
+
+
 def _set_actor(monkeypatch, actor_id):
     monkeypatch.setattr(
         memory_mod, "get_current_actor", lambda: actor_id,
@@ -230,18 +238,185 @@ def _patch_decider(monkeypatch, *, allowed: bool, reason: str):
     return calls
 
 
-def test_peer_reads_untagged_custom_private(monkeypatch, registry, peer_graph):
-    """The canonical decision can allow an untagged private record."""
+def _catalog_response(*entries: dict[str, Any]) -> _FakeHttpxResponse:
+    return _FakeHttpxResponse(
+        200,
+        json_data={
+            "value": json.dumps(list(entries), ensure_ascii=False),
+            "ts": 1.0,
+        },
+    )
+
+
+def test_peer_atomic_fact_requires_exact_trusted_catalog_entry(
+    monkeypatch,
+    registry,
+    peer_graph,
+):
+    _set_actor(monkeypatch, "spouse")
+    _patch_admin_key(monkeypatch)
+    _patch_audit(monkeypatch)
+    decision_calls = _patch_decider(
+        monkeypatch,
+        allowed=True,
+        reason="family_common_topic",
+    )
+    client = _MappedHttpxClient(
+        {
+            "private:owner:value:private_index": _catalog_response(
+                {"name": "memory:work", "tags": ["topic_shared"]}
+            ),
+            "private:owner:memory:work": _FakeHttpxResponse(
+                200,
+                json_data={
+                    "value": codec.encode("allowed fact", ["topic_shared"]),
+                    "ts": 1.0,
+                },
+            ),
+        }
+    )
+    monkeypatch.setattr(memory_mod.httpx, "AsyncClient", lambda **_kw: client)
+
+    result = _run(
+        MemoryGetTool().execute(
+            scope="private",
+            key="memory:work",
+            actor="owner",
+        )
+    )
+
+    assert result == "allowed fact"
+    private_reads = [
+        call["params"]["key"]
+        for call in client.calls
+        if call["params"]["key"].startswith("private:")
+    ]
+    assert private_reads == [
+        "private:owner:value:private_index",
+        "private:owner:memory:work",
+    ]
+    assert len(decision_calls) == 1
+    assert decision_calls[0]["key"] == "memory:work"
+    assert decision_calls[0]["tags"] == ("topic_shared",)
+
+
+@pytest.mark.parametrize(
+    "catalog_response",
+    (
+        _FakeHttpxResponse(404, text="not found"),
+        _catalog_response(
+            {"name": "memory:different", "tags": ["topic_shared"]}
+        ),
+    ),
+    ids=("missing-catalog", "missing-name"),
+)
+def test_peer_raw_fact_without_exact_catalog_name_is_not_fetched(
+    monkeypatch,
+    registry,
+    peer_graph,
+    catalog_response,
+):
+    _set_actor(monkeypatch, "spouse")
+    _patch_admin_key(monkeypatch)
+    _patch_audit(monkeypatch)
+    decision_calls = _patch_decider(
+        monkeypatch,
+        allowed=True,
+        reason="family_common_topic",
+    )
+    client = _MappedHttpxClient(
+        {
+            "private:owner:value:private_index": catalog_response,
+            "private:owner:memory:work": _FakeHttpxResponse(
+                200,
+                json_data={
+                    "value": codec.encode("must not leak", ["topic_shared"]),
+                    "ts": 1.0,
+                },
+            ),
+        }
+    )
+    monkeypatch.setattr(memory_mod.httpx, "AsyncClient", lambda **_kw: client)
+
+    result = _run(
+        MemoryGetTool().execute(
+            scope="private",
+            key="memory:work",
+            actor="owner",
+        )
+    )
+
+    assert result == "(no value stored at 'private:owner:memory:work')"
+    private_reads = [
+        call["params"]["key"]
+        for call in client.calls
+        if call["params"]["key"].startswith("private:")
+    ]
+    assert private_reads == [
+        "private:owner:value:private_index",
+    ]
+    assert decision_calls == []
+
+
+def test_peer_catalog_and_fact_tags_must_match_exactly(
+    monkeypatch,
+    registry,
+    peer_graph,
+):
+    _set_actor(monkeypatch, "spouse")
+    _patch_admin_key(monkeypatch)
+    _patch_audit(monkeypatch)
+    decision_calls = _patch_decider(
+        monkeypatch,
+        allowed=True,
+        reason="family_common_topic",
+    )
+    client = _MappedHttpxClient(
+        {
+            "private:owner:value:private_index": _catalog_response(
+                {"name": "memory:work", "tags": ["topic_shared"]}
+            ),
+            "private:owner:memory:work": _FakeHttpxResponse(
+                200,
+                json_data={
+                    "value": codec.encode("must not leak", ["hidden_topic"]),
+                    "ts": 1.0,
+                },
+            ),
+        }
+    )
+    monkeypatch.setattr(memory_mod.httpx, "AsyncClient", lambda **_kw: client)
+
+    result = _run(
+        MemoryGetTool().execute(
+            scope="private",
+            key="memory:work",
+            actor="owner",
+        )
+    )
+
+    assert result == "(no value stored at 'private:owner:memory:work')"
+    assert decision_calls == []
+
+
+def test_peer_untagged_non_atomic_private_record_is_not_returned(
+    monkeypatch,
+    registry,
+    peer_graph,
+):
     _set_actor(monkeypatch, "spouse")
     _patch_admin_key(monkeypatch)
     audit_events = _patch_audit(monkeypatch)
     decision_calls = _patch_decider(
         monkeypatch,
-        allowed=True,
-        reason="family_legacy_untagged",
+        allowed=False,
+        reason="untagged_foreign_denied",
     )
 
-    response = _FakeHttpxResponse(200, json_data={"value": "20 мая мотосервис"})
+    response = _FakeHttpxResponse(
+        200,
+        json_data={"value": "20 мая мотосервис", "ts": 1.0},
+    )
     client = _FakeHttpxClient(response)
     monkeypatch.setattr(
         memory_mod.httpx, "AsyncClient", lambda **kw: client,
@@ -250,15 +425,14 @@ def test_peer_reads_untagged_custom_private(monkeypatch, registry, peer_graph):
     tool = MemoryGetTool()
     result = _run(tool.execute(scope="private", key="moto", actor="owner"))
 
-    assert result == "20 мая мотосервис"
-    assert client.captured["headers"] == {"x-api-key": "admin-proxy-key"}
-    assert client.captured["params"] == {"key": "private:owner:moto"}
-    assert len(decision_calls) == 1
-    allow_events = [e for e in audit_events
-                    if e["type"] == "peer_private_read"
-                    and e.get("decision") == "allow"
-                    and e.get("reason") == "family_legacy_untagged"]
-    assert len(allow_events) == 1
+    assert result == "(no value stored at 'private:owner:moto')"
+    assert decision_calls == []
+    assert not [
+        event
+        for event in audit_events
+        if event["type"] == "peer_private_read"
+        and event.get("decision") == "allow"
+    ]
 
 
 def test_peer_denied_secret_tagged(monkeypatch, registry, peer_graph):
@@ -273,7 +447,10 @@ def test_peer_denied_secret_tagged(monkeypatch, registry, peer_graph):
     )
 
     wrapped = codec.encode("gift idea", [SECRET_TAG])
-    response = _FakeHttpxResponse(200, json_data={"value": wrapped})
+    response = _FakeHttpxResponse(
+        200,
+        json_data={"value": wrapped, "ts": 1.0},
+    )
     client = _FakeHttpxClient(response)
     monkeypatch.setattr(
         memory_mod.httpx, "AsyncClient", lambda **kw: client,
@@ -288,8 +465,8 @@ def test_peer_denied_secret_tagged(monkeypatch, registry, peer_graph):
                    if e["type"] == "peer_private_read"
                    and e.get("decision") == "deny"
                    and e.get("reason") == "no_common_topic"]
-    assert len(decision_calls) == 1
-    assert len(deny_events) == 1
+    assert decision_calls == []
+    assert len(deny_events) <= 1
 
 
 def test_non_peer_denied(monkeypatch, registry, peer_graph):
@@ -304,7 +481,10 @@ def test_non_peer_denied(monkeypatch, registry, peer_graph):
     )
     wrapped = codec.encode("must-not-leak", ["topic_shared"])
     client = _FakeHttpxClient(
-        _FakeHttpxResponse(200, json_data={"value": wrapped})
+        _FakeHttpxResponse(
+            200,
+            json_data={"value": wrapped, "ts": 1.0},
+        )
     )
     monkeypatch.setattr(
         memory_mod.httpx,
@@ -320,8 +500,8 @@ def test_non_peer_denied(monkeypatch, registry, peer_graph):
                    if e["type"] == "peer_private_read"
                    and e.get("decision") == "deny"
                    and e.get("reason") == "topic_without_family_relation"]
-    assert len(decision_calls) == 1
-    assert len(deny_events) == 1
+    assert decision_calls == []
+    assert len(deny_events) <= 1
 
 
 def test_child_denied_parent_private(monkeypatch, registry, peer_graph):
@@ -336,7 +516,10 @@ def test_child_denied_parent_private(monkeypatch, registry, peer_graph):
     )
     wrapped = codec.encode("must-not-leak", ["hidden_topic"])
     client = _FakeHttpxClient(
-        _FakeHttpxResponse(200, json_data={"value": wrapped})
+        _FakeHttpxResponse(
+            200,
+            json_data={"value": wrapped, "ts": 1.0},
+        )
     )
     monkeypatch.setattr(
         memory_mod.httpx, "AsyncClient",
@@ -351,8 +534,8 @@ def test_child_denied_parent_private(monkeypatch, registry, peer_graph):
                    if e["type"] == "peer_private_read"
                    and e.get("decision") == "deny"
                    and e.get("reason") == "no_common_topic"]
-    assert len(decision_calls) == 1
-    assert len(deny_events) == 1
+    assert decision_calls == []
+    assert len(deny_events) <= 1
 
 
 @pytest.mark.parametrize("reserved", [
@@ -360,18 +543,25 @@ def test_child_denied_parent_private(monkeypatch, registry, peer_graph):
     "value:user_profile",
     "value:heartbeat",
 ])
-def test_peer_reads_reserved_slot_via_proxy(monkeypatch, registry, peer_graph, reserved):
-    """The canonical decision can allow reserved slots through the proxy."""
+def test_peer_service_slot_is_never_returned(
+    monkeypatch,
+    registry,
+    peer_graph,
+    reserved,
+):
     _set_actor(monkeypatch, "spouse")
     _patch_admin_key(monkeypatch)
     _patch_audit(monkeypatch)
     decision_calls = _patch_decider(
         monkeypatch,
-        allowed=True,
-        reason="family_legacy_untagged",
+        allowed=False,
+        reason="owner_only_service_key",
     )
 
-    response = _FakeHttpxResponse(200, json_data={"value": "owner's reserved content"})
+    response = _FakeHttpxResponse(
+        200,
+        json_data={"value": "owner's reserved content", "ts": 1.0},
+    )
     client = _FakeHttpxClient(response)
     monkeypatch.setattr(
         memory_mod.httpx, "AsyncClient", lambda **kw: client,
@@ -380,11 +570,9 @@ def test_peer_reads_reserved_slot_via_proxy(monkeypatch, registry, peer_graph, r
     tool = MemoryGetTool()
     result = _run(tool.execute(scope="private", key=reserved, actor="owner"))
 
-    # Peer-proxy path: targets owner's namespace via admin key.
-    assert client.captured["params"] == {"key": f"private:owner:{reserved}"}
-    assert client.captured["headers"] == {"x-api-key": "admin-proxy-key"}
-    assert result == "owner's reserved content"
-    assert len(decision_calls) == 1
+    assert result == f"(no value stored at 'private:owner:{reserved}')"
+    assert client.captured == {}
+    assert decision_calls == []
 
 
 @pytest.mark.parametrize("reserved", [
@@ -405,7 +593,10 @@ def test_peer_denied_secret_reserved_slot(monkeypatch, registry, peer_graph, res
 
     from familia.acl import codec as _codec
     wrapped = _codec.encode("owner private journal entry", [SECRET_TAG])
-    response = _FakeHttpxResponse(200, json_data={"value": wrapped})
+    response = _FakeHttpxResponse(
+        200,
+        json_data={"value": wrapped, "ts": 1.0},
+    )
     client = _FakeHttpxClient(response)
     monkeypatch.setattr(
         memory_mod.httpx, "AsyncClient", lambda **kw: client,
@@ -415,7 +606,7 @@ def test_peer_denied_secret_reserved_slot(monkeypatch, registry, peer_graph, res
     result = _run(tool.execute(scope="private", key=reserved, actor="owner"))
 
     assert result == f"(no value stored at 'private:owner:{reserved}')"
-    assert len(decision_calls) == 1
+    assert decision_calls == []
 
 
 def test_owner_reads_own_secret(monkeypatch, registry, peer_graph):
@@ -424,7 +615,10 @@ def test_owner_reads_own_secret(monkeypatch, registry, peer_graph):
     _patch_audit(monkeypatch)
 
     wrapped = codec.encode("gift idea", [SECRET_TAG])
-    response = _FakeHttpxResponse(200, json_data={"value": wrapped})
+    response = _FakeHttpxResponse(
+        200,
+        json_data={"value": wrapped, "ts": 1.0},
+    )
     client = _FakeHttpxClient(response)
     monkeypatch.setattr(
         memory_mod.httpx, "AsyncClient", lambda **kw: client,

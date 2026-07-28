@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,7 +19,11 @@ class _Response:
         self._value = value
 
     def json(self) -> dict[str, Any]:
-        return {"value": self._value}
+        return {
+            "value": self._value,
+            "ts": 1.0,
+            "record_version": 1,
+        }
 
 
 class _AsyncClient:
@@ -45,6 +50,12 @@ class _AsyncClient:
             return _Response(self._family_graph)
         if key == "shared:topics.graph":
             return _Response(self._topics_graph)
+        if key == "private:bob:value:private_index":
+            return _Response(
+                json.dumps(
+                    [{"name": "memory:fact-shared", "tags": ["topic_shared"]}]
+                )
+            )
         return _Response(self._encoded_value)
 
 
@@ -136,7 +147,13 @@ def _patch_private_read(
     monkeypatch.setattr(
         principal_memory,
         "get_raw",
-        lambda key, *, api_key: encoded_value,
+        lambda key, *, api_key: (
+            json.dumps(
+                [{"name": "memory:fact-shared", "tags": ["topic_shared"]}]
+            )
+            if key == "private:bob:value:private_index"
+            else encoded_value
+        ),
     )
     monkeypatch.setattr(
         memory.httpx,
@@ -225,11 +242,11 @@ def test_automatic_and_explicit_peer_reads_share_one_canonical_decision(
     automatic = principal_memory.PrincipalMemoryClient(
         "alice",
         "alice-key",
-    ).get_other("bob", "value:memory")
+    ).get_other("bob", "memory:fact-shared")
     explicit = asyncio.run(
         MemoryGetTool().execute(
             "private",
-            "value:memory",
+            "memory:fact-shared",
             actor="bob",
         )
     )
@@ -250,7 +267,7 @@ def test_automatic_and_explicit_peer_reads_share_one_canonical_decision(
         "reader": "alice",
         "owner": "bob",
         "scope": "private",
-        "key": "value:memory",
+        "key": "memory:fact-shared",
         "tags": ("topic_shared",),
         "static_policy": "no_matching_rule",
     }
@@ -259,7 +276,7 @@ def test_automatic_and_explicit_peer_reads_share_one_canonical_decision(
     assert audit_event["event_type"] == "peer_private_read"
     assert audit_event["actor"] == "alice"
     assert audit_event["peer"] == "bob"
-    assert audit_event["key"] == "private:bob:value:memory"
+    assert audit_event["key"] == "private:bob:memory:fact-shared"
     assert audit_event["decision"] == ("allow" if allowed else "deny")
     assert audit_event["reason"] == reason
 
@@ -304,11 +321,11 @@ def test_automatic_and_explicit_reads_reject_the_same_malformed_raw_graph(
     automatic = principal_memory.PrincipalMemoryClient(
         "alice",
         "alice-key",
-    ).get_other("bob", "value:memory")
+    ).get_other("bob", "memory:fact-shared")
     explicit = asyncio.run(
         MemoryGetTool().execute(
             "private",
-            "value:memory",
+            "memory:fact-shared",
             actor="bob",
         )
     )
@@ -330,10 +347,12 @@ def test_memory_get_description_matches_the_canonical_read_rules() -> None:
     for required in (
         "family relation",
         "exact common topic",
-        "legacy untagged",
+        "exact owner catalog",
+        "only `private`",
         "owner-only service",
         "internal transaction",
-        "secret and static deny do not override canonical common-topic allow",
+        "secret",
+        "`shared` and `pair`",
     ):
         assert required in description
 
@@ -341,16 +360,15 @@ def test_memory_get_description_matches_the_canonical_read_rules() -> None:
         "reads any",
         "every `private:` record is peer-readable",
         "tagged 'secret' are filtered",
+        "legacy untagged",
+        "static deny do not override",
     ):
         assert forbidden not in description
 
 
 @pytest.mark.parametrize(
     ("peer", "key", "reason"),
-    [
-        (False, "memory:fact_shared", "topic_without_family_relation"),
-        (True, "pending_migration:choice", "owner_only_service_key"),
-    ],
+    [(False, "memory:fact-shared", "topic_without_family_relation")],
 )
 def test_denied_peer_private_read_emits_one_stable_audit_reason(
     monkeypatch: pytest.MonkeyPatch,
@@ -399,6 +417,46 @@ def test_denied_peer_private_read_emits_one_stable_audit_reason(
     assert audit_event["key"] == f"private:bob:{key}"
     assert audit_event["decision"] == "deny"
     assert audit_event["reason"] == reason
+
+
+def test_explicit_peer_service_read_is_owner_only_before_fact_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from familia.acl import codec
+    from familia.tools.memory import MemoryGetTool
+
+    encoded = codec.encode("must-not-leak", ["topic_shared"])
+    _principal_memory, memory, audit_events = _patch_private_read(
+        monkeypatch,
+        encoded_value=encoded,
+        peer=True,
+    )
+    decision_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        memory,
+        "decide_memory_read",
+        lambda **kwargs: (
+            decision_calls.append(dict(kwargs))
+            or SimpleNamespace(allowed=False, reason="owner_only_service_key")
+        ),
+        raising=False,
+    )
+
+    result = asyncio.run(
+        MemoryGetTool().execute(
+            "private",
+            "value:user_profile",
+            actor="bob",
+        )
+    )
+
+    assert result.startswith("(no value stored")
+    assert decision_calls == []
+    assert not [
+        event
+        for event in audit_events
+        if event.get("decision") == "allow"
+    ]
 
 
 def test_memory_get_private_missing_target_is_denied(monkeypatch):

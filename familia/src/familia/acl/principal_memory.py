@@ -53,6 +53,7 @@ _ORDINARY_VALUE_KEYS = frozenset(
         "value:shared_index",
     }
 )
+_FACT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _PRINCIPAL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _NO_MATCHING_STATIC_POLICY = "no_matching_rule"
 
@@ -63,6 +64,32 @@ class MemoryReadDecision:
 
     allowed: bool
     reason: str
+
+
+def is_valid_atomic_memory_key(key: object) -> bool:
+    """Return whether key has the ingestor's exact atomic-fact shape."""
+    if not isinstance(key, str) or not key.startswith("memory:"):
+        return False
+    return _FACT_ID_RE.fullmatch(key.removeprefix("memory:")) is not None
+
+
+def canonical_memory_tags(tags: object) -> tuple[str, ...] | None:
+    """Validate server tags and return one deterministic set representation."""
+    if isinstance(tags, (str, bytes)) or not isinstance(tags, Sequence):
+        return None
+    canonical: list[str] = []
+    seen: set[str] = set()
+    for tag in tags:
+        if (
+            not isinstance(tag, str)
+            or not tag
+            or any(character.isspace() for character in tag)
+            or tag in seen
+        ):
+            return None
+        seen.add(tag)
+        canonical.append(tag)
+    return tuple(sorted(canonical))
 
 
 def decide_memory_read(
@@ -84,10 +111,8 @@ def decide_memory_read(
         return MemoryReadDecision(False, "invalid_record")
     if not _PRINCIPAL_ID_RE.fullmatch(reader) or not _PRINCIPAL_ID_RE.fullmatch(owner):
         return MemoryReadDecision(False, "invalid_record")
-    if isinstance(tags, (str, bytes)) or not isinstance(tags, Sequence):
-        return MemoryReadDecision(False, "invalid_record")
-    record_tags = tuple(tags)
-    if any(not isinstance(tag, str) or not tag for tag in record_tags):
+    record_tags = canonical_memory_tags(tags)
+    if record_tags is None:
         return MemoryReadDecision(False, "invalid_record")
 
     key_kind = _classify_memory_key(key)
@@ -117,11 +142,6 @@ def decide_memory_read(
     ):
         return MemoryReadDecision(False, "invalid_record")
 
-    if key_kind == "history":
-        return MemoryReadDecision(False, "internal_transaction_candidate")
-    if key_kind == "pending_migration" and reader != owner:
-        return MemoryReadDecision(False, "owner_only_service_key")
-
     pair_members: tuple[str, str] | None = None
     if scope.startswith("pair:"):
         pair_members = _decode_pair_scope(scope)
@@ -132,41 +152,38 @@ def decide_memory_read(
 
     if reader == owner:
         return MemoryReadDecision(True, "owner_self")
+    if key_kind == "history":
+        return MemoryReadDecision(False, "internal_transaction_candidate")
+    if key_kind in {"service", "pending_migration"}:
+        return MemoryReadDecision(False, "owner_only_service_key")
+    if "secret" in record_tags:
+        return MemoryReadDecision(False, "owner_only_secret")
     if pair_members is not None:
-        if reader in pair_members:
-            return MemoryReadDecision(True, "pair_member")
-        return MemoryReadDecision(False, "pair_non_member")
+        reason = "pair_scope_not_readable"
+        if reader not in pair_members:
+            reason = "pair_non_member"
+        return MemoryReadDecision(False, reason)
+    if scope == "shared":
+        return MemoryReadDecision(False, "shared_scope_not_readable")
 
     related = _has_family_relation(family_edges, reader, owner)
-    if scope == "shared":
-        if related:
-            return MemoryReadDecision(True, "shared_family_relation")
-        return MemoryReadDecision(False, "shared_without_family_relation")
-
     common_topic = any(
         reader in circle and owner in circle for circle in topic_circles
     )
     if related and common_topic:
         return MemoryReadDecision(True, "family_common_topic")
-    if related and not record_tags:
-        return MemoryReadDecision(True, "family_legacy_untagged")
     if related:
         return MemoryReadDecision(False, "no_common_topic")
     if common_topic:
         return MemoryReadDecision(False, "topic_without_family_relation")
-
-    if static_policy == "allow":
-        return MemoryReadDecision(True, "static_policy_allow")
-    if static_policy == "deny":
-        return MemoryReadDecision(False, "static_policy_deny")
-    return MemoryReadDecision(False, "no_matching_static_rule")
+    return MemoryReadDecision(False, "no_family_relation")
 
 
 def _classify_memory_key(key: str) -> str | None:
     if key in _ORDINARY_VALUE_KEYS:
-        return "ordinary"
-    if key.startswith("memory:") and key.removeprefix("memory:"):
-        return "ordinary"
+        return "service"
+    if is_valid_atomic_memory_key(key):
+        return "memory"
     if key.startswith("history:") and key.removeprefix("history:"):
         return "history"
     if key.startswith("pending_migration:") and key.removeprefix(
