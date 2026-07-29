@@ -427,16 +427,6 @@ def _current_actor_and_key() -> tuple[str | None, str | None, str | None]:
     return actor_id, principal.memx_key, None
 
 
-_TAGS_DESC = (
-    "Optional list of tag-ids to attach to this record. Tags must be ids "
-    "from the family graphs (principals or topics) that the current actor "
-    "has access to. The record is then visible to anyone whose reachable "
-    "tag-set intersects with these. Used for cross-cutting access (e.g. "
-    "[child, school] makes a record visible to anyone connected to "
-    "principal child OR the school topic). Omit for legacy scope-only ACL."
-)
-
-
 _ACTOR_PARAM_DESC = (
     "Optional principal id whose namespace to read. Defaults to the "
     "current actor (own namespace) and is valid only for 'private'. "
