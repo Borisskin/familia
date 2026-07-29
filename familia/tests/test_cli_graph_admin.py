@@ -312,7 +312,7 @@ def test_seed_topics_apply_moves_subject(fake_store):
     assert "child" not in family_ids
     assert "syava" not in family_ids
     topic_ids = [n["id"] for n in store[graph_admin.TOPICS_KEY]["nodes"]]
-    assert sorted(topic_ids) == ["syava", "child"]
+    assert sorted(topic_ids) == ["child", "syava"]
     # concerns edges with proper concerns_as
     edges = store[graph_admin.TOPICS_KEY]["edges"]
     by_topic = {e["from"]: e for e in edges}

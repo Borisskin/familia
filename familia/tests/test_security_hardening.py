@@ -250,7 +250,7 @@ def test_memory_get_handles_memx_null_body(registry, monkeypatch):
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(return_value=mock_resp)
         mock_client_cls.return_value.__aenter__.return_value = mock_client
-        out = asyncio.run(tool.execute(scope="shared", key="never_written"))
+        out = asyncio.run(tool.execute(scope="private", key="never_written"))
     assert "no value stored" in out.lower()
 
 
@@ -272,7 +272,7 @@ def test_memory_get_handles_explicit_null_value(registry):
         mock_client = AsyncMock()
         mock_client.get = AsyncMock(return_value=mock_resp)
         mock_client_cls.return_value.__aenter__.return_value = mock_client
-        out = asyncio.run(tool.execute(scope="shared", key="zeroed"))
+        out = asyncio.run(tool.execute(scope="private", key="zeroed"))
     assert "no value stored" in out.lower()
 
 
