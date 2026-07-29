@@ -302,7 +302,7 @@ async def websocket_endpoint(websocket: WebSocket, key: str):
     try:
         while True:
             await asyncio.sleep(1)
-    except:
+    except asyncio.CancelledError:
         print(f"[WebSocket] closed: {namespaced_key} ({event_type})")
 
 @app.post("/schema")

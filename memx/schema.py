@@ -1,6 +1,5 @@
 import json
 import jsonschema
-import redis
 from redis_client import get_client
 
 

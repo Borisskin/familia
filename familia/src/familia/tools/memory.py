@@ -49,7 +49,7 @@ from familia.principals import (
 )
 from familia.roles import get_effective_roles
 from nanobot.agent.tools.base import Tool, tool_parameters
-from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
+from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
 SCOPE_DESC = (
     "Memory read scope. Only 'private' is accepted; 'shared' and 'pair' "
     "are rejected before policy or storage access. Own private keys are "

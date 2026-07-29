@@ -30,7 +30,6 @@ Exit codes: ``0`` ok, ``2`` bad args / validation, ``1`` runtime error.
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 import os
 import sys
