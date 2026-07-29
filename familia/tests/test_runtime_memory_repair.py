@@ -106,6 +106,7 @@ def test_principal_memory_rejects_peer_service_slot_before_dependencies(
         principal_memory_mod,
         "get_engine",
         forbidden_dependency("policy"),
+        raising=False,
     )
     monkeypatch.setattr(
         graph_io,

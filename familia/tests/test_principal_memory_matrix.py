@@ -236,7 +236,12 @@ def test_automatic_and_explicit_peer_reads_share_one_canonical_decision(
     def legacy_policy_must_not_run() -> None:
         raise AssertionError("canonical peer read must not consult legacy policy")
 
-    monkeypatch.setattr(principal_memory, "get_engine", legacy_policy_must_not_run)
+    monkeypatch.setattr(
+        principal_memory,
+        "get_engine",
+        legacy_policy_must_not_run,
+        raising=False,
+    )
     monkeypatch.setattr(memory, "get_engine", legacy_policy_must_not_run)
 
     automatic = principal_memory.PrincipalMemoryClient(
