@@ -54,7 +54,7 @@ def _memx_requirement_pins() -> dict[str, str]:
 def check(backend_version: str, release_tag: str) -> list[str]:
     errors: list[str] = []
     expected_tag = f"image-v{backend_version}"
-    _error(errors, backend_version == "0.4.0", "backend version must be exactly 0.4.0")
+    _error(errors, backend_version == "0.4.1", "backend version must be exactly 0.4.1")
     _error(errors, release_tag == expected_tag, f"release tag must be {expected_tag}")
 
     familia = _toml("familia/pyproject.toml")

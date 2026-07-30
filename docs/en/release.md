@@ -63,7 +63,7 @@ SemVer, never `latest`, so their stack won't drift unexpectedly.
 ## Compatibility
 
 Each release of admin declares a minimum image version
-(`min_image_version` constant, currently `0.4.0`). The gateway's
+(`min_image_version` constant, currently `0.4.1`). The gateway's
 `/health` returns `image_version`. On connect the admin compares;
 if mismatch, the **Compatibility** banner offers an inline
 "upgrade image" button.

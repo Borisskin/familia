@@ -3,7 +3,7 @@
 # flow.
 #
 # Usage (from repo root):
-#   ./bin/build-source-pack.sh 0.4.0 [/output/dir]
+#   ./bin/build-source-pack.sh 0.4.1 [/output/dir]
 #
 # Produces:
 #   <output>/familia-source-v<VERSION>.tar.gz       — sources for VM build
@@ -45,7 +45,7 @@ set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
     echo "usage: $0 <version> [output-dir]" >&2
-    echo "example: $0 0.4.0 dist/admin/" >&2
+    echo "example: $0 0.4.1 dist/admin/" >&2
     exit 2
 fi
 VER="$1"
