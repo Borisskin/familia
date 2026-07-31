@@ -59,7 +59,7 @@ Redis (state + schemas)  <-- pub/sub notifications --> WebSocket clients
 Three autonomous agents coordinating on a research task:
 
 | Agent              | Behavior                                             |
-| ------------------ | ---------------------------------------------------- |
+| --- | --- |
 | `QueryAgent`       | Seeds the research question and background context   |
 | `ExplorerAgent`    | Adds search results and working notes                |
 | `SynthesizerAgent` | Summarizes the shared context into final insights    |

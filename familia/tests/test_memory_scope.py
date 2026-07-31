@@ -12,11 +12,14 @@ heartbeat tick, breaking the upcoming-events check. The fix accepts both
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from familia import principals as principals_mod
 from familia.principals import Identity, Principal, PrincipalRegistry
-from familia.tools.memory import _resolve_full_key
+from familia.tools import memory as memory_mod
+from familia.tools.memory import MemoryGetTool, _resolve_full_key
 
 
 @pytest.fixture
@@ -32,6 +35,7 @@ def registry(monkeypatch: pytest.MonkeyPatch) -> PrincipalRegistry:
                   memx_key="k3", roles=[]),
     ])
     monkeypatch.setattr(principals_mod, "_registry", reg)
+    monkeypatch.setattr(memory_mod, "is_peer", lambda _a, _b: True)
     return reg
 
 
@@ -100,6 +104,23 @@ def test_pair_random_underscored_string_rejected(registry):
     assert "unknown principal" in err.lower()
 
 
+def test_actual_pair_namespace_collision_is_rejected(monkeypatch):
+    reg = PrincipalRegistry([
+        Principal(id="a", memx_key="ka"),
+        Principal(id="a_b", memx_key="kab"),
+        Principal(id="b_c", memx_key="kbc"),
+        Principal(id="c", memx_key="kc"),
+    ])
+    monkeypatch.setattr(principals_mod, "_registry", reg)
+    monkeypatch.setattr("familia.tools.memory.is_peer", lambda _a, _b: True)
+
+    full, err = _resolve_full_key("pair:b_c", "x", "a")
+
+    assert full is None
+    assert err is not None
+    assert "ambiguous pair namespace" in err.lower()
+
+
 def test_pair_empty_other_rejected(registry):
     _, err = _resolve_full_key("pair:", "x", "member_a")
     assert err is not None
@@ -113,3 +134,52 @@ def test_unknown_scope_rejected(registry):
 def test_empty_key_rejected(registry):
     _, err = _resolve_full_key("shared", "", "member_a")
     assert err is not None
+
+
+@pytest.mark.parametrize("scope", ("shared", "pair:owner"))
+def test_memory_get_rejects_legacy_scope_before_any_read_dependency(
+    monkeypatch: pytest.MonkeyPatch,
+    registry: PrincipalRegistry,
+    scope: str,
+) -> None:
+    calls = {
+        "policy": 0,
+        "admin_key": 0,
+        "graphs": 0,
+        "http": 0,
+        "memx": 0,
+    }
+
+    def touched(name: str):
+        def fail(*_args, **_kwargs):
+            calls[name] += 1
+            raise AssertionError(f"{name} must not be used for scope={scope}")
+
+        return fail
+
+    class ForbiddenHttpClient:
+        def __init__(self, *_args, **_kwargs):
+            calls["http"] += 1
+            raise AssertionError(f"HTTP must not be created for scope={scope}")
+
+        async def get(self, *_args, **_kwargs):
+            calls["memx"] += 1
+            raise AssertionError(f"memX must not be read for scope={scope}")
+
+    monkeypatch.setattr(memory_mod, "get_current_actor", lambda: "member_a")
+    monkeypatch.setattr(memory_mod, "get_engine", touched("policy"))
+    monkeypatch.setattr(memory_mod, "resolve_admin_key", touched("admin_key"))
+    monkeypatch.setattr(memory_mod, "_fetch_graph", touched("graphs"))
+    monkeypatch.setattr(memory_mod.httpx, "AsyncClient", ForbiddenHttpClient)
+
+    result = asyncio.run(MemoryGetTool().execute(scope=scope, key="todo"))
+
+    assert result.startswith("Error:")
+    assert "private" in result.lower()
+    assert calls == {
+        "policy": 0,
+        "admin_key": 0,
+        "graphs": 0,
+        "http": 0,
+        "memx": 0,
+    }

@@ -49,10 +49,10 @@ _CRON_PARAMETERS = tool_parameters_schema(
     tags=ArraySchema(
         StringSchema(""),
         description=(
-            "Optional list of tag-ids attached to this job. Same semantics as "
-            "memory_set tags: tag-ids must be reachable by the calling actor "
-            "(principals or topics in the family graphs). When set, ``cron list`` "
-            "filters jobs by intersection of tags with the viewer's reachable set."
+            "Optional list of tag ids attached to this job. When a tag visibility "
+            "adapter is configured, tag ids must be reachable by the calling actor, "
+            "and ``cron list`` filters jobs by intersection with the viewer's "
+            "reachable set."
         ),
         nullable=True,
     ),
@@ -97,9 +97,9 @@ class CronTool(Tool):
         # before — backwards-compat for single-user installs.
         self._current_actor_getter = current_actor_getter
         self._is_admin_getter = is_admin_getter
-        # Optional callback for tag-based visibility (familia integration).
-        # Returns the set of tag-ids reachable by the actor (across both
-        # graphs). Without it, tags are stored on jobs but ``cron list``
+        # Optional callback for tag-based visibility.
+        # Returns the set of tag ids reachable by the actor. Without it,
+        # tags are stored on jobs but ``cron list``
         # falls back to the legacy ownership-only filter.
         self._reachable_tags_getter = reachable_tags_getter
         self._channel: ContextVar[str] = ContextVar("cron_channel", default="")
@@ -249,9 +249,9 @@ class CronTool(Tool):
             return "Error: either every_seconds, cron_expr, or at is required"
 
         creator = self._current_actor_getter() if self._current_actor_getter else None
-        # Tag write-side ACL (mirror of memory_set SR-7): if a reachable
-        # getter is wired, every tag must be in the actor's reachable set.
-        # Admin bypass: if is_admin_getter says yes, skip the check.
+        # Tag write-side ACL: if a reachable getter is wired, every tag must
+        # be in the actor's reachable set. Admin bypass: if is_admin_getter
+        # says yes, skip the check.
         clean_tags: list[str] = []
         if tags:
             clean_tags = [t.strip() for t in tags if isinstance(t, str) and t.strip()]
@@ -334,7 +334,7 @@ class CronTool(Tool):
           (a) they created the job (``payload.created_by``);
           (b) they are the recipient (``payload.to`` matches their chat_id);
           (c) tag-intersection: ``payload.tags`` intersects the viewer's
-              reachable set (familia integration only).
+              reachable set provided by the integration.
 
         When neither getter callback is wired (nanobot-standalone), we
         preserve the original "show everything" behavior for backwards
@@ -351,7 +351,7 @@ class CronTool(Tool):
             return True
         if viewer_chat_id and job.payload.to == viewer_chat_id:
             return True
-        # Tag-intersection visibility (familia integration).
+        # Tag-intersection visibility.
         if (job.payload.tags
                 and self._reachable_tags_getter is not None
                 and viewer is not None):

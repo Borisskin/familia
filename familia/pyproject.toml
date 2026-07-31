@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "familia"
-version = "0.3.3"
+version = "0.4.1"
 description = "Family assistant package — principals, policy, roles, memX-backed memory, ask/buttons/graph tools"
 requires-python = ">=3.11"
 readme = "README.md"
@@ -34,6 +34,12 @@ dev = [
 [project.scripts]
 familia-audit = "familia.cli.audit_view:main"
 familia = "familia.cli.graph_admin:main"
+
+[project.entry-points."nanobot.channels"]
+vk = "familia.channels.vk:VKChannel"
+
+[project.entry-points."nanobot.runtime_adapters"]
+familia = "familia.bootstrap"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/familia"]

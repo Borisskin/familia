@@ -49,6 +49,15 @@ class SafeFileHistory(FileHistory):
 from nanobot.cli.stream import StreamRenderer, ThinkingSpinner
 from nanobot.config.paths import get_workspace_path, is_default_workspace
 from nanobot.config.schema import Config
+from nanobot.runtime_adapters import (
+    apply_heartbeat_defaults,
+    make_agent_loop_kwargs,
+    make_callback_handlers,
+    make_channel_manager_kwargs,
+    make_heartbeat_source_reader,
+    reload_runtime_registry,
+    resolve_heartbeat_target,
+)
 from nanobot.utils.helpers import sync_workspace_templates
 from nanobot.utils.restart import (
     consume_restart_notice_from_env,
@@ -594,6 +603,7 @@ def serve(
         disabled_skills=runtime_config.agents.defaults.disabled_skills,
         session_ttl_minutes=runtime_config.agents.defaults.session_ttl_minutes,
         tools_config=runtime_config.tools,
+        **make_agent_loop_kwargs(runtime_config.workspace_path),
     )
 
     model_name = runtime_config.agents.defaults.model
@@ -659,6 +669,7 @@ def _run_gateway(
 ) -> None:
     """Shared gateway runtime; ``open_browser_url`` opens a tab once channels are up."""
     from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.callbacks import CallbackDispatcher
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
     from nanobot.cron.service import CronService
@@ -705,6 +716,7 @@ def _run_gateway(
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         tools_config=config.tools,
+        **make_agent_loop_kwargs(config.workspace_path),
     )
 
     # Set cron callback (needs agent)
@@ -759,18 +771,12 @@ def _run_gateway(
         async def _silent(*_args, **_kwargs):
             pass
 
-        from familia.principals import resolve_actor
-        actor = None
-        if job.payload.channel and job.payload.to:
-            actor = resolve_actor(job.payload.channel, job.payload.to)
-
         try:
             resp = await agent.process_direct(
                 reminder_note,
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
-                actor=actor,
                 on_progress=_silent,
             )
         finally:
@@ -800,10 +806,14 @@ def _run_gateway(
 
     # Create channel manager (forwards SessionManager so the WebSocket channel
     # can serve the embedded webui's REST surface).
-    channels = ChannelManager(config, bus, session_manager=session_manager)
+    channels = ChannelManager(
+        config,
+        bus,
+        session_manager=session_manager,
+        **make_channel_manager_kwargs(),
+    )
 
-    from familia.bus.callback_dispatcher import CallbackDispatcher
-    callback_dispatcher = CallbackDispatcher(bus)
+    callback_dispatcher = CallbackDispatcher(bus, make_callback_handlers(bus))
 
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages.
@@ -822,12 +832,9 @@ def _run_gateway(
 
         target_actor = (config.gateway.heartbeat.target_actor or "").strip()
         if target_actor:
-            from familia.principals import get_registry
-            principal = get_registry().get(target_actor)
-            if principal is not None:
-                for ident in principal.identities:
-                    if ident.channel in enabled and ident.sender_id:
-                        return ident.channel, str(ident.sender_id)
+            resolved = resolve_heartbeat_target(target_actor, enabled)
+            if resolved is not None:
+                return resolved
             # Fail closed: when target_actor is set but unresolvable, do NOT
             # silently leak system messages into the most-recently-active
             # user's chat. Returning (cli, direct) suppresses delivery on
@@ -862,20 +869,11 @@ def _run_gateway(
         async def _silent(*_args, **_kwargs):
             pass
 
-        # Pin the principal derived from the delivery target so scoped
-        # tools (memX shared/pair, role gates) resolve under a real
-        # actor. Without this, ``get_current_actor()`` returns None in
-        # heartbeat turns and memory_get fails with "no actor in
-        # context". Same pattern as cron delivery.
-        from familia.principals import resolve_actor
-        actor = resolve_actor(channel, chat_id) if channel and chat_id else None
-
         resp = await agent.process_direct(
             tasks,
             session_key="heartbeat",
             channel=channel,
             chat_id=chat_id,
-            actor=actor,
             on_progress=_silent,
         )
 
@@ -896,13 +894,7 @@ def _run_gateway(
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
 
     hb_cfg = config.gateway.heartbeat
-    try:
-        from familia import bootstrap as familia_bootstrap
-        familia_bootstrap.apply_heartbeat_defaults(hb_cfg)
-    except ImportError:
-        # Standalone nanobot install — heartbeat keeps the legacy
-        # most-recent-session behavior since target_actor is empty.
-        logger.debug("familia not available; heartbeat target_actor stays unset")
+    apply_heartbeat_defaults(hb_cfg)
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
         provider=provider,
@@ -912,6 +904,7 @@ def _run_gateway(
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
         timezone=config.agents.defaults.timezone,
+        source_reader=make_heartbeat_source_reader(hb_cfg.target_actor),
     )
 
     if channels.enabled_channels:
@@ -1034,14 +1027,13 @@ def _run_gateway(
         except Exception as e:
             console.print(f"[yellow]Could not open browser ({e}); visit {open_browser_url}[/yellow]")
 
-    # Re-entrancy guard for the SIGHUP handler. Two admin operations
-    # in quick succession (e.g. ``channels remove`` immediately
-    # followed by ``pending approve``) each fire ``docker kill
-    # --signal=HUP``. Without the lock both would spawn concurrent
+    # Re-entrancy guard for the SIGHUP handler. Two external config
+    # operations in quick succession can each send a reload signal.
+    # Without the lock both would spawn concurrent
     # ``_handle_sighup`` tasks: each calls ``manager.stop_all()`` and
     # then ``_init_channels()`` + ``start_all()``, leaving two
     # ``_dispatch_outbound`` tasks consuming from the same outbound
-    # queue and (for VK) two long-poll readers on the same token —
+    # queue and duplicate channel readers on the same credentials —
     # duplicate-message processing and a half-stopped channel state
     # are reachable from this race.
     #
@@ -1057,14 +1049,12 @@ def _run_gateway(
     async def _handle_sighup() -> None:
         """Hot-reload principals registry and channel adapters from disk.
 
-        Triggered by ``docker kill --signal=HUP familia-gateway`` from
-        the admin app after operations that mutate principals.json or
-        config.json (pending approve, channel add/remove/edit). Avoids
-        a full container restart — the gateway keeps its loaded
-        agent / cron / heartbeat / callback dispatcher / providers,
-        and only the parts that read mutable on-disk state get
-        rebuilt. Drops the ~30 s «restart_gateway_quiet» wait the
-        admin used to do after every such mutation.
+        Triggered by a HUP signal after operations that mutate runtime
+        config files (for example approval state or channel
+        add/remove/edit). Avoids a full process restart: the gateway
+        keeps its loaded agent / cron / heartbeat / callback dispatcher /
+        providers, and only the parts that read mutable on-disk state get
+        rebuilt.
 
         Serialised under ``sighup_lock`` so concurrent SIGHUPs can't
         interleave stop/start cycles. A second SIGHUP that arrives
@@ -1084,8 +1074,7 @@ def _run_gateway(
                 # 1. principals.json — drop the cached registry; next
                 #    ``get_registry()`` call reads the file again.
                 try:
-                    from familia.principals import reload_registry
-                    reload_registry()
+                    reload_runtime_registry()
                     logger.info("SIGHUP: principals registry reloaded")
                 except Exception:
                     logger.exception(
@@ -1280,6 +1269,7 @@ def agent(
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         tools_config=config.tools,
+        **make_agent_loop_kwargs(config.workspace_path),
     )
     restart_notice = consume_restart_notice_from_env()
     if restart_notice and should_show_cli_restart_notice(restart_notice, session_id):

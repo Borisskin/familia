@@ -1,0 +1,35 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/cron/types.py b/nanobot/nanobot/cron/types.py
+index c38542e..d395375 100644
+--- a/nanobot/nanobot/cron/types.py
++++ b/nanobot/nanobot/cron/types.py
+@@ -27,6 +27,20 @@ class CronPayload:
+     deliver: bool = False
+     channel: str | None = None  # e.g. "whatsapp"
+     to: str | None = None  # e.g. phone number
++    # Principal id of the actor who scheduled this job. Used by ``cron list`` to
++    # filter visibility so non-admin participants only see their own reminders
++    # (created by them OR addressed to them). None on jobs predating the field
++    # or on system jobs — they're treated as admin-only by the list filter.
++    created_by: str | None = None
++    # Tag ids attached to this job. Integrations may define a tag namespace
++    # and a per-viewer reachable set. When set, ``cron list`` filters by
++    # intersection with that reachable set, in addition to the legacy
++    # creator/addressee match.
++    tags: list[str] = field(default_factory=list)
++    # Neutral multi-principal identity fields. Standalone nanobot leaves them
++    # unset; product adapters may require them and fail closed when absent.
++    creator_actor: str | None = None
++    target_actor: str | None = None
+ 
+ 
+ @dataclass
+@@ -77,5 +91,5 @@ class CronJob:
+ @dataclass
+ class CronStore:
+     """Persistent store for cron jobs."""
+-    version: int = 1
++    version: int = 2
+     jobs: list[CronJob] = field(default_factory=list)

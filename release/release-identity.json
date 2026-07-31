@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.0",
+  "backend_version": "0.4.1",
+  "release_tag": "image-v0.4.1",
+  "release_scope": "backend-only",
+  "component_versions": {
+    "familia": "0.4.1",
+    "vendored_nanobot": "0.1.5.post2",
+    "memx": "0.1.0",
+    "memx_sdk": "0.1.1",
+    "bridge": "0.1.0"
+  },
+  "included_components": [
+    "tracked backend",
+    "vendored nanobot baseline",
+    "Familia adapters",
+    "memX",
+    "bridge",
+    "Compose",
+    "memory migration and repair tooling",
+    "operator documentation"
+  ],
+  "excluded_components": [
+    "ignored local admin/"
+  ],
+  "vendored_nanobot": {
+    "version": "0.1.5.post2",
+    "baseline_commit": "950dddec499fbbe0353e997158c99808f0bb41e1",
+    "behavioral_equivalence_claimed": false
+  },
+  "deferred": {
+    "admin_independent_audit": true,
+    "later_nanobot_target_selected": false,
+    "version_synchronization_work_item": "RP-120"
+  },
+  "memory_contract": {
+    "canonical_export": "familia.memory_contract.MEMORY_CONTRACT",
+    "contract_version": "2.0.0",
+    "later_nanobot_upgrade_invariant_boundary": true
+  }
+}

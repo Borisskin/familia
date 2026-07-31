@@ -5,7 +5,7 @@ Two independent SemVer tracks, coupled by a compose-template constant.
 ## Tracks
 
 | Track | What changes trigger a bump | Tag prefix | Where it ships |
-|-------|------------------------------|-----------|-----------------|
+| --- | --- | --- | --- |
 | **Image** | `familia/`, `nanobot/`, `memx/`, `Dockerfile` | `image-vX.Y.Z` | `ghcr.io/<owner>/familia-assistant:X.Y.Z`, `ghcr.io/<owner>/memx:X.Y.Z` |
 | **Admin** | UI / IPC / install wizard | `admin-vX.Y.Z` | GitHub Release: `FamiliaAdmin-vX.Y.Z.exe` + `WebView2Loader.dll` (+ both `.sha256`) |
 
@@ -27,7 +27,7 @@ embeds the new image tag.
 
 ## Tag → CI flow
 
-```
+```bash
 git commit ...
 git tag image-v0.5.0           # only when backend changed
 git tag admin-v0.5.35          # for the corresponding admin
@@ -63,7 +63,7 @@ SemVer, never `latest`, so their stack won't drift unexpectedly.
 ## Compatibility
 
 Each release of admin declares a minimum image version
-(`min_image_version` constant, currently `0.4.0`). The gateway's
+(`min_image_version` constant, currently `0.4.1`). The gateway's
 `/health` returns `image_version`. On connect the admin compares;
 if mismatch, the **Compatibility** banner offers an inline
 "upgrade image" button.

@@ -2,7 +2,7 @@
 
 A thin counterpart to :class:`~nanobot.agent.tools.message.MessageTool`
 that lets the agent deliver a message together with a channel-agnostic
-keyboard spec.  The channel layer (e.g. :mod:`nanobot.channels.vk`)
+keyboard spec.  The channel layer (e.g. :mod:`familia.channels.vk`)
 translates ``metadata["keyboard"]`` into the native format and routes
 callback presses back through ``MessageBus.publish_callback``.
 

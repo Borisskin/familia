@@ -3,7 +3,7 @@
 # flow.
 #
 # Usage (from repo root):
-#   ./bin/build-source-pack.sh 0.4.0 [/output/dir]
+#   ./bin/build-source-pack.sh 0.4.1 [/output/dir]
 #
 # Produces:
 #   <output>/familia-source-v<VERSION>.tar.gz       — sources for VM build
@@ -45,13 +45,32 @@ set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
     echo "usage: $0 <version> [output-dir]" >&2
-    echo "example: $0 0.4.0 dist/admin/" >&2
+    echo "example: $0 0.4.1 dist/admin/" >&2
     exit 2
 fi
 VER="$1"
 OUT_DIR="${2:-dist/admin}"
 
 cd "$(dirname "$0")/.."
+
+IDENTITY_FILE="release/release-identity.json"
+readarray -t RELEASE_IDENTITY < <(
+    python3 - "$IDENTITY_FILE" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    identity = json.load(handle)
+print(identity["backend_version"])
+print(identity["release_tag"])
+PY
+)
+IDENTITY_VERSION="${RELEASE_IDENTITY[0]%$'\r'}"
+RELEASE_TAG="${RELEASE_IDENTITY[1]%$'\r'}"
+if [[ "$VER" != "$IDENTITY_VERSION" ]]; then
+    echo "error: requested version $VER differs from release identity $IDENTITY_VERSION" >&2
+    exit 1
+fi
 
 mkdir -p "$OUT_DIR"
 ARCHIVE="$OUT_DIR/familia-source-v${VER}.tar.gz"
@@ -78,6 +97,7 @@ ROOT_FILES=(
     LICENSE
     README.md
     THIRD_PARTY_NOTICES.md
+    release/release-identity.json
 )
 # nanobot is a forked subtree — we keep upstream attribution
 # (LICENSE, COMMUNICATION.md, SECURITY.md, CONTRIBUTING.md, README) but
@@ -120,7 +140,10 @@ PATCHES_INCLUDES=(
 # themselves from sources if they want to verify.
 EXTRA_FILES=(
     bin/build-source-pack.sh
+    bin/regen-lock.sh
+    bin/regen-memx-lock.sh
     bin/release-admin.sh
+    scripts/check_release_identity.py
 )
 # memx-config: we ship only the example. acl.json is operator-side
 # and gitignored.
@@ -197,6 +220,7 @@ done
 # Drop in a small VERSION file so an operator who untars this somewhere
 # weird can still tell what build it was.
 echo "$VER" > "$STAGE/SOURCE_VERSION"
+echo "$RELEASE_TAG" > "$STAGE/SOURCE_RELEASE_TAG"
 
 # memx-config/acl.example.json is the only memx-config file we ship;
 # acl.json is operator-generated and gitignored. Sanity-check that we

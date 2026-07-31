@@ -21,14 +21,14 @@ def family_graph():
         "nodes": [
             {"id": "owner", "type": "principal", "display_name": "O"},
             {"id": "member_a", "type": "principal", "display_name": "A"},
-            {"id": "varya", "type": "principal", "display_name": "V"},
+            {"id": "child", "type": "principal", "display_name": "V"},
             {"id": "nanny", "type": "principal", "display_name": "N"},
         ],
         "edges": [
             {"from": "owner", "to": "member_a", "rel": "spouse_of"},
-            {"from": "owner", "to": "varya", "rel": "parent_of"},
-            {"from": "member_a", "to": "varya", "rel": "parent_of"},
-            {"from": "nanny", "to": "varya", "rel": "caregiver_of"},
+            {"from": "owner", "to": "child", "rel": "parent_of"},
+            {"from": "member_a", "to": "child", "rel": "parent_of"},
+            {"from": "nanny", "to": "child", "rel": "caregiver_of"},
         ],
         "updated_at_ms": 100,
     })
@@ -46,9 +46,9 @@ def topics_graph():
              "display_name": "Финансы"},
         ],
         "edges": [
-            {"from": "school", "to": "varya", "rel": "concerns",
+            {"from": "school", "to": "child", "rel": "concerns",
              "concerns_as": "guardian_of"},
-            {"from": "child_therapy", "to": "varya", "rel": "concerns",
+            {"from": "child_therapy", "to": "child", "rel": "concerns",
              "concerns_as": "guardian_of"},
             {"from": "finance", "to": "owner", "rel": "concerns",
              "concerns_as": "guardian_of"},
@@ -59,7 +59,7 @@ def topics_graph():
 
 @pytest.fixture
 def child_roles():
-    return {"varya": frozenset({"child"})}
+    return {"child": frozenset({"child"})}
 
 
 # SR-1: vocabulary leak prevention -------------------------------------------
@@ -68,7 +68,7 @@ def test_nanny_does_not_see_finance_or_owner_topics(
     family_graph, topics_graph, child_roles,
 ):
     """SR-1 critical: even topic *names* must be filtered for non-admin
-    actors. Nanny has caregiver_of varya only — must NOT see finance."""
+    actors. Nanny has caregiver_of child only — must NOT see finance."""
     entries = vocabulary.build_for(
         actor="nanny", family=family_graph, topics=topics_graph,
         principal_roles=child_roles, is_admin=False,
@@ -77,9 +77,9 @@ def test_nanny_does_not_see_finance_or_owner_topics(
     assert "finance" not in visible_ids
     assert "owner" not in visible_ids
     assert "member_a" not in visible_ids
-    # She does see varya (her ward), nanny (self), school + child_therapy
-    # (both connected to varya).
-    assert visible_ids >= {"varya", "nanny", "school", "child_therapy"}
+    # She does see child (her ward), nanny (self), school + child_therapy
+    # (both connected to child).
+    assert visible_ids >= {"child", "nanny", "school", "child_therapy"}
 
 
 def test_admin_sees_everything(
@@ -90,21 +90,21 @@ def test_admin_sees_everything(
         principal_roles=child_roles, is_admin=True,
     )
     visible_ids = {e.id for e in entries}
-    assert visible_ids >= {"owner", "member_a", "varya", "nanny",
+    assert visible_ids >= {"owner", "member_a", "child", "nanny",
                             "school", "child_therapy", "finance"}
 
 
 def test_child_role_filtered(family_graph, topics_graph, child_roles):
     """SR-2 + SR-1: child does not see parents' tags via vocabulary either."""
     entries = vocabulary.build_for(
-        actor="varya", family=family_graph, topics=topics_graph,
+        actor="child", family=family_graph, topics=topics_graph,
         principal_roles=child_roles, is_admin=False,
     )
     visible_ids = {e.id for e in entries}
     assert "owner" not in visible_ids
     assert "member_a" not in visible_ids
     assert "finance" not in visible_ids
-    assert visible_ids >= {"varya", "nanny", "school", "child_therapy"}
+    assert visible_ids >= {"child", "nanny", "school", "child_therapy"}
 
 
 # SR-9: cache invalidation by etag -------------------------------------------

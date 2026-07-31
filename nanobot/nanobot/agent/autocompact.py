@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection
+from copy import deepcopy
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
@@ -74,33 +75,54 @@ class AutoCompact:
 
     async def _archive(self, key: str) -> None:
         try:
-            self.sessions.invalidate(key)
-            session = self.sessions.get_or_create(key)
-            archive_msgs, kept_msgs = self._split_unconsolidated(session)
-            if not archive_msgs and not kept_msgs:
-                session.updated_at = datetime.now()
-                self.sessions.save(session)
-                return
+            lock = self.consolidator.get_lock(key)
+            async with lock:
+                self.sessions.invalidate(key)
+                session = self.sessions.get_or_create(key)
+                original_messages = deepcopy(session.messages)
+                original_last_consolidated = session.last_consolidated
+                original_metadata = deepcopy(session.metadata)
+                original_updated_at = session.updated_at
+                try:
+                    archive_msgs, kept_msgs = self._split_unconsolidated(session)
+                    if not archive_msgs and not kept_msgs:
+                        session.updated_at = datetime.now()
+                        self.sessions.save(session)
+                        return
 
-            last_active = session.updated_at
-            summary = ""
-            if archive_msgs:
-                summary = await self.consolidator.archive(archive_msgs) or ""
-            if summary and summary != "(nothing)":
-                self._summaries[key] = (summary, last_active)
-                session.metadata["_last_summary"] = {"text": summary, "last_active": last_active.isoformat()}
-            session.messages = kept_msgs
-            session.last_consolidated = 0
-            session.updated_at = datetime.now()
-            self.sessions.save(session)
-            if archive_msgs:
-                logger.info(
-                    "Auto-compact: archived {} (archived={}, kept={}, summary={})",
-                    key,
-                    len(archive_msgs),
-                    len(kept_msgs),
-                    bool(summary),
-                )
+                    last_active = session.updated_at
+                    summary = ""
+                    if archive_msgs:
+                        summary = await self.consolidator.archive(
+                            archive_msgs,
+                            session_key=key,
+                        ) or ""
+                    if summary and summary != "(nothing)":
+                        session.metadata["_last_summary"] = {
+                            "text": summary,
+                            "last_active": last_active.isoformat(),
+                        }
+                    session.messages = kept_msgs
+                    session.last_consolidated = 0
+                    session.updated_at = datetime.now()
+                    self.sessions.save(session)
+                except Exception:
+                    session.messages = original_messages
+                    session.last_consolidated = original_last_consolidated
+                    session.metadata = original_metadata
+                    session.updated_at = original_updated_at
+                    raise
+
+                if summary and summary != "(nothing)":
+                    self._summaries[key] = (summary, last_active)
+                if archive_msgs:
+                    logger.info(
+                        "Auto-compact: archived {} (archived={}, kept={}, summary={})",
+                        key,
+                        len(archive_msgs),
+                        len(kept_msgs),
+                        bool(summary),
+                    )
         except Exception:
             logger.exception("Auto-compact: failed for {}", key)
         finally:

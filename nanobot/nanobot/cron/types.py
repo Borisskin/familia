@@ -32,11 +32,15 @@ class CronPayload:
     # (created by them OR addressed to them). None on jobs predating the field
     # or on system jobs — they're treated as admin-only by the list filter.
     created_by: str | None = None
-    # Tag-ids attached to this job. Same namespace as memory_set tags
-    # (principals + topics from the family graphs). When set, ``cron list``
-    # filters by intersection of tags with the viewer's reachable set, in
-    # addition to the legacy creator/addressee match.
+    # Tag ids attached to this job. Integrations may define a tag namespace
+    # and a per-viewer reachable set. When set, ``cron list`` filters by
+    # intersection with that reachable set, in addition to the legacy
+    # creator/addressee match.
     tags: list[str] = field(default_factory=list)
+    # Neutral multi-principal identity fields. Standalone nanobot leaves them
+    # unset; product adapters may require them and fail closed when absent.
+    creator_actor: str | None = None
+    target_actor: str | None = None
 
 
 @dataclass
@@ -87,5 +91,5 @@ class CronJob:
 @dataclass
 class CronStore:
     """Persistent store for cron jobs."""
-    version: int = 1
+    version: int = 2
     jobs: list[CronJob] = field(default_factory=list)

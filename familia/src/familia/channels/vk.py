@@ -501,7 +501,14 @@ class VKChannel(BaseChannel):
                 chat_id=str(peer_id),
                 content=content,
                 media=media_paths,
-                metadata={"vk": {"message": message}},
+                metadata={
+                    "vk": {"message": message},
+                    "private_mode_proof": {
+                        "private_mode": str(peer_id) == str(from_id),
+                        "peer_id": str(peer_id),
+                        "from_id": str(from_id),
+                    },
+                },
             )
         except Exception:
             logger.exception("VK: error handling message from {}", from_id)

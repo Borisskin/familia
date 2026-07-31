@@ -43,7 +43,7 @@ def test_audit_tags_filters_outside_window(audit_file, capsys):
     audit_file.write_text(
         _line(ts=old_ts, kind="tag_acl_decision",
               actor="member_a", op="write",
-              full_key="shared:x", record_tags=["varya"], decision="deny")
+              full_key="shared:x", record_tags=["child"], decision="deny")
         + _line(ts=recent_ts, kind="tag_acl_decision",
                 actor="member_a", op="write",
                 full_key="shared:y", record_tags=["school"], decision="allow"),
@@ -54,7 +54,7 @@ def test_audit_tags_filters_outside_window(audit_file, capsys):
     out = capsys.readouterr().out
     assert "tag_acl_decision events: 1" in out
     # Old denial filtered out
-    assert "varya" not in out
+    assert "child" not in out
     # Recent allow shows in tag freq
     assert "school" in out
 
@@ -65,7 +65,7 @@ def test_audit_tags_lists_denials(audit_file, capsys):
         _line(ts=now, kind="tag_acl_decision", actor="nanny", op="write",
               full_key="shared:k1", record_tags=["finance"], decision="deny")
         + _line(ts=now, kind="tag_acl_decision", actor="member_a", op="read",
-                full_key="shared:k2", record_tags=["varya"], decision="allow"),
+                full_key="shared:k2", record_tags=["child"], decision="allow"),
         encoding="utf-8",
     )
     rc = graph_admin.main(["audit", "tags"])
@@ -97,9 +97,9 @@ def test_audit_tags_top_tags_aggregation(audit_file, capsys):
     now = datetime.now(timezone.utc).isoformat()
     lines = [
         _line(ts=now, kind="tag_acl_decision", actor="m", op="write",
-              full_key="k", record_tags=["varya", "school"], decision="allow"),
+              full_key="k", record_tags=["child", "school"], decision="allow"),
         _line(ts=now, kind="tag_acl_decision", actor="m", op="write",
-              full_key="k", record_tags=["varya"], decision="allow"),
+              full_key="k", record_tags=["child"], decision="allow"),
         _line(ts=now, kind="tag_acl_decision", actor="m", op="read",
               full_key="k", record_tags=["finance"], decision="allow"),
     ]
@@ -107,10 +107,10 @@ def test_audit_tags_top_tags_aggregation(audit_file, capsys):
     rc = graph_admin.main(["audit", "tags"])
     assert rc == 0
     out = capsys.readouterr().out
-    # varya should rank highest (2 writes), then finance/school (1 each).
-    assert "varya" in out
-    # Order check: varya line above finance/school
-    varya_idx = out.find("varya")
+    # child should rank highest (2 writes), then finance/school (1 each).
+    assert "child" in out
+    # Order check: child line above finance/school
+    child_idx = out.find("child")
     finance_idx = out.find("finance")
-    assert varya_idx >= 0
-    assert finance_idx == -1 or varya_idx < finance_idx
+    assert child_idx >= 0
+    assert finance_idx == -1 or child_idx < finance_idx

@@ -49,8 +49,9 @@ notice. To run your own private instance, see
 > - Discord / Slack / Matrix as first-class channels
 >
 > **Upgrade path:** the new admin app detects the version running on your VM
-> and offers to upgrade in one click. If something goes wrong — backup →
-> uninstall → install.
+> and offers to upgrade in one click. The new version is recorded only after
+> the memory transition completes; backup and restore are covered in the
+> [operations guide](docs/en/operations.md).
 
 ## Day-in-life scenarios
 
@@ -112,23 +113,25 @@ into the wife's chat. By default, conversations don't leak.
 - **Who can see it:** only you and people you've given SSH access to the VM.
   The backend does NOT call any external service except (a) the LLM provider
   you chose, (b) the messenger APIs.
-- **How memory is shared between people:** by default — it isn't. To make
-  the husband's data visible to the wife you have to explicitly set a
-  "spouse" link (`spouse_of`) in the family graph through the admin app.
-  Children are visible to their guardians, guardians are NOT visible to
-  children — asymmetric, can't be bypassed.
+- **How memory is shared between people:** every new record belongs to the
+  speaker. Another person's automatic context receives only a specific
+  `memory:<fact_id>` name when the owner's exact private-catalog entry, a
+  direct supported family relationship, and a verified common topic all
+  match; the value is read by exact name only after the same checks run again.
+  Profiles, service memory, and secret memory remain owner-only. Topics are
+  created and linked only in Admin. See the
+  [access policy](docs/en/policy.md).
 - **On removal:** the "Remove" button in the admin app wipes the whole stack
   off the VM in 30 seconds (containers + data + keys). You can download an
   archive to your laptop before removal.
 
 ## Who sees what
 
-| Who | Sees own chats | Sees spouse's chats | Sees child's chats |
-|---|---|---|---|
-| Husband | ✓ | ✓ (if "spouse" link with wife) | ✓ (if guardian) |
-| Wife | ✓ | ✓ (if "spouse" link with husband) | ✓ (if guardian) |
-| Daughter | ✓ | — | ✓ (own only) |
-| Nanny | ✓ (her slice) | — | ✓ (only her charge, if caregiver) |
+Each person sees their own memory. A family relationship, legacy shared or
+pair storage, a static rule, and a missing tag do not open a foreign record
+on their own. A foreign atomic name is available only after the catalog,
+direct relationship, and common-topic checks all match; an administrator
+role in chat does not permit writing into someone else's memory.
 
 ## Don't worry if you're not a sysadmin
 
@@ -199,7 +202,7 @@ About 5 minutes later the bot is replying in your family chat.
 ## How is this different from…
 
 | Alternative | What's missing |
-|---|---|
+| --- | --- |
 | A regular Telegram bot (Cleo and similar) | Doesn't separate memory between family members. Dad and son see the same answers. |
 | ChatGPT / Claude in a chat | Not tied to the family messenger. Cloud-hosted, conversations sit with OpenAI. |
 | Notes apps (Notion, Apple Notes, Google Keep) | Doesn't answer questions. Doesn't remember context. Doesn't reach out with reminders. |

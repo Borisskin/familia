@@ -11,6 +11,7 @@ from loguru import logger
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.inbound import InboundEnricher
 from nanobot.config.schema import Config
 from nanobot.utils.restart import consume_restart_notice_from_env, format_restart_completed_message
 
@@ -47,10 +48,14 @@ class ChannelManager:
         bus: MessageBus,
         *,
         session_manager: "SessionManager | None" = None,
+        inbound_enrichers: list[InboundEnricher] | None = None,
+        channel_classes: dict[str, type[BaseChannel]] | None = None,
     ):
         self.config = config
         self.bus = bus
         self._session_manager = session_manager
+        self._inbound_enrichers = list(inbound_enrichers or [])
+        self._channel_classes = dict(channel_classes or {})
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
 
@@ -62,7 +67,12 @@ class ChannelManager:
 
         global_provider = self.config.channels.transcription_provider
 
-        for name, cls in discover_all().items():
+        discovered = discover_all()
+        # Runtime adapters can provide domain-owned channels without putting
+        # their modules back under nanobot.channels.
+        discovered.update(getattr(self, "_channel_classes", {}))
+
+        for name, cls in discovered.items():
             section = getattr(self.config.channels, name, None)
             if section is None:
                 continue
@@ -83,6 +93,7 @@ class ChannelManager:
                     if static_path is not None:
                         kwargs["static_dist_path"] = static_path
                 channel = cls(section, self.bus, **kwargs)
+                channel.set_inbound_enrichers(getattr(self, "_inbound_enrichers", []))
                 # Per-channel transcription override:
                 #   - section.transcription_provider == "off" → skip STT entirely
                 #     (api_key="" makes BaseChannel.transcribe_audio short-circuit).

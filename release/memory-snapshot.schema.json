@@ -1,0 +1,461 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://familia.invalid/schemas/memory-snapshot-1.0.0.json",
+  "title": "Familia memory snapshot manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "snapshot_format_version",
+    "snapshot_id",
+    "status",
+    "state_role",
+    "capture",
+    "provenance",
+    "versions",
+    "images",
+    "inventory",
+    "content_hashes"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0.0" },
+    "snapshot_format_version": { "const": "1.0.0" },
+    "snapshot_id": { "$ref": "#/$defs/sha256" },
+    "status": { "const": "complete" },
+    "state_role": { "enum": ["source", "restored"] },
+    "capture": { "$ref": "#/$defs/capture" },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "versions": { "$ref": "#/$defs/versions" },
+    "images": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/image" }
+    },
+    "inventory": { "$ref": "#/$defs/inventory" },
+    "content_hashes": { "$ref": "#/$defs/contentHashes" }
+  },
+  "$defs": {
+    "nonEmpty": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "relativePayloadPath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
+    },
+    "nullableString": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "started_at",
+        "ended_at",
+        "writer_stop_started_at",
+        "writer_stop_ended_at",
+        "authorization_id",
+        "source_kind",
+        "source"
+      ],
+      "properties": {
+        "mode": { "const": "read_only" },
+        "started_at": { "type": "string", "format": "date-time" },
+        "ended_at": { "type": "string", "format": "date-time" },
+        "writer_stop_started_at": { "type": "string", "format": "date-time" },
+        "writer_stop_ended_at": { "type": "string", "format": "date-time" },
+        "authorization_id": { "$ref": "#/$defs/nonEmpty" },
+        "source_kind": { "enum": ["sanitized_fixture", "authorized_prechange"] },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["host_id", "deployment_id", "logical_paths", "redis_endpoint"],
+          "properties": {
+            "host_id": { "$ref": "#/$defs/nonEmpty" },
+            "deployment_id": { "$ref": "#/$defs/nonEmpty" },
+            "logical_paths": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/nonEmpty" }
+            },
+            "redis_endpoint": { "$ref": "#/$defs/nonEmpty" }
+          }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hash_algorithm",
+        "capture_tool_sha256",
+        "repository_commit",
+        "repository_dirty",
+        "effective_config_hashes"
+      ],
+      "properties": {
+        "hash_algorithm": { "const": "sha256" },
+        "capture_tool_sha256": { "$ref": "#/$defs/sha256" },
+        "repository_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "repository_dirty": { "type": "boolean" },
+        "effective_config_hashes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["identity", "sha256"],
+            "properties": {
+              "identity": { "$ref": "#/$defs/relativePayloadPath" },
+              "sha256": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        }
+      }
+    },
+    "versions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "familia",
+        "nanobot",
+        "memx",
+        "snapshot_schema",
+        "acl",
+        "policy"
+      ],
+      "properties": {
+        "familia": { "$ref": "#/$defs/nonEmpty" },
+        "nanobot": { "$ref": "#/$defs/nonEmpty" },
+        "memx": { "$ref": "#/$defs/nonEmpty" },
+        "snapshot_schema": { "const": "1.0.0" },
+        "acl": { "$ref": "#/$defs/nonEmpty" },
+        "policy": { "$ref": "#/$defs/nonEmpty" }
+      }
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component", "identity", "digest"],
+      "properties": {
+        "component": { "$ref": "#/$defs/nonEmpty" },
+        "identity": { "$ref": "#/$defs/nonEmpty" },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "classCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "nanobot_files",
+        "workspace_memory",
+        "history",
+        "cursors",
+        "scheduler",
+        "principals",
+        "acl_policy",
+        "non_secret_config",
+        "redis_raw",
+        "memx_values",
+        "schemas",
+        "discovery_indexes",
+        "logical_records",
+        "access_matrix",
+        "anomalies"
+      ],
+      "properties": {
+        "nanobot_files": { "type": "integer", "minimum": 0 },
+        "workspace_memory": { "type": "integer", "minimum": 0 },
+        "history": { "type": "integer", "minimum": 0 },
+        "cursors": { "type": "integer", "minimum": 0 },
+        "scheduler": { "type": "integer", "minimum": 0 },
+        "principals": { "type": "integer", "minimum": 0 },
+        "acl_policy": { "type": "integer", "minimum": 0 },
+        "non_secret_config": { "type": "integer", "minimum": 0 },
+        "redis_raw": { "type": "integer", "minimum": 0 },
+        "memx_values": { "type": "integer", "minimum": 0 },
+        "schemas": { "type": "integer", "minimum": 0 },
+        "discovery_indexes": { "type": "integer", "minimum": 0 },
+        "logical_records": { "type": "integer", "minimum": 0 },
+        "access_matrix": { "type": "integer", "minimum": 0 },
+        "anomalies": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "fileClass": {
+      "enum": [
+        "nanobot_files",
+        "workspace_memory",
+        "history",
+        "cursors",
+        "scheduler",
+        "principals",
+        "acl_policy",
+        "non_secret_config"
+      ]
+    },
+    "flatFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "classes",
+        "object_kind",
+        "byte_length",
+        "sha256",
+        "mode",
+        "payload_path",
+        "parse_status",
+        "logical_record_count"
+      ],
+      "properties": {
+        "identity": { "$ref": "#/$defs/relativePayloadPath" },
+        "classes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/fileClass" }
+        },
+        "object_kind": { "const": "file" },
+        "byte_length": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "mode": { "type": "string", "pattern": "^[0-7]{4}$" },
+        "payload_path": { "$ref": "#/$defs/relativePayloadPath" },
+        "parse_status": { "enum": ["valid", "malformed", "not_applicable"] },
+        "logical_record_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "redisEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "object_kind",
+        "raw_key_sha256",
+        "key_payload_path",
+        "key_byte_length",
+        "key_sha256",
+        "raw_type",
+        "ttl_kind",
+        "pttl_ms",
+        "dump_payload_path",
+        "dump_byte_length",
+        "dump_sha256",
+        "value_payload_path",
+        "value_byte_length",
+        "value_sha256",
+        "logical_key",
+        "scope",
+        "owner",
+        "category",
+        "schema",
+        "parse_status"
+      ],
+      "properties": {
+        "identity": {
+          "type": "string",
+          "pattern": "^redis:[0-9a-f]{64}$"
+        },
+        "object_kind": { "enum": ["redis_string", "redis_opaque"] },
+        "raw_key_sha256": { "$ref": "#/$defs/sha256" },
+        "key_payload_path": { "$ref": "#/$defs/relativePayloadPath" },
+        "key_byte_length": { "type": "integer", "minimum": 1 },
+        "key_sha256": { "$ref": "#/$defs/sha256" },
+        "raw_type": { "$ref": "#/$defs/nonEmpty" },
+        "ttl_kind": { "enum": ["persistent", "volatile"] },
+        "pttl_ms": { "type": "integer", "minimum": -1 },
+        "dump_payload_path": { "$ref": "#/$defs/relativePayloadPath" },
+        "dump_byte_length": { "type": "integer", "minimum": 1 },
+        "dump_sha256": { "$ref": "#/$defs/sha256" },
+        "value_payload_path": {
+          "oneOf": [
+            { "$ref": "#/$defs/relativePayloadPath" },
+            { "type": "null" }
+          ]
+        },
+        "value_byte_length": { "type": ["integer", "null"], "minimum": 0 },
+        "value_sha256": {
+          "oneOf": [
+            { "$ref": "#/$defs/sha256" },
+            { "type": "null" }
+          ]
+        },
+        "logical_key": { "$ref": "#/$defs/nullableString" },
+        "scope": { "$ref": "#/$defs/nullableString" },
+        "owner": { "$ref": "#/$defs/nullableString" },
+        "category": { "$ref": "#/$defs/nullableString" },
+        "schema": { "$ref": "#/$defs/nullableString" },
+        "parse_status": { "enum": ["valid", "malformed", "opaque"] }
+      }
+    },
+    "logicalRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "source_identity",
+        "record_kind",
+        "owner",
+        "actor",
+        "scope",
+        "category",
+        "destination",
+        "schema",
+        "canonical_sha256",
+        "raw_sha256",
+        "parse_status"
+      ],
+      "properties": {
+        "identity": { "$ref": "#/$defs/nonEmpty" },
+        "source_identity": { "$ref": "#/$defs/nonEmpty" },
+        "record_kind": { "$ref": "#/$defs/nonEmpty" },
+        "owner": { "$ref": "#/$defs/nullableString" },
+        "actor": { "$ref": "#/$defs/nullableString" },
+        "scope": { "$ref": "#/$defs/nullableString" },
+        "category": { "$ref": "#/$defs/nullableString" },
+        "destination": { "$ref": "#/$defs/nullableString" },
+        "schema": { "$ref": "#/$defs/nullableString" },
+        "canonical_sha256": { "$ref": "#/$defs/sha256" },
+        "raw_sha256": { "$ref": "#/$defs/sha256" },
+        "parse_status": { "const": "valid" }
+      }
+    },
+    "accessRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "actor",
+        "resource_pattern",
+        "actions",
+        "decision",
+        "source_identity",
+        "canonical_sha256"
+      ],
+      "properties": {
+        "identity": { "$ref": "#/$defs/nonEmpty" },
+        "actor": { "$ref": "#/$defs/nonEmpty" },
+        "resource_pattern": { "$ref": "#/$defs/nonEmpty" },
+        "actions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["read", "write"] }
+        },
+        "decision": { "enum": ["allow", "deny"] },
+        "source_identity": { "$ref": "#/$defs/nonEmpty" },
+        "canonical_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "anomaly": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "raw_identity",
+        "classification",
+        "reason_code",
+        "raw_sha256"
+      ],
+      "properties": {
+        "identity": { "$ref": "#/$defs/nonEmpty" },
+        "raw_identity": { "$ref": "#/$defs/nonEmpty" },
+        "classification": {
+          "enum": [
+            "invalid_utf8",
+            "malformed_json",
+            "malformed_jsonl",
+            "duplicate_json_key",
+            "torn_jsonl_line",
+            "unsupported_redis_type",
+            "malformed_redis_value"
+          ]
+        },
+        "reason_code": { "$ref": "#/$defs/nonEmpty" },
+        "raw_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "logicalInventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "records",
+        "access_matrix",
+        "anomalies",
+        "record_count",
+        "access_count",
+        "anomaly_count",
+        "aggregate_sha256"
+      ],
+      "properties": {
+        "records": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/logicalRecord" }
+        },
+        "access_matrix": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/accessRow" }
+        },
+        "anomalies": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/anomaly" }
+        },
+        "record_count": { "type": "integer", "minimum": 0 },
+        "access_count": { "type": "integer", "minimum": 0 },
+        "anomaly_count": { "type": "integer", "minimum": 0 },
+        "aggregate_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "class_counts",
+        "flat_files",
+        "redis",
+        "logical",
+        "byte_aggregate_sha256"
+      ],
+      "properties": {
+        "class_counts": { "$ref": "#/$defs/classCounts" },
+        "flat_files": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/flatFile" }
+        },
+        "redis": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/redisEntry" }
+        },
+        "logical": { "$ref": "#/$defs/logicalInventory" },
+        "byte_aggregate_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "contentHashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "byte_state_sha256", "logical_state_sha256"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "byte_state_sha256": { "$ref": "#/$defs/sha256" },
+        "logical_state_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

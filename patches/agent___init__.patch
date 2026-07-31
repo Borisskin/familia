@@ -1,0 +1,23 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/agent/__init__.py b/nanobot/nanobot/agent/__init__.py
+index 9eef5a0..f9d9abc 100644
+--- a/nanobot/nanobot/agent/__init__.py
++++ b/nanobot/nanobot/agent/__init__.py
+@@ -1,6 +1,6 @@
+ """Agent core module."""
+ 
+-from nanobot.agent.context import ContextBuilder
++from nanobot.agent.context import ContextBuilder, ContextExtension
+ from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
+ from nanobot.agent.loop import AgentLoop
+ from nanobot.agent.memory import Dream, MemoryStore
+@@ -13,6 +13,7 @@ __all__ = [
+     "AgentLoop",
+     "CompositeHook",
+     "ContextBuilder",
++    "ContextExtension",
+     "Dream",
+     "MemoryStore",
+     "SkillsLoader",

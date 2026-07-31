@@ -1,0 +1,564 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://familia.local/schema/memory-contract-2.0.0.json",
+  "title": "Familia memory contract 2.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "authority",
+    "identity",
+    "destination_registry",
+    "pair_codec",
+    "failure_rules",
+    "storage",
+    "recall",
+    "write_routing",
+    "updates",
+    "consolidation",
+    "outcomes",
+    "registry",
+    "access",
+    "unknown_content",
+    "flat_memory",
+    "soul",
+    "migration"
+  ],
+  "properties": {
+    "contract_version": {
+      "const": "2.0.0"
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "canonical_export",
+        "final_writer",
+        "automatic_sources",
+        "automatic_scopes",
+        "owner_assignment",
+        "model_may_select_owner",
+        "model_may_request_topic",
+        "server_validates_topic",
+        "model_may_create_topic"
+      ],
+      "properties": {
+        "canonical_export": {
+          "const": "familia.memory_contract.MEMORY_CONTRACT"
+        },
+        "final_writer": {
+          "const": "PrincipalMemoryIngestor"
+        },
+        "automatic_sources": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "automatic_scopes": {
+          "const": [
+            "private_profile",
+            "private_atomic_memory"
+          ]
+        },
+        "owner_assignment": {
+          "const": "server_only"
+        },
+        "model_may_select_owner": {
+          "const": false
+        },
+        "model_may_request_topic": {
+          "const": true
+        },
+        "server_validates_topic": {
+          "const": true
+        },
+        "model_may_create_topic": {
+          "const": false
+        }
+      }
+    },
+    "identity": {
+      "type": "object"
+    },
+    "destination_registry": {
+      "type": "object"
+    },
+    "pair_codec": {
+      "type": "object"
+    },
+    "failure_rules": {
+      "type": "object"
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile_key",
+        "atomic_fact_key",
+        "legacy_combined_key",
+        "legacy_combined_role",
+        "pending_migration_key",
+        "fact_topics",
+        "private_catalog"
+      ],
+      "properties": {
+        "profile_key": {
+          "const": "private:<principal>:value:user_profile"
+        },
+        "atomic_fact_key": {
+          "const": "private:<principal>:memory:<fact_id>"
+        },
+        "legacy_combined_key": {
+          "const": "private:<principal>:value:memory"
+        },
+        "legacy_combined_role": {
+          "const": "migration_and_compatibility_input_only"
+        },
+        "pending_migration_key": {
+          "const": "private:<principal>:pending_migration:<id>"
+        },
+        "fact_topics": {
+          "const": {
+            "assigned_by": "server",
+            "homogeneous_reader_set": true
+          }
+        },
+        "private_catalog": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "key",
+            "entry",
+            "max_entries",
+            "overflow",
+            "update",
+            "delete"
+          ],
+          "properties": {
+            "key": {
+              "const": "private:<principal>:value:private_index"
+            },
+            "entry": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "tags"
+              ],
+              "properties": {
+                "name": {
+                  "const": "memory:<fact_id>"
+                },
+                "tags": {
+                  "const": "server_topic_tags"
+                }
+              }
+            },
+            "max_entries": {
+              "const": 256
+            },
+            "overflow": {
+              "const": "catalog_full_without_eviction"
+            },
+            "update": {
+              "const": "atomic_with_fact"
+            },
+            "delete": {
+              "const": "atomic_with_fact"
+            }
+          }
+        }
+      }
+    },
+    "recall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "own_catalog",
+        "foreign_projection",
+        "foreign_value_projection",
+        "foreign_catalog_projection",
+        "foreign_profile_projection",
+        "max_names_per_owner",
+        "legacy_history_fact_id"
+      ],
+      "properties": {
+        "own_catalog": {
+          "const": "trusted_private_catalog"
+        },
+        "foreign_projection": {
+          "const": "authorized_fact_names_only"
+        },
+        "foreign_value_projection": {
+          "const": false
+        },
+        "foreign_catalog_projection": {
+          "const": false
+        },
+        "foreign_profile_projection": {
+          "const": false
+        },
+        "max_names_per_owner": {
+          "const": 40
+        },
+        "legacy_history_fact_id": {
+          "const": "legacy-history"
+        }
+      }
+    },
+    "write_routing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "physical_owner",
+        "owner_assigned_by",
+        "default_destination",
+        "third_party_fact_owner",
+        "foreign_private_allowed",
+        "direct_shared_allowed",
+        "direct_pair_allowed",
+        "topic"
+      ],
+      "properties": {
+        "physical_owner": {
+          "const": "actor"
+        },
+        "owner_assigned_by": {
+          "const": "server"
+        },
+        "default_destination": {
+          "const": "private"
+        },
+        "third_party_fact_owner": {
+          "const": "speaker"
+        },
+        "foreign_private_allowed": {
+          "const": false
+        },
+        "direct_shared_allowed": {
+          "const": false
+        },
+        "direct_pair_allowed": {
+          "const": false
+        },
+        "topic": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "form",
+            "creation",
+            "existing_without_shared_relations",
+            "missing_or_unavailable"
+          ],
+          "properties": {
+            "form": {
+              "const": "server_verified_private_fact_tag"
+            },
+            "creation": {
+              "const": "admin_only"
+            },
+            "existing_without_shared_relations": {
+              "const": "tag_and_notify_private_only"
+            },
+            "missing_or_unavailable": {
+              "const": "store_private_untagged_and_notify"
+            }
+          }
+        }
+      }
+    },
+    "updates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "record_revision",
+        "full_memory_scan_required",
+        "operations",
+        "delete_scope",
+        "delete_missing"
+      ],
+      "properties": {
+        "identity": {
+          "const": "stable_fact_id"
+        },
+        "record_revision": {
+          "const": "ts"
+        },
+        "full_memory_scan_required": {
+          "const": false
+        },
+        "operations": {
+          "const": [
+            "profile",
+            "memory",
+            "delete"
+          ]
+        },
+        "delete_scope": {
+          "const": "private_actor_fact_only"
+        },
+        "delete_missing": {
+          "const": "success"
+        }
+      }
+    },
+    "consolidation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supported_sources",
+        "automatic_destination",
+        "owner_resolver",
+        "archive_sink",
+        "retry",
+        "session_serialization",
+        "standalone_without_sink"
+      ],
+      "properties": {
+        "supported_sources": {
+          "const": [
+            "vk_private",
+            "telegram_private"
+          ]
+        },
+        "automatic_destination": {
+          "const": "private_owner_untagged"
+        },
+        "owner_resolver": {
+          "const": {
+            "input": [
+              "session_key",
+              "messages"
+            ],
+            "result": "principal_or_none",
+            "before_model": true
+          }
+        },
+        "archive_sink": {
+          "const": {
+            "input": [
+              "principal",
+              "messages"
+            ],
+            "success": "return_without_exception",
+            "failure": "exception",
+            "failure_keeps_source_messages": true
+          }
+        },
+        "retry": {
+          "const": "reapply_stable_fact_operations"
+        },
+        "session_serialization": {
+          "const": "single_lock"
+        },
+        "standalone_without_sink": {
+          "const": "legacy_behavior"
+        }
+      }
+    },
+    "outcomes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "legacy_row",
+        "migration_command",
+        "memory_mutation"
+      ],
+      "properties": {
+        "legacy_row": {
+          "type": "object"
+        },
+        "migration_command": {
+          "type": "object"
+        },
+        "memory_mutation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "committed",
+            "catalog_full",
+            "deleted",
+            "absent",
+            "conflict"
+          ],
+          "properties": {
+            "committed": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "committed",
+                "updated",
+                "retryable",
+                "version"
+              ],
+              "properties": {
+                "committed": {
+                  "const": true
+                },
+                "updated": {
+                  "const": true
+                },
+                "retryable": {
+                  "const": false
+                },
+                "version": {
+                  "const": "new_number"
+                }
+              }
+            },
+            "catalog_full": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "committed",
+                "updated",
+                "retryable",
+                "version"
+              ],
+              "properties": {
+                "committed": {
+                  "const": false
+                },
+                "updated": {
+                  "const": false
+                },
+                "retryable": {
+                  "const": false
+                },
+                "version": {
+                  "const": "current_number_or_null"
+                }
+              }
+            },
+            "deleted": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "committed",
+                "updated",
+                "retryable",
+                "version"
+              ],
+              "properties": {
+                "committed": {
+                  "const": true
+                },
+                "updated": {
+                  "const": true
+                },
+                "retryable": {
+                  "const": false
+                },
+                "version": {
+                  "const": "previous_number_or_null"
+                }
+              }
+            },
+            "absent": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "committed",
+                "updated",
+                "retryable",
+                "version"
+              ],
+              "properties": {
+                "committed": {
+                  "const": true
+                },
+                "updated": {
+                  "const": false
+                },
+                "retryable": {
+                  "const": false
+                },
+                "version": {
+                  "const": null
+                }
+              }
+            },
+            "conflict": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "committed",
+                "updated",
+                "retryable",
+                "version"
+              ],
+              "properties": {
+                "committed": {
+                  "const": false
+                },
+                "updated": {
+                  "const": false
+                },
+                "retryable": {
+                  "const": true
+                },
+                "version": {
+                  "const": "current_number_or_null"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "registry": {
+      "type": "object"
+    },
+    "access": {
+      "type": "object",
+      "required": [
+        "common_topic_requires_family_relation"
+      ],
+      "properties": {
+        "common_topic_requires_family_relation": {
+          "const": true
+        }
+      },
+      "not": {
+        "required": [
+          "transaction_candidate_internal_only"
+        ]
+      }
+    },
+    "unknown_content": {
+      "type": "object",
+      "required": [
+        "allowed_persistence"
+      ],
+      "properties": {
+        "allowed_persistence": {
+          "const": [
+            "reason_counters"
+          ]
+        }
+      }
+    },
+    "flat_memory": {
+      "type": "object",
+      "required": [
+        "may_be_memory_source"
+      ],
+      "properties": {
+        "may_be_memory_source": {
+          "const": false
+        }
+      }
+    },
+    "soul": {
+      "type": "object"
+    },
+    "migration": {
+      "type": "object"
+    }
+  }
+}

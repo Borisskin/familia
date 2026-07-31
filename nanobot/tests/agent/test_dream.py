@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from nanobot.agent.memory import Dream, MemoryStore
 from nanobot.agent.runner import AgentRunResult
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+from nanobot.agent.tools import Tool
 from nanobot.utils.gitstore import LineAge
 
 
@@ -54,6 +55,47 @@ def _make_run_result(
     )
 
 
+class _InjectedDreamTool(Tool):
+    @property
+    def name(self) -> str:
+        return "dream_memory_set"
+
+    @property
+    def description(self) -> str:
+        return "Injected dream memory writer."
+
+    @property
+    def parameters(self) -> dict:
+        return {"type": "object", "properties": {}}
+
+    async def execute(self, **kwargs):
+        return "ok"
+
+
+def test_dream_registers_injected_tool_installers(store, mock_provider) -> None:
+    def install_dream_tools(registry, memory_store) -> None:
+        assert memory_store is store
+        registry.register(_InjectedDreamTool())
+
+    dream = Dream(
+        store=store,
+        provider=mock_provider,
+        model="test-model",
+        dream_tool_installers=[install_dream_tools],
+    )
+
+    assert dream._tools.get("dream_memory_set").name == "dream_memory_set"
+
+
+def test_dream_without_installers_uses_standalone_tool_registry(store, mock_provider) -> None:
+    dream = Dream(store=store, provider=mock_provider, model="test-model")
+
+    assert dream._tools.get("read_file") is not None
+    assert dream._tools.get("edit_file") is not None
+    assert dream._tools.get("write_file") is not None
+    assert dream._tools.get("dream_memory_set") is None
+
+
 class TestDreamRun:
     async def test_noop_when_no_unprocessed_history(self, dream, mock_provider, mock_runner, store):
         """Dream should not call LLM when there's nothing to process."""
@@ -74,7 +116,62 @@ class TestDreamRun:
         mock_runner.run.assert_called_once()
         spec = mock_runner.run.call_args[0][0]
         assert spec.max_iterations == 10
-        assert spec.fail_on_tool_error is False
+        assert spec.fail_on_tool_error is True
+
+    async def test_failed_required_write_keeps_cursor_and_history(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        store.append_history("private finding", actor="actor_a")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="[PRIVATE:actor_a] sensitive fact",
+        )
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{
+                "name": "dream_memory_set",
+                "status": "error",
+                "detail": "Error: updated:false",
+            }],
+        ))
+
+        result = await dream.run()
+
+        assert result is False
+        assert store.get_last_dream_cursor() == 0
+        assert len(store.read_unprocessed_history(since_cursor=0)) == 1
+
+    async def test_incomplete_scoped_plan_keeps_cursor(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        store.append_history("private finding", actor="actor_a")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="[PRIVATE:actor_a] sensitive fact",
+        )
+        mock_runner.run = AsyncMock(return_value=_make_run_result(tool_events=[]))
+
+        result = await dream.run()
+
+        assert result is False
+        assert store.get_last_dream_cursor() == 0
+
+    async def test_successful_scoped_batch_advances_cursor_once(
+        self, dream, mock_provider, mock_runner, store,
+    ):
+        store.append_history("private finding", actor="actor_a")
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="[PRIVATE:actor_a] sensitive fact",
+        )
+        mock_runner.run = AsyncMock(return_value=_make_run_result(
+            tool_events=[{
+                "name": "dream_memory_set",
+                "status": "ok",
+                "detail": "Stored at private:actor_a:fact",
+            }],
+        ))
+
+        assert await dream.run() is True
+        assert store.get_last_dream_cursor() == 1
+        assert await dream.run() is False
+        assert store.get_last_dream_cursor() == 1
 
     async def test_advances_dream_cursor(self, dream, mock_provider, mock_runner, store):
         """Dream should advance the cursor after processing."""
@@ -154,11 +251,9 @@ class TestDreamRun:
 
         call_args = mock_provider.chat_with_retry.call_args
         user_msg = call_args.kwargs.get("messages", call_args[1].get("messages"))[1]["content"]
-        # The ← suffix should only appear in MEMORY.md section
-        memory_section = user_msg.split("## Current MEMORY.md")[1].split("## Current SOUL.md")[0]
+        # The age suffix must not leak into stable identity sections.
         soul_section = user_msg.split("## Current SOUL.md")[1].split("## Current USER.md")[0]
         user_section = user_msg.split("## Current USER.md")[1]
-        # SOUL and USER should not contain age arrows
         assert "\u2190" not in soul_section
         assert "\u2190" not in user_section
 
@@ -255,4 +350,3 @@ class TestDreamRun:
         system_msg = mock_provider.chat_with_retry.call_args.kwargs["messages"][0]["content"]
         # The template renders with stale_threshold_days=14 → LLM must see "N>14"
         assert "N>14" in system_msg
-

@@ -69,14 +69,14 @@ def test_direct_match_finds_topic_alias():
     family = {"nodes": [{"id": "owner", "type": "principal"}], "edges": []}
     topics = {
         "nodes": [
-            {"id": "varya", "type": "topic", "kind": "person",
+            {"id": "child", "type": "topic", "kind": "person",
              "display_name": "kid", "aliases": ["alias_a"]},
         ],
         "edges": [],
     }
     merged = _merge_graphs(family, topics)
     matches = resolve(merged, "alias_a", from_actor="owner")
-    assert [m["id"] for m in matches] == ["varya"]
+    assert [m["id"] for m in matches] == ["child"]
 
 
 def test_direct_match_finds_principal_alias():

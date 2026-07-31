@@ -231,9 +231,8 @@ class TelegramChannel(BaseChannel):
     name = "telegram"
     display_name = "Telegram"
 
-    # No slash commands registered with Telegram's menu — see commit
-    # message for the rationale. Bot listens to natural language only;
-    # auto-compact + Dream handle session management without UI.
+    # No slash commands registered with Telegram's menu. Bot listens to
+    # natural language only; session lifecycle stays inside the runtime.
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
@@ -313,10 +312,9 @@ class TelegramChannel(BaseChannel):
 
         # Single message handler: every text/photo/voice/audio/document/
         # location update routes straight through the agent loop. No slash-
-        # command regexes — :class:`AgentLoop` no longer maintains a
-        # ``CommandRouter``; auto-compact and Dream handle session-level
-        # concerns without a UI affordance, and the LLM understands
-        # "забудь, давай заново" / "stop, не отвечай" in natural language.
+        # command regexes or command router; session-level concerns stay
+        # inside the runtime, and the LLM handles natural-language control
+        # requests as regular messages.
         self._app.add_handler(
             MessageHandler(
                 (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL | filters.LOCATION),
@@ -339,7 +337,7 @@ class TelegramChannel(BaseChannel):
 
         # Best-effort wipe of any commands previously registered with
         # BotFather / older versions of this code, so the in-app menu
-        # doesn't keep showing /new /stop /dream etc. Failure is fine —
+        # doesn't keep showing disabled runtime commands. Failure is fine —
         # the menu is cosmetic, the regex handlers were the actual
         # routing surface and they're already gone.
         try:
@@ -725,15 +723,22 @@ class TelegramChannel(BaseChannel):
     def _build_message_metadata(message, user) -> dict:
         """Build common Telegram inbound metadata payload."""
         reply_to = getattr(message, "reply_to_message", None)
+        is_group = message.chat.type != "private"
+        topic_id = getattr(message, "message_thread_id", None)
         return {
             "message_id": message.message_id,
             "user_id": user.id,
             "username": user.username,
             "first_name": user.first_name,
-            "is_group": message.chat.type != "private",
-            "message_thread_id": getattr(message, "message_thread_id", None),
+            "is_group": is_group,
+            "message_thread_id": topic_id,
             "is_forum": bool(getattr(message.chat, "is_forum", False)),
             "reply_to_message_id": getattr(reply_to, "message_id", None) if reply_to else None,
+            "private_mode_proof": {
+                "private_mode": not is_group,
+                "is_group": is_group,
+                "topic_id": topic_id,
+            },
         }
 
     async def _extract_reply_context(self, message) -> str | None:

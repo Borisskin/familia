@@ -10,6 +10,8 @@ Usage from the patched loop.py::
 
     from familia import bootstrap as familia_bootstrap
     ...
+    context_extensions=familia_bootstrap.make_context_extensions(workspace)
+    ...
     familia_bootstrap.install_tools(self)     # inside _register_tools
     ...
     await familia_bootstrap.on_inbound(msg)   # wherever msg.actor is set
@@ -18,14 +20,314 @@ Usage from the patched loop.py::
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from loguru import logger
 
 import sys
 
-from familia.principals import set_current_actor, set_current_channel
+from familia.principals import get_current_actor, set_current_actor, set_current_channel
 from familia.roles import load_effective_roles
+
+
+_dream_principal: ContextVar[str | None] = ContextVar(
+    "familia_dream_principal",
+    default=None,
+)
+
+
+def make_context_extensions(workspace: Any) -> list[Any]:
+    """Return familia prompt/runtime extensions for a nanobot context builder."""
+    # Keep nanobot.context generic: familia owns the concrete extension class
+    # and exposes only already-built extension objects to the runtime loop.
+    try:
+        from familia.nanobot_extension.context import FamiliaContextExtension
+    except ImportError:
+        return []
+    return [FamiliaContextExtension(workspace)]
+
+
+def make_inbound_enrichers() -> list[Any]:
+    """Return familia adapters for channel-level inbound enrichment."""
+    try:
+        from familia.nanobot_extension.inbound import FamiliaInboundEnricher
+    except ImportError:
+        return []
+    return [FamiliaInboundEnricher()]
+
+
+def make_channel_manager_kwargs() -> dict[str, Any]:
+    """Return familia adapters for nanobot's neutral channel extension points."""
+    return {
+        "inbound_enrichers": make_inbound_enrichers(),
+        "channel_classes": make_channel_classes(),
+    }
+
+
+def make_channel_classes() -> dict[str, Any]:
+    """Return familia-owned channel classes for explicit runtime registration."""
+    try:
+        from familia.channels.vk import VKChannel
+    except ImportError:
+        return {}
+    return {"vk": VKChannel}
+
+
+def make_private_session_owner_resolver() -> Any:
+    """Return Familia's resolver for private archive source ownership."""
+    from familia.principals import get_registry
+    from familia.private_session_owner import PrivateSessionOwnerResolver
+
+    return PrivateSessionOwnerResolver(get_registry)
+
+
+def make_agent_loop_kwargs(workspace: Any) -> dict[str, Any]:
+    """Return familia adapters for nanobot's neutral extension points."""
+    from familia import audit
+
+    return {
+        "context_extensions": make_context_extensions(workspace),
+        "tool_installers": [install_tools],
+        # Loop-level enrichment owns per-turn ContextVars/roles after the
+        # channel-level enricher has already resolved msg.actor.
+        "inbound_enrichers": [on_inbound],
+        "outbound_guard": make_outbound_guard(),
+        "pending_inbound_handler": handle_pending_inbound,
+        "direct_actor_resolver": make_direct_actor_resolver(),
+        "current_actor_getter": get_current_actor,
+        "history_actor_validator": make_history_actor_validator(),
+        "private_session_owner_resolver": make_private_session_owner_resolver(),
+        "tool_call_auditor": audit.log_event,
+        "cron_tool_options": {
+            "to_validator": make_principal_chat_validator(),
+            "current_actor_getter": get_current_actor,
+            "is_admin_getter": make_admin_check(),
+            "reachable_tags_getter": make_reachable_tags_getter(),
+        },
+        "dream_tool_installers": make_dream_tool_installers(),
+        "dream_turn_context": make_dream_turn_context(),
+        "dream_restore_policy": make_dream_restore_policy(),
+        "dream_batch_context": make_dream_batch_context(),
+    }
+
+
+def make_direct_actor_resolver() -> Any:
+    """Return resolver for direct cron/heartbeat turns that skip channels."""
+    from familia.principals import resolve_actor
+
+    return resolve_actor
+
+
+def make_dream_tool_installers() -> list[Any]:
+    """Return familia Dream memory tool installers for nanobot Dream."""
+    from familia.nanobot_extension.cron import make_dream_tool_installers as _make
+
+    return _make(server_principal_getter=make_dream_server_context_resolver())
+
+
+def make_dream_restore_policy() -> Any:
+    """Return Familia's fail-closed policy for ordinary Dream restores."""
+
+    tracked_files = {"SOUL.md", "USER.md", "memory/MEMORY.md"}
+
+    def _policy(changed_files: list[str] | None) -> str | None:
+        if (
+            not isinstance(changed_files, list)
+            or not changed_files
+            or any(
+                not isinstance(path, str) or path not in tracked_files
+                for path in changed_files
+            )
+        ):
+            return (
+                "Familia cannot verify which files this Dream change affects. "
+                "Use the isolated snapshot restore path instead."
+            )
+        if "SOUL.md" in changed_files:
+            return (
+                "Familia does not restore `SOUL.md` through `/dream-restore`. "
+                "Use the isolated snapshot restore path instead."
+            )
+        return None
+
+    return _policy
+
+
+def make_history_actor_validator() -> Any:
+    """Return the neutral validator used by actor-aware Recent History."""
+    from familia.principals import get_registry
+
+    def _is_known(actor: str) -> bool:
+        return bool(actor) and get_registry().get(actor) is not None
+
+    return _is_known
+
+
+def make_dream_turn_context() -> Any:
+    """Pin Dream's executor identity for one Phase 2 turn and restore it."""
+    from familia.tools.dream_memory import CONSOLIDATOR_ACTOR
+
+    @contextmanager
+    def _scope():
+        previous = get_current_actor()
+        set_current_actor(CONSOLIDATOR_ACTOR)
+        try:
+            yield
+        finally:
+            set_current_actor(previous)
+
+    return _scope
+
+
+def make_dream_batch_context() -> Any:
+    """Bind one server-resolved private owner for the active Dream turn."""
+
+    @contextmanager
+    def _scope(principal: str):
+        value = principal if isinstance(principal, str) and principal else None
+        token = _dream_principal.set(value)
+        try:
+            yield
+        finally:
+            _dream_principal.reset(token)
+
+    return _scope
+
+
+def make_dream_server_context_resolver() -> Any:
+    """Return the registry-verified owner bound to the active Dream turn."""
+    from familia.principals import get_registry
+
+    def _resolve() -> str | None:
+        principal = _dream_principal.get()
+        if (
+            not isinstance(principal, str)
+            or get_registry().get(principal) is None
+        ):
+            return None
+        return principal
+
+    return _resolve
+
+
+def make_heartbeat_source_reader(target_actor: str | None) -> Any:
+    """Return the adapter-owned heartbeat reader for a configured principal.
+
+    ``None`` means nanobot may use its standalone legacy file path. A returned
+    reader owns source selection, and empty reader content must fail closed in
+    nanobot heartbeat service instead of falling back to ``HEARTBEAT.md``.
+    """
+    if not (target_actor or "").strip():
+        return None
+    from familia.nanobot_extension.cron import make_heartbeat_source_reader as _make
+
+    return _make(target_actor)
+
+
+def make_callback_handlers(bus: Any) -> list[Any]:
+    """Return familia callback handlers for nanobot's neutral dispatcher."""
+    from familia.bus.callback_dispatcher import CallbackDispatcher
+
+    return [CallbackDispatcher(bus)]
+
+
+def resolve_heartbeat_target(target_actor: str, enabled_channels: set[str]) -> tuple[str, str] | None:
+    """Resolve configured heartbeat actor to an enabled channel identity."""
+    from familia.principals import get_registry
+
+    principal = get_registry().get(target_actor)
+    if principal is None:
+        return None
+    for ident in principal.identities:
+        if ident.channel in enabled_channels and ident.sender_id:
+            return ident.channel, str(ident.sender_id)
+    return None
+
+
+def reload_runtime_registry() -> None:
+    """Reload mutable familia registry state for gateway SIGHUP."""
+    from familia.principals import reload_registry
+
+    reload_registry()
+
+
+def make_outbound_guard() -> Any:
+    """Adapt familia outbound policy to nanobot's guard protocol."""
+    from familia.policy import gate_outbound_send
+    from nanobot.agent.outbound import OutboundDecision
+
+    async def _guard(request: Any) -> Any:
+        result = await gate_outbound_send(
+            action=request.action,
+            outbound=request.outbound,
+            inbound_channel=request.inbound_channel,
+            inbound_chat_id=request.inbound_chat_id,
+            publish_outbound=request.publish_outbound,
+        )
+        return OutboundDecision(
+            kind=result.kind,
+            reason=result.reason,
+            approvers_label=result.approvers_label,
+        )
+
+    return _guard
+
+
+async def handle_pending_inbound(msg: Any) -> tuple[bool, Any | None]:
+    """Intercept unknown principals before nanobot logs or processes content."""
+    if getattr(msg, "actor", None) is not None or getattr(msg, "channel", None) in (
+        "cli",
+        "system",
+    ):
+        return False, None
+
+    from nanobot.bus.events import OutboundMessage
+
+    try:
+        from familia.pending import store as pending_store
+        from familia.pending.messages import reply_for_pending
+
+        display_name = ""
+        meta = getattr(msg, "metadata", None) or {}
+        # Channel adapters may provide a friendly name; fallback keeps admin
+        # pending rows identifiable without exposing this logic to nanobot.
+        for key in ("display_name", "first_name", "username", "from_name"):
+            value = meta.get(key)
+            if isinstance(value, str) and value.strip():
+                display_name = value.strip()
+                break
+        if not display_name:
+            display_name = str(getattr(msg, "sender_id", ""))
+
+        import asyncio
+
+        entry = await asyncio.to_thread(
+            pending_store.record,
+            channel=msg.channel,
+            sender_id=msg.sender_id,
+            display_name=display_name,
+            message_preview=msg.content,
+        )
+        if entry is not None:
+            return True, OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=reply_for_pending(),
+            )
+        return True, None
+    except Exception:
+        logger.exception(
+            "pending-principal gate failed for {}:{}; replying with degraded notice",
+            getattr(msg, "channel", None),
+            getattr(msg, "sender_id", None),
+        )
+        return True, OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content="Сейчас не могу обработать запрос. Попробуйте позже.",
+        )
 
 
 def install_tools(loop: Any) -> None:
@@ -91,7 +393,7 @@ def install_tools(loop: Any) -> None:
             await _asyncio.sleep(24 * 60 * 60)
 
     try:
-        _asyncio.get_event_loop().create_task(_models_refresh_daemon())
+        _asyncio.get_running_loop().create_task(_models_refresh_daemon())
     except RuntimeError:
         # No running loop yet (called from a sync context). The CLI
         # path that spawns the gateway will set one up; this branch is

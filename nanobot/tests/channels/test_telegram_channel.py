@@ -159,6 +159,68 @@ def _make_telegram_update(
 
 
 @pytest.mark.asyncio
+async def test_private_message_preserves_private_mode_proof() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    handled = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle
+    channel._start_typing = lambda _chat_id: None
+    channel._add_reaction = AsyncMock()
+    channel._download_message_media = AsyncMock(return_value=([], []))
+    update = _make_telegram_update(chat_type="private", text="hello private")
+    update.message.chat_id = 12345
+
+    await channel._on_message(update, None)
+
+    assert len(handled) == 1
+    assert handled[0]["sender_id"] == "12345|alice"
+    assert handled[0]["chat_id"] == "12345"
+    assert handled[0]["metadata"]["private_mode_proof"] == {
+        "private_mode": True,
+        "is_group": False,
+        "topic_id": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("chat_type", "topic_id", "expected_proof"),
+    [
+        (
+            "group",
+            None,
+            {"private_mode": False, "is_group": True, "topic_id": None},
+        ),
+        (
+            "private",
+            42,
+            {"private_mode": True, "is_group": False, "topic_id": 42},
+        ),
+    ],
+)
+def test_build_message_metadata_preserves_group_and_topic_proof(
+    chat_type: str, topic_id: int | None, expected_proof: dict
+) -> None:
+    update = _make_telegram_update(chat_type=chat_type, text="metadata")
+    update.message.message_thread_id = topic_id
+
+    metadata = TelegramChannel._build_message_metadata(
+        update.message,
+        update.effective_user,
+    )
+
+    assert metadata["private_mode_proof"] == expected_proof
+    assert metadata["is_group"] is (chat_type != "private")
+    assert metadata["message_thread_id"] == topic_id
+
+
+@pytest.mark.asyncio
 async def test_start_creates_separate_pools_with_proxy(monkeypatch) -> None:
     _FakeHTTPXRequest.clear()
     config = TelegramConfig(

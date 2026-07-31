@@ -3,22 +3,64 @@ name: tests
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   familia:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out Familia
+        uses: actions/checkout@v4
+
+      - name: Check out declared nanobot upstream
+        uses: actions/checkout@v4
+        with:
+          repository: HKUDS/nanobot
+          ref: 950dddec499fbbe0353e997158c99808f0bb41e1
+          path: upstream-nanobot
+
+      - name: Expose upstream checkout at the patch-tool path
+        run: ln -s "$GITHUB_WORKSPACE/upstream-nanobot" "$GITHUB_WORKSPACE/../nanobot"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install nanobot + familia (editable)
+
+      - name: Install nanobot and Familia
         run: |
           python -m pip install --upgrade pip
           pip install -e ./nanobot -e ./familia pytest pytest-asyncio ruff
-      - name: Ruff (familia)
+
+      - name: Ruff Familia
         run: ruff check familia/src
-      - name: Pytest (familia)
+
+      - name: Validate release identity
+        run: |
+          backend_version="$(python -c 'import json; print(json.load(open("release/release-identity.json", encoding="utf-8"))["backend_version"])')"
+          release_tag="$(python -c 'import json; print(json.load(open("release/release-identity.json", encoding="utf-8"))["release_tag"])')"
+          python scripts/check_release_identity.py \
+            --backend-version "$backend_version" \
+            --tag "$release_tag"
+
+      - name: Test Familia logic
         run: pytest familia/tests -q
+
+      - name: Test Familia integration points in nanobot
+        run: |
+          pytest -q \
+            nanobot/tests/agent/test_context_prompt_cache.py \
+            nanobot/tests/agent/test_consolidator.py \
+            nanobot/tests/agent/test_dream.py \
+            nanobot/tests/agent/test_memory_store.py \
+            nanobot/tests/agent/test_memory_store_durability.py
+
+      - name: Verify exact nanobot patch reconstruction
+        run: python patches/test_check_exact_reconstruction.py -v

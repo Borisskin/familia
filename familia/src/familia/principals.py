@@ -27,9 +27,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
+from collections.abc import Iterable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from itertools import combinations
 from pathlib import Path
 
 from loguru import logger
@@ -48,6 +51,65 @@ class Principal:
     identities: list[Identity] = field(default_factory=list)
     memx_key: str = ""
     roles: list[str] = field(default_factory=list)
+
+
+def normalize_new_principal_id(
+    raw_id: str,
+    *,
+    existing_ids: Iterable[str] = (),
+) -> str:
+    """Normalize and validate an ID assigned to a new principal.
+
+    Existing registry entries are deliberately not rewritten.  New IDs keep
+    Familia's established lowercase ``[a-z][a-z0-9_]*`` contract.
+    """
+    if not isinstance(raw_id, str):
+        raise ValueError(
+            "principal id must start with a-z and then use only a-z, 0-9, "
+            "and underscores; maximum 64 characters"
+        )
+    normalized = raw_id.strip()
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", normalized):
+        raise ValueError(
+            "principal id must start with a-z and then use only a-z, 0-9, "
+            "and underscores, without spaces; maximum 64 characters"
+        )
+
+    for existing_id in existing_ids:
+        if not isinstance(existing_id, str):
+            continue
+        if existing_id.strip() == normalized:
+            raise ValueError(
+                f"new principal id {raw_id!r} normalizes to {normalized!r} "
+                f"and collides with existing id {existing_id!r}"
+            )
+    return normalized
+
+
+def pair_namespace_token(first: str, second: str) -> str:
+    """Return the established ``<left>_<right>`` token for one actor pair."""
+    left, right = sorted((first, second))
+    return f"{left}_{right}"
+
+
+def ambiguous_pair_namespaces(
+    actor_ids: Iterable[str],
+) -> dict[str, tuple[tuple[str, str], ...]]:
+    """Return only pair tokens produced by more than one distinct actor pair.
+
+    Underscores remain valid in actor IDs.  They are safe unless a deployed
+    registry contains the rare combination where two complete, sorted pairs
+    produce the same established ``left_right`` token.
+    """
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for first, second in combinations(sorted(set(actor_ids)), 2):
+        pair = (first, second)
+        groups.setdefault(pair_namespace_token(*pair), []).append(pair)
+    return {
+        token: tuple(pairs)
+        for token, pairs in groups.items()
+        if len(pairs) > 1
+    }
 
 
 class PrincipalRegistry:
@@ -72,8 +134,8 @@ class PrincipalRegistry:
             # routed as ``actor=None`` → pending queue.
             #
             # Index both forms so ``resolve_actor("telegram",
-            # "33143799")`` and ``resolve_actor("telegram",
-            # "33143799|Borisskin")`` both return the principal.
+            # "123456789")`` and ``resolve_actor("telegram",
+            # "123456789|example_user")`` both return the principal.
             if ident.channel == "telegram" and "|" in sid:
                 chat_id = sid.split("|", 1)[0]
                 if chat_id and (ident.channel, chat_id) not in self._index:

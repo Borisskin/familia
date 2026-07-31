@@ -10,6 +10,9 @@
 # && docker inspect --format '{{index .RepoDigests 0}}' …``
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim@sha256:e5b65587bce7de595f299855d7385fe7fca39b8a74baa261ba1b7147afa78e58
 
+ARG FAMILIA_VERSION=0.4.1
+LABEL org.opencontainers.image.version="${FAMILIA_VERSION}"
+
 # Build-time mirror fallbacks. Defaults point at canonical upstreams;
 # operators on restricted networks (e.g. some RU egress paths where
 # deb.debian.org / pypi.org / registry.npmjs.org are throttled) can
@@ -87,7 +90,7 @@ RUN uv pip install --system --no-cache --no-deps /app/nanobot /app/familia
 WORKDIR /app/nanobot/bridge
 RUN git config --global --add url."https://github.com/".insteadOf ssh://git@github.com/ && \
     git config --global --add url."https://github.com/".insteadOf git@github.com: && \
-    npm install && npm run build
+    npm ci && npm run build
 WORKDIR /app
 
 # Create non-root user and config directory.

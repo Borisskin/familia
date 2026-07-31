@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import json
 import os
 import time
+from collections.abc import Awaitable as AwaitableABC
+from collections.abc import Callable as CallableABC
 from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -16,10 +19,8 @@ from loguru import logger
 from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
-from nanobot.agent.memory import Consolidator, Dream
-from familia.policy import gate_outbound_send
-from familia.principals import get_current_actor
-from familia import audit, bootstrap as familia_bootstrap
+from nanobot.agent.memory import Consolidator, Dream, MemoryStore
+from nanobot.agent.outbound import OutboundGuard, OutboundRequest, allow_outbound
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
@@ -29,8 +30,8 @@ from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.notebook import NotebookEditTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.search import GlobTool, GrepTool
-from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.self import MyTool
+from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
@@ -115,14 +116,15 @@ class _LoopHook(AgentHook):
         for tc in context.tool_calls:
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
             logger.info("Tool call: {}({})", tc.name, args_str[:200])
-            audit.log_event(
-                "tool_call",
-                tool=tc.name,
-                args_preview=args_str[:500],
-                actor=get_current_actor(),
-                channel=self._channel,
-                chat_id=self._chat_id,
-            )
+            if self._loop._tool_call_auditor:
+                self._loop._tool_call_auditor(
+                    "tool_call",
+                    tool=tc.name,
+                    args_preview=args_str[:500],
+                    actor=self._loop._current_actor_getter(),
+                    channel=self._channel,
+                    chat_id=self._chat_id,
+                )
         self._loop._set_tool_context(self._channel, self._chat_id, self._message_id)
 
     async def after_iteration(self, context: AgentHookContext) -> None:
@@ -177,6 +179,26 @@ class AgentLoop:
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
         tools_config: ToolsConfig | None = None,
+        context_extensions: list[Any] | None = None,
+        tool_installers: list[CallableABC[[AgentLoop], None]] | None = None,
+        inbound_enrichers: list[CallableABC[[InboundMessage], AwaitableABC[None]]] | None = None,
+        outbound_guard: OutboundGuard | None = None,
+        pending_inbound_handler: (
+            CallableABC[[InboundMessage], AwaitableABC[tuple[bool, OutboundMessage | None]]] | None
+        ) = None,
+        direct_actor_resolver: CallableABC[[str, str], str | None] | None = None,
+        current_actor_getter: CallableABC[[], str | None] | None = None,
+        tool_call_auditor: CallableABC[..., None] | None = None,
+        cron_tool_options: dict[str, Any] | None = None,
+        dream_tool_installers: list[CallableABC[[ToolRegistry, MemoryStore], None]] | None = None,
+        history_actor_validator: CallableABC[[str], bool] | None = None,
+        dream_turn_context: CallableABC[[], Any] | None = None,
+        dream_restore_policy: CallableABC[[list[str] | None], str | None] | None = None,
+        dream_batch_context: CallableABC[[list[dict[str, Any]]], Any] | None = None,
+        archive_sink: Callable[[str, list[dict]], Awaitable[Any]] | None = None,
+        private_session_owner_resolver: (
+            Callable[[str, list[dict]], Awaitable[str | None]] | None
+        ) = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
@@ -209,8 +231,26 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
+        self._tool_installers = tool_installers or []
+        self._inbound_enrichers = inbound_enrichers or []
+        self._outbound_guard = outbound_guard or allow_outbound
+        self._pending_inbound_handler = pending_inbound_handler
+        self._direct_actor_resolver = direct_actor_resolver
+        self._current_actor_getter = current_actor_getter or (lambda: None)
+        self._tool_call_auditor = tool_call_auditor
+        self._cron_tool_options = cron_tool_options or {}
+        self._dream_tool_installers = dream_tool_installers or []
+        self.dream_restore_policy = dream_restore_policy
 
-        self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
+        # Deployments inject concrete prompt/runtime extensions here; the
+        # builder remains unaware of which product owns them.
+        self.context = ContextBuilder(
+            workspace,
+            timezone=timezone,
+            disabled_skills=disabled_skills,
+            context_extensions=context_extensions or [],
+            history_actor_validator=history_actor_validator,
+        )
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.runner = AgentRunner(provider)
@@ -243,6 +283,16 @@ class AgentLoop:
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
         )
+        self.dream = Dream(
+            store=self.context.memory,
+            provider=provider,
+            model=self.model,
+            dream_tool_installers=self._dream_tool_installers,
+            dream_turn_context=dream_turn_context,
+            dream_batch_context=dream_batch_context,
+        )
+        if archive_sink is None and private_session_owner_resolver is not None:
+            archive_sink = self.dream.archive_private
         self.consolidator = Consolidator(
             store=self.context.memory,
             provider=provider,
@@ -252,16 +302,13 @@ class AgentLoop:
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
+            archive_sink=archive_sink,
+            private_session_owner_resolver=private_session_owner_resolver,
         )
         self.auto_compact = AutoCompact(
             sessions=self.sessions,
             consolidator=self.consolidator,
             session_ttl_minutes=session_ttl_minutes,
-        )
-        self.dream = Dream(
-            store=self.context.memory,
-            provider=provider,
-            model=self.model,
         )
         self._register_default_tools()
         if _tc.my.enable:
@@ -322,32 +369,25 @@ class AgentLoop:
                 WebSearchTool(config=self.web_config.search, proxy=self.web_config.proxy)
             )
             self.tools.register(WebFetchTool(proxy=self.web_config.proxy))
-        self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
-        familia_bootstrap.install_tools(self)
+        self.tools.register(
+            MessageTool(
+                send_callback=self.bus.publish_outbound,
+                outbound_guard=self._outbound_guard,
+            )
+        )
+        for install_tools in self._tool_installers:
+            install_tools(self)
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
-            to_validator = None
-            current_actor_getter = None
-            is_admin_getter = None
-            reachable_tags_getter = None
-            try:
-                to_validator = familia_bootstrap.make_principal_chat_validator()
-                from familia.principals import get_current_actor as _gca
-                current_actor_getter = _gca
-                is_admin_getter = familia_bootstrap.make_admin_check()
-                reachable_tags_getter = familia_bootstrap.make_reachable_tags_getter()
-            except (ImportError, AttributeError):
-                # Standalone nanobot install (no familia) — cron list/remove
-                # stay un-filtered (single-user) and 'to' override unchecked.
-                pass
+            cron_options = self._cron_tool_options
             self.tools.register(
                 CronTool(
                     self.cron_service,
                     default_timezone=self.context.timezone or "UTC",
-                    to_validator=to_validator,
-                    current_actor_getter=current_actor_getter,
-                    is_admin_getter=is_admin_getter,
-                    reachable_tags_getter=reachable_tags_getter,
+                    to_validator=cron_options.get("to_validator"),
+                    current_actor_getter=cron_options.get("current_actor_getter"),
+                    is_admin_getter=cron_options.get("is_admin_getter"),
+                    reachable_tags_getter=cron_options.get("reachable_tags_getter"),
                 )
             )
 
@@ -717,11 +757,10 @@ class AgentLoop:
     async def _publish_reply_with_policy(
         self, inbound: InboundMessage, outbound: OutboundMessage
     ) -> None:
-        """Gate a direct agent reply through the familia policy engine
-        before publishing. All four message-send paths (this one plus
-        MessageTool, SendButtonsTool, AskPrincipalTool) delegate the
-        policy decision to :func:`familia.policy.gate_outbound_send` so
-        the self-reply bypass and ASK parking live in one place.
+        """Gate a direct agent reply through the configured outbound guard.
+
+        Direct replies and MessageTool delegate to the same guard so self-reply
+        bypasses, approval parking, and audit stay behind one extension point.
         Streaming deltas, progress/retry notices and status metadata
         messages are passed through without gating — they are system
         output, not agent decisions about who to address."""
@@ -734,20 +773,26 @@ class AgentLoop:
             await self.bus.publish_outbound(outbound)
             return
 
-        result = await gate_outbound_send(
-            action="message.send",
-            outbound=outbound,
-            inbound_channel=inbound.channel,
-            inbound_chat_id=inbound.chat_id,
-            publish_outbound=self.bus.publish_outbound,
+        # Direct replies and MessageTool share the same neutral guard. Adapters
+        # can park or deny sends without loop.py importing product policy.
+        result = await self._outbound_guard(
+            OutboundRequest(
+                action="message.send",
+                outbound=outbound,
+                inbound_channel=inbound.channel,
+                inbound_chat_id=inbound.chat_id,
+                publish_outbound=self.bus.publish_outbound,
+            )
         )
         if result.kind == "allow":
             await self.bus.publish_outbound(outbound)
             return
         if result.kind == "deny":
             logger.warning(
-                "familia policy: dropped direct reply to {}:{} — {}",
-                outbound.channel, outbound.chat_id, result.reason,
+                "outbound guard: dropped direct reply to {}:{} — {}",
+                outbound.channel,
+                outbound.chat_id,
+                result.reason,
             )
             return
 
@@ -790,7 +835,7 @@ class AgentLoop:
 
             session, pending = self.auto_compact.prepare_session(session, key)
 
-            await self.consolidator.maybe_consolidate_by_tokens(
+            session = await self.consolidator.maybe_consolidate_by_tokens(
                 session,
                 session_summary=pending,
             )
@@ -803,7 +848,8 @@ class AgentLoop:
             if is_subagent and self._persist_subagent_followup(session, msg):
                 self.sessions.save(session)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
-            await familia_bootstrap.on_inbound(msg)
+            for enrich_inbound in self._inbound_enrichers:
+                await enrich_inbound(msg)
             history = session.get_history(max_messages=0)
             current_role = "assistant" if is_subagent else "user"
 
@@ -832,77 +878,24 @@ class AgentLoop:
                 content=final_content or "Background task completed.",
             )
 
-        # Pending-principal gate: an unknown identity (one whose
-        # (channel, sender_id) is not in principals.json) is intercepted
-        # before any LLM/tool work, document extraction, AND the
-        # ``Processing message`` log line — we don't want a stranger's
-        # message preview leaking to the gateway log alongside our
-        # principals' real ones. Land in the pending list, send a
-        # templated "ждите подтверждения" reply, don't process the
-        # message. Repeat messages from the same sender update the row
-        # in place.
-        #
-        # NOTE: today this only fires for channels that route through
-        # ``BaseChannel._handle_message`` (i.e. VK in the current
-        # deployment). Telegram/Discord/Matrix adapters call
-        # ``is_allowed`` themselves before that path and would bypass
-        # this gate; when they're brought online, the channel-level
-        # ``allow_from`` filter must be relaxed in the same way to let
-        # unknown senders flow through with ``actor=None``.
+        metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
+        has_private_mode_proof = (
+            "private_mode_proof" in metadata
+            and metadata["private_mode_proof"] is not None
+        )
         if (
-            msg.actor is None
-            and msg.channel not in ("cli", "system")
+            self.consolidator.archive_sink_enabled
+            and msg.channel in {"telegram", "vk"}
+            and not has_private_mode_proof
         ):
-            try:
-                from familia.pending import store as pending_store
-                from familia.pending.messages import reply_for_pending
+            raise ValueError(
+                "private_mode_proof is required for server messages"
+            )
 
-                display_name = ""
-                meta = msg.metadata or {}
-                # Channel adapters drop a friendly name into metadata
-                # when the platform exposes one; fall back to the raw
-                # sender_id so the admin "Заявки" page is never blank.
-                for k in ("display_name", "first_name", "username", "from_name"):
-                    v = meta.get(k)
-                    if isinstance(v, str) and v.strip():
-                        display_name = v.strip()
-                        break
-                if not display_name:
-                    display_name = str(msg.sender_id)
-
-                # Off-load the synchronous file I/O so the asyncio event
-                # loop doesn't stall on disk under bursts of newcomers.
-                entry = await asyncio.to_thread(
-                    pending_store.record,
-                    channel=msg.channel,
-                    sender_id=msg.sender_id,
-                    display_name=display_name,
-                    message_preview=msg.content,
-                )
-                if entry is not None:
-                    return OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content=reply_for_pending(),
-                    )
-                # entry is None → silenced (rejected cooldown or cap):
-                # do NOT reply, do NOT proceed to LLM — flooders get nothing.
-                return None
-            except Exception:
-                # Persistence layer is down (disk full, perms, …).
-                # Send a generic "service degraded" hint so the sender
-                # isn't met with silence; we'd rather give a
-                # not-actionable reply than mute every newcomer until
-                # the next deploy. The exception is fully logged for ops.
-                logger.exception(
-                    "pending-principal gate failed for {}:{}; replying with degraded notice",
-                    msg.channel, msg.sender_id,
-                )
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content="Сейчас не могу обработать запрос. Попробуйте позже.",
-                )
+        if self._pending_inbound_handler:
+            handled, pending_response = await self._pending_inbound_handler(msg)
+            if handled:
+                return pending_response
 
         # Extract document text from media at the processing boundary so all
         # channels benefit without format-specific logic in ContextBuilder.
@@ -922,13 +915,14 @@ class AgentLoop:
 
         session, pending = self.auto_compact.prepare_session(session, key)
 
-        await self.consolidator.maybe_consolidate_by_tokens(
+        session = await self.consolidator.maybe_consolidate_by_tokens(
             session,
             session_summary=pending,
         )
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
-        await familia_bootstrap.on_inbound(msg)
+        for enrich_inbound in self._inbound_enrichers:
+            await enrich_inbound(msg)
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
@@ -982,11 +976,23 @@ class AgentLoop:
         # makes recovery possible from the session log alone.
         user_persisted_early = False
         if isinstance(msg.content, str) and msg.content.strip():
-            user_actor = get_current_actor()
+            user_message_kwargs: dict[str, Any] = {
+                "sender_id": str(msg.sender_id),
+            }
+            if has_private_mode_proof:
+                user_message_kwargs.update(
+                    {
+                        "channel": msg.channel,
+                        "chat_id": str(msg.chat_id),
+                        "private_mode_proof": copy.deepcopy(
+                            metadata["private_mode_proof"]
+                        ),
+                    }
+                )
+            user_actor = self._current_actor_getter()
             if user_actor:
-                session.add_message("user", msg.content, actor=user_actor)
-            else:
-                session.add_message("user", msg.content)
+                user_message_kwargs["actor"] = user_actor
+            session.add_message("user", msg.content, **user_message_kwargs)
             self._mark_pending_user_turn(session)
             self.sessions.save(session)
             user_persisted_early = True
@@ -1120,7 +1126,9 @@ class AgentLoop:
                         continue
                     entry["content"] = filtered
             entry.setdefault("timestamp", datetime.now().isoformat())
-            session.messages.append(entry)
+            stored_role = entry.pop("role", None)
+            stored_content = entry.pop("content", "")
+            session.add_message(stored_role, stored_content, **entry)
         session.updated_at = datetime.now()
 
     def _persist_subagent_followup(self, session: Session, msg: InboundMessage) -> bool:
@@ -1222,7 +1230,13 @@ class AgentLoop:
             ):
                 overlap = size
                 break
-        session.messages.extend(restored_messages[overlap:])
+        previous_updated_at = session.updated_at
+        for restored_message in restored_messages[overlap:]:
+            entry = dict(restored_message)
+            role = entry.pop("role", None)
+            content = entry.pop("content", "")
+            session.add_message(role, content, **entry)
+        session.updated_at = previous_updated_at
 
         self._clear_pending_user_turn(session)
         self._clear_runtime_checkpoint(session)
@@ -1236,12 +1250,10 @@ class AgentLoop:
             return False
 
         if session.messages and session.messages[-1].get("role") == "user":
-            session.messages.append(
-                {
-                    "role": "assistant",
-                    "content": "Error: Task interrupted before a response was generated.",
-                    "timestamp": datetime.now().isoformat(),
-                }
+            session.add_message(
+                "assistant",
+                "Error: Task interrupted before a response was generated.",
+                timestamp=datetime.now().isoformat(),
             )
             session.updated_at = datetime.now()
 
@@ -1267,10 +1279,49 @@ class AgentLoop:
         the recipient's principal is known from ``payload.to``.
         """
         await self._connect_mcp()
+        direct_actor_resolver = getattr(self, "_direct_actor_resolver", None)
+        metadata: dict[str, Any] = {}
+        if channel in {"telegram", "vk"}:
+            # Direct cron/heartbeat paths bypass channel enrichment, so the
+            # trusted adapter must prove the private recipient before the loop
+            # may persist or archive anything for a server channel.
+            resolved_actor = (
+                direct_actor_resolver(channel, chat_id)
+                if direct_actor_resolver is not None
+                else None
+            )
+            trusted_actor = (
+                resolved_actor
+                if isinstance(resolved_actor, str) and resolved_actor
+                else None
+            )
+            if actor is not None and actor != trusted_actor:
+                raise ValueError(
+                    "explicit actor does not match trusted direct actor"
+                )
+            actor = trusted_actor
+            if actor is not None:
+                private_mode_proof = (
+                    {
+                        "private_mode": True,
+                        "is_group": False,
+                        "topic_id": None,
+                    }
+                    if channel == "telegram"
+                    else {
+                        "private_mode": True,
+                        "peer_id": chat_id,
+                        "from_id": chat_id,
+                    }
+                )
+                metadata["private_mode_proof"] = private_mode_proof
+        elif actor is None and direct_actor_resolver is not None:
+            actor = direct_actor_resolver(channel, chat_id)
         msg = InboundMessage(
             channel=channel, sender_id=actor or "user", chat_id=chat_id,
             content=content, media=media or [],
             actor=actor,
+            metadata=metadata,
         )
         return await self._process_message(
             msg,

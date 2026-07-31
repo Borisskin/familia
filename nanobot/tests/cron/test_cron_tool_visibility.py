@@ -240,7 +240,7 @@ def test_add_with_unreachable_tag_rejected(svc):
 
 def test_add_with_reachable_tags_persists_with_tags_field(svc):
     def reachable(actor: str | None) -> set[str]:
-        return {"varya", "school"} if actor == "member_a" else set()
+        return {"child", "school"} if actor == "member_a" else set()
 
     tool = CronTool(
         svc,
@@ -251,26 +251,26 @@ def test_add_with_reachable_tags_persists_with_tags_field(svc):
     )
     tool.set_context("vk", SESSION_CHAT_MEMBER_A)
     out = _run(tool, action="add", message="x", at="2030-01-01T00:00:00",
-               tags=["varya", "school"])
+               tags=["child", "school"])
     assert "Created job" in out
     [job] = svc.list_jobs()
-    assert sorted(job.payload.tags) == ["school", "varya"]
+    assert sorted(job.payload.tags) == ["school", "child"]
 
 
 def test_list_filters_by_tag_intersection(svc):
-    """A job tagged ``varya`` is visible to anyone whose reachable set
-    contains varya, even if they didn't create it and aren't the recipient."""
-    _seed(svc, id="t1", name="varya-tagged",
+    """A job tagged ``child`` is visible to anyone whose reachable set
+    contains child, even if they didn't create it and aren't the recipient."""
+    _seed(svc, id="t1", name="child-tagged",
           created_by="member_a", to=SESSION_CHAT_MEMBER_A,
           # tags injected via direct service path
           )
     # Inject tags into the seeded job (bypass: the seed helper doesn't accept tags).
     job = svc.get_job("t1")
-    job.payload.tags = ["varya"]
+    job.payload.tags = ["child"]
     svc._save_store()
 
     def reachable_owner(actor: str | None) -> set[str]:
-        return {"varya", "owner"} if actor == "owner" else set()
+        return {"child", "owner"} if actor == "owner" else set()
 
     tool = CronTool(
         svc,
@@ -281,7 +281,7 @@ def test_list_filters_by_tag_intersection(svc):
     )
     tool.set_context("vk", CHAT_OWNER)
     out = _run(tool, action="list")
-    assert "varya-tagged" in out
+    assert "child-tagged" in out
 
 
 def test_admin_can_remove_anyone_job(svc):

@@ -1,109 +1,101 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
 diff --git a/nanobot/nanobot/command/builtin.py b/nanobot/nanobot/command/builtin.py
-index 94ee064..50f8fc1 100644
+index 87d4bf6..30bfa05 100644
 --- a/nanobot/nanobot/command/builtin.py
 +++ b/nanobot/nanobot/command/builtin.py
-@@ -7,6 +7,9 @@ import os
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++from copy import deepcopy
+ import os
  import sys
  
- from nanobot import __version__
-+from familia import audit
-+from familia.policy import get_pending_store
-+from nanobot.agent.tools.message import MessageTool
- from nanobot.bus.events import OutboundMessage
- from nanobot.command.router import CommandContext, CommandRouter
- from nanobot.utils.helpers import build_status_content
-@@ -339,6 +342,88 @@ def build_help_text() -> str:
-     return "\n".join(lines)
- 
- 
-+async def cmd_approve(ctx: CommandContext) -> OutboundMessage:
-+    """Approve a pending policy-gated action by token (familia extension)."""
-+    msg = ctx.msg
-+    raw = ctx.args.strip() if ctx.args else ctx.raw.removeprefix("/approve").strip()
-+    token = raw.split()[0] if raw else ""
+@@ -52,7 +53,7 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
+         pass
+     if ctx_est <= 0:
+         ctx_est = loop._last_usage.get("prompt_tokens", 0)
+-    
 +
-+    def reply(text: str) -> OutboundMessage:
-+        return OutboundMessage(
-+            channel=msg.channel,
-+            chat_id=msg.chat_id,
-+            content=text,
-+            metadata=dict(msg.metadata or {}),
+     # Fetch web search provider usage (best-effort, never blocks the response)
+     search_usage_text: str | None = None
+     try:
+@@ -95,13 +96,29 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
+     """Stop active task and start a fresh session."""
+     loop = ctx.loop
+     await loop._cancel_active_tasks(ctx.key)
+-    session = ctx.session or loop.sessions.get_or_create(ctx.key)
+-    snapshot = session.messages[session.last_consolidated:]
+-    session.clear()
+-    loop.sessions.save(session)
+-    loop.sessions.invalidate(session.key)
+-    if snapshot:
+-        loop._schedule_background(loop.consolidator.archive(snapshot))
++    lock = loop.consolidator.get_lock(ctx.key)
++    async with lock:
++        session = loop.sessions.get_or_create(ctx.key)
++        original_messages = deepcopy(session.messages)
++        original_last_consolidated = session.last_consolidated
++        original_metadata = deepcopy(session.metadata)
++        original_updated_at = session.updated_at
++        snapshot = session.messages[session.last_consolidated:]
++        if snapshot:
++            await loop.consolidator.archive(
++                snapshot,
++                session_key=session.key,
++            )
++        session.clear()
++        try:
++            loop.sessions.save(session)
++        except Exception:
++            session.messages = original_messages
++            session.last_consolidated = original_last_consolidated
++            session.metadata = original_metadata
++            session.updated_at = original_updated_at
++            raise
++        loop.sessions.invalidate(session.key)
+     return OutboundMessage(
+         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+         content="New session started.",
+@@ -287,19 +304,27 @@ async def cmd_dream_restore(ctx: CommandContext) -> OutboundMessage:
+         sha = args.split()[0]
+         result = git.show_commit_diff(sha)
+         changed_files = _format_changed_files(result[1]) if result else "the tracked memory files"
+-        new_sha = git.revert(sha)
+-        if new_sha:
+-            content = (
+-                f"Restored Dream memory to the state before `{sha}`.\n\n"
+-                f"- New safety commit: `{new_sha}`\n"
+-                f"- Restored files: {changed_files}\n\n"
+-                f"Use `/dream-log {new_sha}` to inspect the restore diff."
+-            )
++        changed_file_paths = _extract_changed_files(result[1]) if result else None
++        restore_policy = getattr(ctx.loop, "dream_restore_policy", None)
++        restore_block_reason = (
++            restore_policy(changed_file_paths) if callable(restore_policy) else None
 +        )
-+
-+    if not token:
-+        return reply("Usage: /approve <token>")
-+
-+    store = get_pending_store()
-+    pending = store.peek(token)
-+    if pending is None:
-+        audit.log_event(
-+            "policy_expired", token=token, attempted_by=msg.actor, verb="approve"
-+        )
-+        return reply(f"No pending action for token {token} (expired or unknown).")
-+
-+    if not pending.allows_approver(msg.actor):
-+        approvers = ", ".join(pending.approvers) if pending.approvers else "no one"
-+        audit.log_event(
-+            "policy_approve_denied",
-+            token=token,
-+            attempted_by=msg.actor,
-+            approvers=list(pending.approvers),
-+        )
-+        return reply(
-+            f"You are not authorized to approve this action. "
-+            f"Required approver(s): {approvers}."
-+        )
-+
-+    # Commit: remove from store and execute through the message tool.
-+    taken = store.take(token)
-+    if taken is None:
-+        audit.log_event(
-+            "policy_expired", token=token, attempted_by=msg.actor, verb="approve"
-+        )
-+        return reply(f"Pending action {token} just expired.")
-+
-+    tool = None
-+    if ctx.loop is not None:
-+        tool = ctx.loop.tools.get("message") if hasattr(ctx.loop, "tools") else None
-+    if not isinstance(tool, MessageTool):
-+        return reply("Message tool is unavailable; cannot execute the approved action.")
-+
-+    try:
-+        await tool.send_approved(taken.outbound)
-+    except Exception as exc:
-+        audit.log_event(
-+            "policy_approve_failed",
-+            token=token,
-+            approver=msg.actor,
-+            action=taken.action,
-+            target_channel=taken.outbound.channel,
-+            target_chat_id=taken.outbound.chat_id,
-+            requester_actor=taken.requester_actor,
-+            error=str(exc),
-+        )
-+        return reply(f"Approved action failed to send: {exc}")
-+
-+    audit.log_event(
-+        "policy_approve",
-+        token=token,
-+        approver=msg.actor,
-+        action=taken.action,
-+        target_channel=taken.outbound.channel,
-+        target_chat_id=taken.outbound.chat_id,
-+        requester_actor=taken.requester_actor,
-+        via="slash_command",
-+    )
-+    return reply(
-+        f"Approved {taken.action} to {taken.outbound.channel}:{taken.outbound.chat_id}."
-+    )
-+
-+
- def register_builtin_commands(router: CommandRouter) -> None:
-     """Register the default set of slash commands."""
-     router.priority("/stop", cmd_stop)
-@@ -352,3 +437,5 @@ def register_builtin_commands(router: CommandRouter) -> None:
-     router.exact("/dream-restore", cmd_dream_restore)
-     router.prefix("/dream-restore ", cmd_dream_restore)
-     router.exact("/help", cmd_help)
-+    router.prefix("/approve ", cmd_approve)
-+    router.exact("/approve", cmd_approve)
++        if restore_block_reason is not None:
++            content = restore_block_reason
+         else:
+-            content = (
+-                f"Couldn't restore Dream change `{sha}`.\n\n"
+-                "It may not exist, or it may be the first saved version with no earlier state to restore."
+-            )
++            new_sha = git.revert(sha)
++            if new_sha:
++                content = (
++                    f"Restored Dream memory to the state before `{sha}`.\n\n"
++                    f"- New safety commit: `{new_sha}`\n"
++                    f"- Restored files: {changed_files}\n\n"
++                    f"Use `/dream-log {new_sha}` to inspect the restore diff."
++                )
++            else:
++                content = (
++                    f"Couldn't restore Dream change `{sha}`.\n\n"
++                    "It may not exist, or it may be the first saved version with no earlier state to restore."
++                )
+     return OutboundMessage(
+         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+         content=content, metadata={"render_as": "text"},

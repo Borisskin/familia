@@ -8,12 +8,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from typer.testing import CliRunner
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.cli.commands import _make_provider, app
+from nanobot.command.builtin import cmd_new
+from nanobot.command.router import CommandContext
 from nanobot.config.schema import Config
 from nanobot.cron.types import CronJob, CronPayload
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_name
+from nanobot.session.manager import Session
 
 runner = CliRunner()
 
@@ -1480,3 +1483,279 @@ def test_channels_login_requires_channel_name() -> None:
     result = runner.invoke(app, ["channels", "login"])
 
     assert result.exit_code == 2
+
+
+def _dream_restore_context(
+    *,
+    actor: str | None,
+    changed_file: str,
+    restore_policy,
+):
+    from nanobot.bus.events import InboundMessage
+    from nanobot.command.router import CommandContext
+
+    git = MagicMock()
+    git.is_initialized.return_value = True
+    if changed_file.startswith(" "):
+        old_path = json.dumps(f"a/{changed_file}")
+        new_path = json.dumps(f"b/{changed_file}")
+    else:
+        old_path = f"a/{changed_file}"
+        new_path = f"b/{changed_file}"
+    git.show_commit_diff.return_value = (
+        MagicMock(sha="dream-sha"),
+        f"diff --git {old_path} {new_path}\n"
+        f"--- {old_path}\n"
+        f"+++ {new_path}\n",
+    )
+    git.revert.return_value = "safety-sha"
+    loop = MagicMock()
+    loop.consolidator.store.git = git
+    loop.dream_restore_policy = restore_policy
+    message = InboundMessage(
+        channel="telegram",
+        sender_id="101",
+        chat_id="101",
+        content="/dream-restore dream-sha",
+        actor=actor,
+    )
+    context = CommandContext(
+        msg=message,
+        session=None,
+        key=message.session_key,
+        raw=message.content,
+        args="dream-sha",
+        loop=loop,
+    )
+    return git, context
+
+
+@pytest.mark.asyncio
+async def test_familia_dream_restore_policy_blocks_soul() -> None:
+    from familia.bootstrap import make_dream_restore_policy
+    from nanobot.command.builtin import cmd_dream_restore
+
+    git, context = _dream_restore_context(
+        actor=None,
+        changed_file="SOUL.md",
+        restore_policy=make_dream_restore_policy(),
+    )
+
+    result = await cmd_dream_restore(context)
+
+    git.revert.assert_not_called()
+    assert "does not restore `SOUL.md`" in result.content
+
+
+@pytest.mark.parametrize(
+    "changed_file",
+    ["unknown.md", "subdir/SOUL.md", "sOuL.Md", " SOUL.md"],
+)
+@pytest.mark.asyncio
+async def test_familia_dream_restore_policy_blocks_unknown_or_distorted_path(
+    changed_file: str,
+) -> None:
+    from familia.bootstrap import make_dream_restore_policy
+    from nanobot.command.builtin import cmd_dream_restore
+
+    git, context = _dream_restore_context(
+        actor=None,
+        changed_file=changed_file,
+        restore_policy=make_dream_restore_policy(),
+    )
+
+    result = await cmd_dream_restore(context)
+
+    git.revert.assert_not_called()
+    assert "cannot verify which files" in result.content
+
+
+@pytest.mark.asyncio
+async def test_standalone_dream_restore_with_actor_and_no_policy_reverts() -> None:
+    from nanobot.command.builtin import cmd_dream_restore
+
+    git, context = _dream_restore_context(
+        actor="principal_alpha",
+        changed_file="SOUL.md",
+        restore_policy=None,
+    )
+
+    await cmd_dream_restore(context)
+
+    git.revert.assert_called_once_with("dream-sha")
+
+
+@pytest.mark.parametrize("changed_file", ["USER.md", "memory/MEMORY.md"])
+@pytest.mark.asyncio
+async def test_familia_dream_restore_policy_allows_known_non_soul_diff(
+    changed_file: str,
+) -> None:
+    from familia.bootstrap import make_dream_restore_policy
+    from nanobot.command.builtin import cmd_dream_restore
+
+    git, context = _dream_restore_context(
+        actor="principal_alpha",
+        changed_file=changed_file,
+        restore_policy=make_dream_restore_policy(),
+    )
+
+    await cmd_dream_restore(context)
+
+    git.revert.assert_called_once_with("dream-sha")
+
+
+@pytest.mark.asyncio
+async def test_cmd_new_archives_under_session_lock_before_clearing() -> None:
+    session = Session(key="telegram:1001")
+    session.add_message("user", "old user")
+    session.add_message("assistant", "old assistant")
+    expected_snapshot = [dict(message) for message in session.messages]
+
+    async def archive(actual_snapshot, *, session_key):
+        assert session_key == "telegram:1001"
+        assert actual_snapshot == expected_snapshot
+        assert session.messages == expected_snapshot
+
+    loop = MagicMock()
+    loop._cancel_active_tasks = AsyncMock(return_value=0)
+    loop.consolidator.archive = archive
+    loop.consolidator.get_lock.return_value = asyncio.Lock()
+    loop.sessions.get_or_create.return_value = session
+    loop.sessions.save = MagicMock()
+    loop.sessions.invalidate = MagicMock()
+    msg = InboundMessage(
+        channel="telegram",
+        sender_id="1001|alice",
+        chat_id="1001",
+        content="/new",
+    )
+    ctx = CommandContext(
+        msg=msg,
+        session=session,
+        key=session.key,
+        raw="/new",
+        loop=loop,
+    )
+
+    await cmd_new(ctx)
+
+    assert session.messages == []
+    loop.sessions.save.assert_called_once_with(session)
+    loop.sessions.invalidate.assert_called_once_with("telegram:1001")
+
+
+@pytest.mark.asyncio
+async def test_cmd_new_selects_current_session_under_consolidator_lock() -> None:
+    key = "telegram:1001"
+    stale = Session(key=key)
+    stale.add_message("user", "stale message")
+    current = Session(key=key)
+    current.add_message("user", "current message")
+    expected_snapshot = [dict(message) for message in current.messages]
+    lock = asyncio.Lock()
+    selection_lock_states: list[bool] = []
+    archived_snapshots: list[list[dict]] = []
+
+    def get_current(session_key):
+        assert session_key == key
+        selection_lock_states.append(lock.locked())
+        return current
+
+    async def archive(messages, *, session_key):
+        assert session_key == key
+        archived_snapshots.append([dict(message) for message in messages])
+
+    loop = MagicMock()
+    loop._cancel_active_tasks = AsyncMock(return_value=0)
+    loop.consolidator.archive = archive
+    loop.consolidator.get_lock.return_value = lock
+    loop.sessions.get_or_create.side_effect = get_current
+    loop.sessions.save = MagicMock()
+    loop.sessions.invalidate = MagicMock()
+    msg = InboundMessage(
+        channel="telegram",
+        sender_id="1001|alice",
+        chat_id="1001",
+        content="/new",
+    )
+    ctx = CommandContext(msg=msg, session=stale, key=key, raw="/new", loop=loop)
+
+    await cmd_new(ctx)
+
+    assert selection_lock_states == [True]
+    assert archived_snapshots == [expected_snapshot]
+
+
+@pytest.mark.asyncio
+async def test_cmd_new_archive_failure_keeps_session() -> None:
+    session = Session(key="telegram:1001")
+    session.add_message("user", "must remain")
+    expected_messages = list(session.messages)
+    loop = MagicMock()
+    loop._cancel_active_tasks = AsyncMock(return_value=0)
+    loop.consolidator.archive = AsyncMock(
+        side_effect=RuntimeError("memX unavailable")
+    )
+    loop.consolidator.get_lock.return_value = asyncio.Lock()
+    loop.sessions.save = MagicMock()
+    loop.sessions.invalidate = MagicMock()
+    msg = InboundMessage(
+        channel="telegram",
+        sender_id="1001|alice",
+        chat_id="1001",
+        content="/new",
+    )
+    ctx = CommandContext(
+        msg=msg,
+        session=session,
+        key=session.key,
+        raw="/new",
+        loop=loop,
+    )
+
+    with pytest.raises(RuntimeError, match="memX unavailable"):
+        await cmd_new(ctx)
+
+    assert session.messages == expected_messages
+    loop.sessions.save.assert_not_called()
+    loop.sessions.invalidate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cmd_new_save_failure_keeps_session_state() -> None:
+    session = Session(key="telegram:1001")
+    session.add_message("user", "must remain")
+    session.add_message("assistant", "must also remain")
+    session.last_consolidated = 1
+    expected_messages = [dict(message) for message in session.messages]
+    expected_last_consolidated = session.last_consolidated
+    expected_summary = ("previous summary", session.updated_at)
+    loop = MagicMock()
+    loop._cancel_active_tasks = AsyncMock(return_value=0)
+    loop.consolidator.archive = AsyncMock(return_value=None)
+    loop.consolidator.get_lock.return_value = asyncio.Lock()
+    loop.sessions.get_or_create.return_value = session
+    loop.sessions.save = MagicMock(side_effect=RuntimeError("save failed"))
+    loop.sessions.invalidate = MagicMock()
+    loop.auto_compact._summaries = {session.key: expected_summary}
+    msg = InboundMessage(
+        channel="telegram",
+        sender_id="1001|alice",
+        chat_id="1001",
+        content="/new",
+    )
+    ctx = CommandContext(
+        msg=msg,
+        session=session,
+        key=session.key,
+        raw="/new",
+        loop=loop,
+    )
+
+    with pytest.raises(RuntimeError, match="save failed"):
+        await cmd_new(ctx)
+
+    assert session.messages == expected_messages
+    assert session.last_consolidated == expected_last_consolidated
+    assert loop.auto_compact._summaries[session.key] == expected_summary
+    loop.sessions.invalidate.assert_not_called()

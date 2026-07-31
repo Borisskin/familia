@@ -7,7 +7,7 @@
 #   ./deploy.sh -h | --help                 # this help
 #
 # Paths are relative to this repo root and MUST start with "nanobot/" or
-# "familia/" (e.g. nanobot/channels/vk.py, familia/src/familia/policy/engine.py).
+# "familia/" (e.g. familia/src/familia/channels/vk.py, familia/src/familia/policy/engine.py).
 # The script extracts at $REMOTE_ROOT on the VM; the compose file there
 # mounts that path as the container's /app so local edits become live
 # after a restart.

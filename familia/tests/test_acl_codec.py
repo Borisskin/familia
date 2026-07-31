@@ -16,15 +16,15 @@ from familia.acl.codec import decode, encode
 # ---- positive: round-trip ---------------------------------------------------
 
 def test_round_trip_preserves_value():
-    raw = encode("hello world", ["varya", "school"])
+    raw = encode("hello world", ["child", "school"])
     rec = decode(raw)
     assert rec is not None
     assert rec.value == "hello world"
-    assert rec.tags == ("varya", "school")
+    assert rec.tags == ("child", "school")
 
 
 def test_round_trip_preserves_unicode():
-    raw = encode("Купить тетради", ["varya"])
+    raw = encode("Купить тетради", ["child"])
     rec = decode(raw)
     assert rec is not None
     assert rec.value == "Купить тетради"

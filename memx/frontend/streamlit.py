@@ -2,7 +2,6 @@
 
 import streamlit as st
 import secrets
-import json
 import time
 import pandas as pd
 from supabase import create_client, Client, ClientOptions

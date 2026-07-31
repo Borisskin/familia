@@ -9,6 +9,7 @@ from typing import Any
 from nanobot.agent.hook import AgentHook
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.queue import MessageBus
+from nanobot.runtime_adapters import make_agent_loop_kwargs
 
 
 @dataclass(slots=True)
@@ -85,6 +86,7 @@ class Nanobot:
             disabled_skills=defaults.disabled_skills,
             session_ttl_minutes=defaults.session_ttl_minutes,
             tools_config=config.tools,
+            **make_agent_loop_kwargs(config.workspace_path),
         )
         return cls(loop)
 
