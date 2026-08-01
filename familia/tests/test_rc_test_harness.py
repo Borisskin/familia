@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import platform
 import shutil
 import signal
 import subprocess
@@ -30,6 +31,30 @@ REQUIRED_BUNDLE_ENTRIES = {
     "stdout.bin",
 }
 SECRET_SENTINEL = "rp020-secret-sentinel-7f83b636c89f4f8d"
+
+
+def _supports_final_capture_environment() -> bool:
+    if sys.platform != "linux" or sys.version_info[:2] != (3, 12):
+        return False
+    release = platform.release().lower()
+    if "microsoft" not in release or "wsl2" not in release:
+        return False
+    try:
+        os_release = {
+            key.lower(): value.strip().strip('"')
+            for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines()
+            if line and not line.startswith("#") and "=" in line
+            for key, value in [line.split("=", 1)]
+        }
+    except OSError:
+        return False
+    return os_release.get("id") == "ubuntu" and os_release.get("version_id") == "24.04"
+
+
+requires_final_capture_environment = unittest.skipUnless(
+    _supports_final_capture_environment(),
+    "RP-020 final-capture environment is unavailable",
+)
 
 
 def _sha256(data: bytes) -> str:
@@ -190,6 +215,7 @@ class RcTestHarnessTests(unittest.TestCase):
         self.assertEqual(result.stdout, b"import-safe-ok\n")
         self.assertEqual(result.stderr, b"")
 
+    @requires_final_capture_environment
     def test_argv_round_trips_without_shell_interpretation(self) -> None:
         self._require_collector()
         fixture = CollectorFixture()
@@ -223,6 +249,7 @@ class RcTestHarnessTests(unittest.TestCase):
         self.assertEqual(command["target_exit_code"], 0)
         self.assertEqual(command["collector_status"], "captured")
 
+    @requires_final_capture_environment
     def test_exact_stream_bytes_and_arbitrary_exit_are_preserved(self) -> None:
         self._require_collector()
         fixture = CollectorFixture()
@@ -250,6 +277,7 @@ class RcTestHarnessTests(unittest.TestCase):
         self.assertIsNone(command["target_signal"])
         self.assertEqual(command["collector_status"], "captured")
 
+    @requires_final_capture_environment
     def test_deliberate_assertion_failure_is_not_reported_as_success(self) -> None:
         self._require_collector()
         fixture = CollectorFixture()
@@ -267,6 +295,7 @@ class RcTestHarnessTests(unittest.TestCase):
         self.assertEqual(command["collector_status"], "captured")
         self.assertTrue(json.loads((bundle / "manifest.json").read_bytes())["valid"])
 
+    @requires_final_capture_environment
     def test_signal_identity_and_shell_status_are_retained(self) -> None:
         self._require_collector()
         fixture = CollectorFixture()
@@ -285,6 +314,7 @@ class RcTestHarnessTests(unittest.TestCase):
         self.assertEqual(command["target_signal"]["name"], "SIGTERM")
         self.assertEqual(command["shell_status"], 128 + signal.SIGTERM)
 
+    @requires_final_capture_environment
     def test_command_not_found_is_an_explicit_collector_failure(self) -> None:
         self._require_collector()
         fixture = CollectorFixture()
@@ -346,6 +376,7 @@ class RcTestHarnessTests(unittest.TestCase):
         self.assertEqual(sentinel.read_bytes(), b"do-not-overwrite")
         self.assertEqual(sorted(path.name for path in existing.iterdir()), ["sentinel"])
 
+    @requires_final_capture_environment
     def test_secret_environment_is_excluded_and_secret_argv_is_rejected(self) -> None:
         self._require_collector()
         fixture = CollectorFixture()
@@ -385,6 +416,7 @@ class RcTestHarnessTests(unittest.TestCase):
         self.assertNotIn(SECRET_SENTINEL.encode(), rejected.stderr)
         self.assertFalse(fixture.bundle("secret-argv").exists())
 
+    @requires_final_capture_environment
     def test_secret_bearing_target_output_is_rejected_without_replay(self) -> None:
         self._require_collector()
         fixture = CollectorFixture()
@@ -411,6 +443,7 @@ class RcTestHarnessTests(unittest.TestCase):
         self.assertFalse(fixture.bundle("secret-output").exists())
         self.assertFalse((fixture.evidence / ".secret-output.incomplete").exists())
 
+    @requires_final_capture_environment
     def test_source_mutation_invalidates_evidence_and_names_changed_path(self) -> None:
         self._require_collector()
         fixture = CollectorFixture()
@@ -433,6 +466,7 @@ class RcTestHarnessTests(unittest.TestCase):
         self.assertIn("tracked.txt", source["comparison"]["changed_paths"])
         self.assertEqual((fixture.repo / "tracked.txt").read_text(encoding="utf-8"), "changed\n")
 
+    @requires_final_capture_environment
     def test_declared_untracked_input_mutation_is_detected_across_all_snapshots(self) -> None:
         self._require_collector()
         fixture = CollectorFixture()
@@ -470,6 +504,7 @@ class RcTestHarnessTests(unittest.TestCase):
             source["comparison"]["final_declared_input_inventory_sha256"],
         )
 
+    @requires_final_capture_environment
     def test_structured_finalization_integrity_attestation_is_retained(self) -> None:
         self._require_collector()
         fixture = CollectorFixture()
@@ -503,6 +538,7 @@ class RcTestHarnessTests(unittest.TestCase):
         self.assertEqual(hashes["artifacts"]["source.json"]["sha256"], _sha256(source_bytes))
         self.assertFalse((fixture.evidence / ".final-attestation.incomplete").exists())
 
+    @requires_final_capture_environment
     def test_bundle_layout_canonical_json_hashes_and_source_identity(self) -> None:
         self._require_collector()
         fixture = CollectorFixture()
@@ -533,6 +569,7 @@ class RcTestHarnessTests(unittest.TestCase):
         self.assertTrue(source["comparison"]["checkout_unchanged"])
         self.assertIn("tracked.txt", source["input_hashes"])
 
+    @requires_final_capture_environment
     def test_mutable_wsl_and_dependency_identity_are_honest_and_complete(self) -> None:
         self._require_collector()
         fixture = CollectorFixture()
@@ -562,6 +599,7 @@ class RcTestHarnessTests(unittest.TestCase):
         self.assertEqual(dependencies["mode"], "exactly_recorded")
         self.assertIn("mutable", dependencies["limitation"].lower())
 
+    @requires_final_capture_environment
     def test_runner_uses_external_venv_and_captures_import_smoke(self) -> None:
         self._require_collector()
         self._require_runner()
