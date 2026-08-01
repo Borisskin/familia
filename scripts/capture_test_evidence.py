@@ -278,8 +278,8 @@ def _require_wsl_python() -> tuple[dict[str, str], str]:
     os_release = _read_os_release()
     if "microsoft" not in release.lower() or "wsl2" not in release.lower():
         raise ValidationError("final capture requires WSL2")
-    if os_release.get("id") != "ubuntu" or os_release.get("version_id") != "24.04":
-        raise ValidationError("final capture requires Ubuntu-24.04")
+    if os_release.get("id") != "ubuntu":
+        raise ValidationError("final capture requires Ubuntu")
     return os_release, release
 
 

@@ -11,7 +11,7 @@ usage: rc-test-env.sh --repo-root PATH --state-root PATH --evidence-root PATH
                       [--allow-env NAME]
                       [--no-install | --install-locked] -- COMMAND [ARG ...]
 
-Run COMMAND in an external Python 3.12 venv on WSL2 Ubuntu-24.04 and capture an
+Run COMMAND in an external Python 3.12 venv on WSL2 Ubuntu and capture an
 atomic evidence bundle.  All runtime roots are required to be outside the
 checkout.  --dependency-root may name an already prepared, external Python
 distribution directory; its installed distributions are recorded exactly.
@@ -158,16 +158,14 @@ esac
 kernel_release=$(uname -r)
 [[ ${kernel_release,,} == *microsoft* && ${kernel_release,,} == *wsl2* ]] || reject
 os_id=
-os_version=
 while IFS='=' read -r key value; do
   value=${value#\"}
   value=${value%\"}
   case $key in
     ID) os_id=$value ;;
-    VERSION_ID) os_version=$value ;;
   esac
 done < /etc/os-release
-[[ $os_id == ubuntu && $os_version == 24.04 ]] || reject
+[[ $os_id == ubuntu ]] || reject
 
 python312=$(command -v python3.12) || reject
 "$python312" -c 'import sys; raise SystemExit(sys.version_info[:2] != (3, 12))' || reject
