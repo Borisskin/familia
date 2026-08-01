@@ -44,6 +44,8 @@ familia = "familia.bootstrap"
 [tool.hatch.build.targets.wheel]
 packages = ["src/familia"]
 
+[tool.ruff]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = [".."]
