@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any, Final
 
-
 MEMORY_CONTRACT: Final[dict[str, Any]] = {
     "contract_version": "2.0.0",
     "authority": {

@@ -9,9 +9,9 @@ import os
 import re
 import stat
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path, PurePosixPath
-from typing import Any, Awaitable, Callable
-
+from typing import Any
 
 SNAPSHOT_SCHEMA_VERSION = "1.0.0"
 SNAPSHOT_FORMAT_VERSION = "1.0.0"
@@ -392,7 +392,7 @@ def _write_dream_cursor(workspace: Path, cursor: int) -> None:
         current = int(path.read_text(encoding="utf-8").strip())
     except (FileNotFoundError, OSError, ValueError):
         current = 0
-    _write_private_atomic(path, f"{max(current, cursor)}\n".encode("utf-8"))
+    _write_private_atomic(path, f"{max(current, cursor)}\n".encode())
 
 
 def make_history_consolidator(provider: Any, model: str) -> Callable[
@@ -726,10 +726,11 @@ def cli(argv: list[str] | None = None) -> int:
     try:
         import asyncio
 
+        from scripts.compare_memory_state import load_and_validate_manifest
+
         from familia.acl.graph_io import get_raw, resolve_admin_key
         from familia.memx_client import memx_base_url
         from familia.principal_memory_ingestor import PrincipalMemoryIngestor
-        from scripts.compare_memory_state import load_and_validate_manifest
 
         snapshot_root = args.snapshot.resolve(strict=True)
         snapshot = load_and_validate_manifest(snapshot_root / "manifest.json")

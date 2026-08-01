@@ -22,7 +22,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-
 # --- Wrapper sentinel (SR-4) ------------------------------------------------
 
 # The wrapper schema MUST contain {WRAP_SENTINEL_KEY: WRAP_SENTINEL}. Any

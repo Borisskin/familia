@@ -8,7 +8,6 @@ from typing import Any
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
 
-
 CONSOLIDATOR_ACTOR = "dream_consolidator"
 
 
@@ -75,7 +74,8 @@ class DreamMemorySetTool(Tool):
             return "Error: Dream trusted server principal is not configured"
         try:
             server_principal = self._server_principal_getter()
-        except Exception as exc:
+        # The configured principal getter is supplied by the host runtime.
+        except Exception as exc:  # noqa: BLE001
             return f"Error: Dream trusted server principal failed ({type(exc).__name__})"
         if not isinstance(server_principal, str) or not server_principal:
             return "Error: denied_invalid: Dream private owner is unavailable"

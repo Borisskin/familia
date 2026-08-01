@@ -64,7 +64,8 @@ def normalize_new_principal_id(
     Familia's established lowercase ``[a-z][a-z0-9_]*`` contract.
     """
     if not isinstance(raw_id, str):
-        raise ValueError(
+        # Callers expose every malformed principal id as one validation error.
+        raise ValueError(  # noqa: TRY004
             "principal id must start with a-z and then use only a-z, 0-9, "
             "and underscores; maximum 64 characters"
         )

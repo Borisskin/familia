@@ -234,7 +234,7 @@ def _match_actor(patterns: list[str], actor: str | None) -> bool:
         elif kind == "peer_of":
             hit = is_peer(actor, arg)
         elif kind == "family_of":
-            from familia.acl.peers import is_family_member  # noqa: PLC0415
+            from familia.acl.peers import is_family_member
             hit = is_family_member(actor, arg)
         elif kind == "principal":
             if not actor:

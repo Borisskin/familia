@@ -17,7 +17,8 @@ original requester through an inbound injection.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -32,13 +33,13 @@ if TYPE_CHECKING:
 async def request_approval(
     *,
     action: str,
-    outbound: "OutboundMessage",
+    outbound: OutboundMessage,
     requester_actor: str | None,
     requester_channel: str | None,
     approvers: list[str],
     reason: str,
     rule_name: str,
-    publish_outbound: Callable[["OutboundMessage"], Awaitable[None]],
+    publish_outbound: Callable[[OutboundMessage], Awaitable[None]],
     extra: dict[str, Any] | None = None,
 ) -> tuple[PendingApproval, list[str]]:
     """Park ``outbound`` and prompt each approver with Confirm/Reject buttons.
@@ -135,7 +136,8 @@ async def request_approval(
         )
         try:
             await publish_outbound(prompt_msg)
-        except Exception as exc:
+        # One failing channel adapter must not prevent notifying other approvers.
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "request_approval: failed to notify approver {}: {}",
                 approver_id, exc,

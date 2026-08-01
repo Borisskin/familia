@@ -11,10 +11,10 @@ Scenarios then consume :class:`~nanobot.bus.events.CallbackEvent` via
 put on each button here.
 """
 
+from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
-from typing import Any, Awaitable, Callable
+from typing import Any
 
-from familia.policy import gate_outbound_send
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import (
     ArraySchema,
@@ -25,6 +25,7 @@ from nanobot.agent.tools.schema import (
 )
 from nanobot.bus.events import OutboundMessage
 
+from familia.policy import gate_outbound_send
 
 _BUTTON_SCHEMA = ObjectSchema(
     label=StringSchema("Button caption shown to the user"),
@@ -196,5 +197,6 @@ class SendButtonsTool(Tool):
             await self._send_callback(msg)
             n = sum(len(r) for r in rows)
             return f"Sent {n} buttons to {channel}:{chat_id}"
-        except Exception as e:
-            return f"Error sending buttons: {str(e)}"
+        # Channel send callbacks are extension boundaries with no shared error type.
+        except Exception as e:  # noqa: BLE001
+            return f"Error sending buttons: {e!s}"

@@ -34,6 +34,8 @@ import json
 import os
 import sys
 import time
+from contextlib import ExitStack
+from datetime import UTC
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +47,7 @@ from familia.acl.schema import (
     ALLOWED_RELATIONS,
     TOPIC_KINDS,
 )
+
 FAMILY_KEY = "shared:family.graph"
 TOPICS_KEY = "shared:topics.graph"
 
@@ -88,7 +91,7 @@ CHANNEL_DEPS: dict[str, tuple[str, str]] = {
 try:
     from familia.tools.family_graph import KINSHIP_RU
     _KINSHIP_TERMS = frozenset(KINSHIP_RU.keys())
-except Exception:  # pragma: no cover - tool import only fails in odd setups
+except Exception:  # noqa: BLE001  # pragma: no cover - optional tool import
     _KINSHIP_TERMS = frozenset()
 
 
@@ -116,8 +119,9 @@ def _all_known_ids(family: dict[str, Any], topics: dict[str, Any]) -> set[str]:
     try:
         from familia.principals import get_registry
         out |= set(get_registry().ids)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # Registry loading is best-effort while validating graph-only fixtures.
+        logger.debug("known-id registry lookup failed: {}", exc)
     return out
 
 
@@ -171,7 +175,8 @@ def _caller_user() -> str:
     import getpass
     try:
         return getpass.getuser()
-    except Exception:
+    except Exception:  # noqa: BLE001
+        # OS account discovery is optional metadata for the audit record.
         return "?"
 
 
@@ -218,7 +223,8 @@ def _familia_version() -> str:
     try:
         from importlib.metadata import version
         return version("familia")
-    except Exception:
+    except Exception:  # noqa: BLE001
+        # Version discovery must not make the administrative CLI unavailable.
         return "unknown"
 
 
@@ -254,7 +260,8 @@ def cmd_health(args: argparse.Namespace) -> int:
     try:
         from familia.principals import get_registry
         info["principals_count"] = len(get_registry().ids)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
+        # Health combines independent subsystems and reports each failure in-band.
         info["principals_error"] = str(exc)
     try:
         family = load_graph_value(FAMILY_KEY)
@@ -311,7 +318,7 @@ def cmd_audit_tail(args: argparse.Namespace) -> int:
                     continue
                 try:
                     from datetime import datetime
-                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    ts = datetime.fromisoformat(ts_str)
                 except ValueError:
                     continue
                 if ts < since:
@@ -869,7 +876,7 @@ def cmd_memory_get(args: argparse.Namespace) -> int:
     ``resolve_admin_key`` chain). Output: raw value if it's a string,
     JSON-encoded otherwise. ``(missing)`` for 404.
     """
-    from familia.acl.graph_io import get_raw, GraphIOError
+    from familia.acl.graph_io import GraphIOError, get_raw
     try:
         raw = get_raw(args.key)
     except GraphIOError as exc:
@@ -947,12 +954,12 @@ def cmd_migrate_hybrid_storage(args: argparse.Namespace) -> int:
     import asyncio
 
     from familia.acl.graph_io import get_raw, resolve_admin_key
-    from familia.memx_client import memx_base_url
     from familia.memory_migration import (
         apply_legacy_transition_plan,
         build_legacy_transition_plan,
         make_configured_history_consolidator,
     )
+    from familia.memx_client import memx_base_url
     from familia.principal_memory_ingestor import PrincipalMemoryIngestor
 
     if args.workspace:
@@ -1223,7 +1230,7 @@ def cmd_audit_untagged_topics(args: argparse.Namespace) -> int:
             if not ts_str:
                 continue
             try:
-                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                ts = datetime.fromisoformat(ts_str)
             except ValueError:
                 continue
             if ts < since:
@@ -1265,16 +1272,16 @@ def cmd_audit_untagged_topics(args: argparse.Namespace) -> int:
 
 def _parse_since(s: str):
     """Accept '30m', '2h', '7d', or ISO datetime."""
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
     units = {"m": 60, "h": 3600, "d": 86400}
     if s and s[-1] in units:
         try:
             n = int(s[:-1])
         except ValueError:
             raise GraphIOError(f"bad --since value: {s!r}")
-        return datetime.now(timezone.utc) - timedelta(seconds=n * units[s[-1]])
+        return datetime.now(UTC) - timedelta(seconds=n * units[s[-1]])
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return datetime.fromisoformat(s)
     except ValueError:
         raise GraphIOError(f"bad --since value: {s!r}")
 
@@ -1308,7 +1315,7 @@ def cmd_audit_tags(args: argparse.Namespace) -> int:
             if not ts_str:
                 continue
             try:
-                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                ts = datetime.fromisoformat(ts_str)
             except ValueError:
                 continue
             if ts < since:
@@ -1800,6 +1807,31 @@ def cmd_pending_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _close_optional_file_lock(stack: ExitStack, operation: str) -> None:
+    try:
+        stack.close()
+    except OSError as exc:
+        logger.debug("{}: file lock close failed ({})", operation, exc)
+
+
+def _acquire_optional_file_lock(path: Path, operation: str) -> ExitStack:
+    """Hold a POSIX advisory lock when available, otherwise keep CLI fallback."""
+    stack = ExitStack()
+    try:
+        import fcntl
+
+        lock_file = stack.enter_context(path.open("w"))
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    except (ImportError, OSError) as exc:
+        _close_optional_file_lock(stack, operation)
+        logger.debug(
+            "{}: file lock unavailable ({}); proceeding without it",
+            operation,
+            exc,
+        )
+    return stack
+
+
 def cmd_pending_approve(args: argparse.Namespace) -> int:
     """Promote a pending entry to a real principal.
 
@@ -1814,8 +1846,8 @@ def cmd_pending_approve(args: argparse.Namespace) -> int:
       to an existing principal. Same locking discipline; idempotent
       (no-op if the identity is already there); does not touch any graph.
     """
-    from familia.pending import store
     from familia import principals as principals_mod
+    from familia.pending import store
 
     if args.attach_to is not None:
         return _cmd_pending_attach(args, store, principals_mod)
@@ -1835,15 +1867,7 @@ def cmd_pending_approve(args: argparse.Namespace) -> int:
     lock_path = Path(os.environ.get("FAMILIA_PRINCIPALS_FILE",
                                     "principals.json")).with_suffix(".approve.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_fd = None
-    try:
-        import fcntl
-
-        lock_fd = open(lock_path, "w")
-        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
-    except (ImportError, OSError) as exc:
-        logger.debug("approve: file lock unavailable ({}); proceeding without it", exc)
-        lock_fd = None
+    lock_stack = _acquire_optional_file_lock(lock_path, "approve")
 
     try:
         # Uniqueness across all three surfaces (principals registry +
@@ -1912,8 +1936,9 @@ def cmd_pending_approve(args: argparse.Namespace) -> int:
             entry = pending_entry
 
         try:
-            from familia.acl.graph_io import set_raw, GraphIOError
             import time as _time
+
+            from familia.acl.graph_io import GraphIOError, set_raw
 
             family = load_graph_value("shared:family.graph")
             nodes = list(family.get("nodes") or [])
@@ -1958,11 +1983,7 @@ def cmd_pending_approve(args: argparse.Namespace) -> int:
         print(f"approved {entry.channel}:{entry.sender_id} as principal {new_id!r}")
         return 0
     finally:
-        if lock_fd is not None:
-            try:
-                lock_fd.close()
-            except Exception:
-                pass
+        _close_optional_file_lock(lock_stack, "approve")
 
 
 def _cmd_pending_attach(args: argparse.Namespace, store: Any, principals_mod: Any) -> int:
@@ -1975,15 +1996,7 @@ def _cmd_pending_attach(args: argparse.Namespace, store: Any, principals_mod: An
     lock_path = Path(os.environ.get("FAMILIA_PRINCIPALS_FILE",
                                     "principals.json")).with_suffix(".approve.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_fd = None
-    try:
-        import fcntl
-
-        lock_fd = open(lock_path, "w")
-        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
-    except (ImportError, OSError) as exc:
-        logger.debug("attach: file lock unavailable ({}); proceeding without it", exc)
-        lock_fd = None
+    lock_stack = _acquire_optional_file_lock(lock_path, "attach")
 
     try:
         registry = principals_mod.get_registry()
@@ -2057,11 +2070,7 @@ def _cmd_pending_attach(args: argparse.Namespace, store: Any, principals_mod: An
               + (" (identity already present, no-op)" if already else ""))
         return 0
     finally:
-        if lock_fd is not None:
-            try:
-                lock_fd.close()
-            except Exception:
-                pass
+        _close_optional_file_lock(lock_stack, "attach")
 
 
 def cmd_pending_reject(args: argparse.Namespace) -> int:
@@ -2123,15 +2132,7 @@ def cmd_identity_remove(args: argparse.Namespace) -> int:
     """Detach a (channel, sender_id) identity from a principal."""
     lock_path = _principals_path().with_suffix(".approve.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_fd = None
-    try:
-        import fcntl
-
-        lock_fd = open(lock_path, "w")
-        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
-    except (ImportError, OSError) as exc:
-        logger.debug("identity-remove: file lock unavailable ({}); proceeding", exc)
-        lock_fd = None
+    lock_stack = _acquire_optional_file_lock(lock_path, "identity-remove")
 
     try:
         path, raw = _load_principals_json()
@@ -2165,11 +2166,7 @@ def cmd_identity_remove(args: argparse.Namespace) -> int:
         print(f"detached {args.channel}:{args.sender_id} from principal {args.principal_id!r}")
         return 0
     finally:
-        if lock_fd is not None:
-            try:
-                lock_fd.close()
-            except Exception:
-                pass
+        _close_optional_file_lock(lock_stack, "identity-remove")
 
 
 # ---------------------------------------------------------------------------
@@ -2186,7 +2183,7 @@ def _pair_scope_grant(member_a: str, member_b: str) -> str:
 def _ambiguous_pair_scope_grants(
     principal_ids: set[str],
 ) -> dict[str, tuple[tuple[str, str], ...]]:
-    from familia.principals import ambiguous_pair_namespaces  # noqa: PLC0415
+    from familia.principals import ambiguous_pair_namespaces
 
     return {
         f"pair:{token}:*": pairs
@@ -2202,7 +2199,7 @@ def _scopes_for_principal(
 ) -> list[str]:
     if principal_ids is None:
         try:
-            from familia.principals import get_registry  # noqa: PLC0415
+            from familia.principals import get_registry
 
             principal_ids = set(get_registry().ids)
         except Exception:  # noqa: BLE001 - isolated CLI fixtures may lack a registry
@@ -2278,7 +2275,7 @@ def _try_sync_memx_acl(new_id: str) -> None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         try:
-            from familia.principals import get_registry  # noqa: PLC0415
+            from familia.principals import get_registry
 
             registry = get_registry()
             principal_ids = set(registry.ids)
@@ -2424,8 +2421,9 @@ def _post_telegram(token: str, chat_id: str, text: str) -> None:
 
 def _post_vk(token: str, user_id: str, text: str) -> None:
     try:
-        import httpx
         import secrets
+
+        import httpx
         r = httpx.post(
             "https://api.vk.com/method/messages.send",
             params={
@@ -2612,14 +2610,14 @@ def cmd_channels_add(args: argparse.Namespace) -> int:
     # Light schema validation per channel — fail loudly so the operator
     # learns about missing tokens before a restart silently drops the
     # adapter from `_init_channels`.
-    if args.name == "telegram":
-        if not section.get("token"):
-            print("error: telegram requires 'token'", file=sys.stderr)
-            return 2
-    elif args.name == "vk":
-        if not section.get("access_token") or not section.get("group_id"):
-            print("error: vk requires 'access_token' and 'group_id'", file=sys.stderr)
-            return 2
+    if args.name == "telegram" and not section.get("token"):
+        print("error: telegram requires 'token'", file=sys.stderr)
+        return 2
+    if args.name == "vk" and (
+        not section.get("access_token") or not section.get("group_id")
+    ):
+        print("error: vk requires 'access_token' and 'group_id'", file=sys.stderr)
+        return 2
 
     section.setdefault("enabled", True)
 
@@ -2744,7 +2742,7 @@ def _channel_test_telegram(cfg: dict[str, Any]) -> tuple[bool, str]:
             u = data.get("result", {})
             return True, f"connected as @{u.get('username')} (id={u.get('id')})"
         return False, data.get("description") or f"HTTP {r.status_code}"
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - external channel probe boundary
         return False, f"error: {e}"
 
 
@@ -2787,7 +2785,7 @@ def _channel_test_vk(cfg: dict[str, Any]) -> tuple[bool, str]:
             g = groups[0]
             return True, f"connected as group «{g.get('name')}» (id={g.get('id')})"
         return True, "connected (response empty)"
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - external channel probe boundary
         return False, f"error: {e}"
 
 
@@ -2806,7 +2804,7 @@ def _channel_test_discord(cfg: dict[str, Any]) -> tuple[bool, str]:
             d = r.json()
             return True, f"connected as {d.get('username')}#{d.get('discriminator', '0')} (id={d.get('id')})"
         return False, f"HTTP {r.status_code}: {r.text[:200]}"
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - external channel probe boundary
         return False, f"error: {e}"
 
 
@@ -2825,7 +2823,7 @@ def _channel_test_slack(cfg: dict[str, Any]) -> tuple[bool, str]:
         if d.get("ok"):
             return True, f"connected as {d.get('user')} on team {d.get('team')}"
         return False, str(d.get("error") or "auth.test failed")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - external channel probe boundary
         return False, f"error: {e}"
 
 
@@ -2844,7 +2842,7 @@ def _channel_test_matrix(cfg: dict[str, Any]) -> tuple[bool, str]:
         if r.status_code == 200:
             return True, f"whoami: {r.json().get('user_id')}"
         return False, f"HTTP {r.status_code}: {r.text[:200]}"
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - external channel probe boundary
         return False, f"error: {e}"
 
 
@@ -2860,7 +2858,7 @@ def _channel_test_email(cfg: dict[str, Any]) -> tuple[bool, str]:
         with imaplib.IMAP4_SSL(host, port, timeout=10) as imap:
             imap.login(user, pwd)
             return True, f"IMAP login ok ({host}:{port}, user={user})"
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - external channel probe boundary
         return False, f"error: {e}"
 
 
@@ -2971,7 +2969,7 @@ def cmd_agents_get(args: argparse.Namespace) -> int:
     """Read main + fallback slot from nanobot config.json. fallback is
     a familia-specific block (``agents.familia_fallback``) — nanobot
     ignores unknown keys."""
-    path, raw = _load_config_json()
+    _path, raw = _load_config_json()
     agents = raw.get("agents") or {}
     main = (agents.get("defaults") or {})
     fallback = (agents.get("familia_fallback") or {})
@@ -3014,8 +3012,9 @@ def cmd_agents_get(args: argparse.Namespace) -> int:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-        except Exception:  # noqa: BLE001 — best-effort
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # Refresh is opportunistic; the current cached response remains valid.
+            logger.debug("model cache background refresh failed to start: {}", exc)
 
     out = {
         "schema_version": 1,
@@ -3312,7 +3311,7 @@ def cmd_agents_test(args: argparse.Namespace) -> int:
             return 0
         print(json.dumps({"ok": False, "message": f"HTTP {r.status_code}: {r.text[:200]}"}))
         return 0
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - external provider probe boundary
         print(json.dumps({"ok": False, "message": f"error: {exc}"}))
         return 0
 
@@ -3334,7 +3333,7 @@ def _load_models_cache() -> dict[str, Any]:
         return {}
     try:
         return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, ValueError):
         return {}
 
 
@@ -3618,7 +3617,7 @@ def cmd_stt_get(args: argparse.Namespace) -> int:
     """Return STT provider creds (redacted) + global default + per-channel
     overrides. Used by the admin UI to populate the STT card on Channels.
     """
-    path, raw = _load_config_json()
+    _path, raw = _load_config_json()
     providers_raw = raw.get("providers") or {}
     channels_raw = raw.get("channels") or {}
 
@@ -3820,7 +3819,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except SystemExit:
         raise
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception as exc:  # noqa: BLE001  # pragma: no cover - CLI boundary
         logger.exception("CLI fatal: {}", exc)
         if getattr(args, "json", False):
             _emit_error_json(str(exc), code="INTERNAL_ERROR")
@@ -3917,7 +3916,8 @@ def _rpc_server_loop(parser: argparse.ArgumentParser) -> int:
                     rc = 2
                 except SystemExit as exc:
                     rc = exc.code if isinstance(exc.code, int) else 1
-                except Exception as exc:
+                # One malformed request must not terminate the local RPC server.
+                except Exception as exc:  # noqa: BLE001
                     if getattr(args, "json", False):
                         _emit_error_json(str(exc), code="INTERNAL_ERROR")
                     else:

@@ -20,17 +20,15 @@ Usage from the patched loop.py::
 from __future__ import annotations
 
 import os
+import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 
 from loguru import logger
 
-import sys
-
 from familia.principals import get_current_actor, set_current_actor, set_current_channel
 from familia.roles import load_effective_roles
-
 
 _dream_principal: ContextVar[str | None] = ContextVar(
     "familia_dream_principal",
@@ -255,8 +253,9 @@ def reload_runtime_registry() -> None:
 
 def make_outbound_guard() -> Any:
     """Adapt familia outbound policy to nanobot's guard protocol."""
-    from familia.policy import gate_outbound_send
     from nanobot.agent.outbound import OutboundDecision
+
+    from familia.policy import gate_outbound_send
 
     async def _guard(request: Any) -> Any:
         result = await gate_outbound_send(
@@ -317,7 +316,8 @@ async def handle_pending_inbound(msg: Any) -> tuple[bool, Any | None]:
                 content=reply_for_pending(),
             )
         return True, None
-    except Exception:
+    # The pending-principal gate must fail closed for any storage or adapter error.
+    except Exception:  # noqa: BLE001
         logger.exception(
             "pending-principal gate failed for {}:{}; replying with degraded notice",
             getattr(msg, "channel", None),
@@ -432,7 +432,9 @@ def build_vocabulary_for(actor: str) -> str:
         return ""
     try:
         import json
+
         import httpx
+
         from familia.acl import vocabulary
         from familia.acl.schema import Graph
         from familia.memx_client import memx_base_url
@@ -491,8 +493,10 @@ def build_vocabulary_for(actor: str) -> str:
     topics_e = [e for e in entries if e.kind != "principal"]
     lines = [
         "<acl-vocabulary>",
-        "Используй эти id для tags=[...] в memory_set/cron add. "
-        "Видны только участники/топики, к которым у тебя есть доступ.",
+        (
+            "Используй эти id для tags=[...] в memory_set/cron add. "
+            "Видны только участники/топики, к которым у тебя есть доступ."
+        ),
         "",
     ]
     if persons:
@@ -525,7 +529,9 @@ def make_reachable_tags_getter() -> Any:
     """
     import asyncio
     import json
+
     import httpx
+
     from familia.acl.reachable import reachable_tag_ids
     from familia.acl.schema import Graph
     from familia.memx_client import memx_base_url

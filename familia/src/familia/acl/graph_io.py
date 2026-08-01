@@ -32,7 +32,6 @@ from typing import Any
 import httpx
 from loguru import logger
 
-
 ADMIN_KEY_PATH = Path("/etc/familia/admin.key")
 ENV_FALLBACK = "FAMILIA_ADMIN_MEMX_KEY"
 HTTP_TIMEOUT_SECS = 10.0
@@ -138,10 +137,7 @@ def resolve_admin_key() -> str:
         ("env", _read_admin_key_from_env),
         ("principals", _read_admin_key_from_principals),
     ):
-        try:
-            key = fn()
-        except GraphIOError:
-            raise
+        key = fn()
         if key:
             # Same dedupe pattern as the WARN — log the resolved source
             # exactly once per process. ``"info:<source>"`` keys it

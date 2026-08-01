@@ -8,8 +8,9 @@ Dream write tool can write scoped facts to memX.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Any, Callable, Iterator
+from typing import Any
 
 from loguru import logger
 
@@ -59,9 +60,9 @@ def make_heartbeat_source_reader(target_actor: str | None) -> Callable[[], tuple
 
     # HeartbeatService consumes these neutral callable attributes without
     # importing familia. This keeps standalone nanobot behavior unchanged.
-    setattr(_read, "target_actor", actor_id or None)
-    setattr(_read, "execution_context", _execution_context)
-    setattr(_read, "requires_explicit_actor", True)
+    _read.target_actor = actor_id or None
+    _read.execution_context = _execution_context
+    _read.requires_explicit_actor = True
     return _read
 
 

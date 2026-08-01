@@ -30,12 +30,12 @@ import os
 from typing import Any
 
 from loguru import logger
+from nanobot.bus.events import CallbackEvent, InboundMessage, OutboundMessage
+from nanobot.bus.queue import MessageBus
 
 from familia import audit, pending_asks
 from familia.policy import get_pending_store
 from familia.principals import actor_display, resolve_identity
-from nanobot.bus.events import CallbackEvent, InboundMessage, OutboundMessage
-from nanobot.bus.queue import MessageBus
 
 
 def _owner_actor() -> str:
@@ -93,7 +93,8 @@ class CallbackDispatcher:
                 await self._task
             except asyncio.CancelledError:
                 pass
-            except Exception as exc:
+            # Shutdown must complete even if the background task failed unexpectedly.
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("Callback dispatcher task raised on shutdown: {}", exc)
             self._task = None
 
@@ -105,7 +106,8 @@ class CallbackDispatcher:
                 break
             try:
                 await self._handle(evt)
-            except Exception:
+            # Isolate each callback so one adapter payload cannot stop the dispatcher.
+            except Exception:  # noqa: BLE001
                 logger.exception(
                     "Callback dispatcher: handler error for evt={!r}", evt
                 )
@@ -262,7 +264,8 @@ class CallbackDispatcher:
         if verb == "approve":
             try:
                 await self.bus.publish_outbound(taken.outbound)
-            except Exception as exc:
+            # Publishing crosses the channel-adapter boundary.
+            except Exception as exc:  # noqa: BLE001
                 logger.exception("approval publish failed")
                 audit.log_event(
                     "policy_approve_failed",
@@ -331,7 +334,8 @@ class CallbackDispatcher:
                     content=text,
                 )
             )
-        except Exception:
+        # A reply failure must not undo the already recorded approval decision.
+        except Exception:  # noqa: BLE001
             logger.exception("approval: failed to reply to approver")
 
     async def _notify_requester(
@@ -371,7 +375,8 @@ class CallbackDispatcher:
         )
         try:
             await self.bus.publish_inbound(msg)
-        except Exception:
+        # Requester notification is best-effort after the decision is committed.
+        except Exception:  # noqa: BLE001
             logger.exception("approval: failed to notify requester")
 
     async def _deliver_ask_answer(self, ask: Any, evt: CallbackEvent) -> None:

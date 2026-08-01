@@ -12,7 +12,6 @@ import httpx
 from familia.acl import codec
 from familia.principals import get_registry
 
-
 _MAX_CAS_ATTEMPTS = 3
 _FACT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _SEMANTIC_RESULT_FIELDS = frozenset(
@@ -26,7 +25,8 @@ def _parse_memx_version(value: Any, *, allow_none: bool) -> float | None:
             return None
         raise ValueError
     if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ValueError
+        # All malformed memX payload fields share one validation contract.
+        raise ValueError  # noqa: TRY004
     try:
         converted = float(value)
     except (OverflowError, TypeError, ValueError) as exc:
@@ -79,7 +79,8 @@ class PrincipalMemoryIngestor:
                 return "denied_invalid: server topic is not verified"
             try:
                 topic_valid = self._server_topic_validator(server_topic)
-            except Exception:
+            # The configured validator is an external trust boundary.
+            except Exception:  # noqa: BLE001
                 return "denied_invalid: server topic validation failed"
             if topic_valid is not True:
                 return "denied_invalid: unknown or untrusted server topic"

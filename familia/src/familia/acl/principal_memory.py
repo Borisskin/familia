@@ -34,7 +34,6 @@ from loguru import logger
 from familia.acl import codec, graph_io
 from familia.acl.graph_io import GraphIOError, get_raw, set_raw
 
-
 _FAMILY_RELATIONS = frozenset(
     {
         "spouse_of",

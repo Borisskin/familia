@@ -71,8 +71,8 @@ class _Probe:
 
 def _load_probe() -> _Probe:
     try:
-        from familia.acl import graph_io
         from familia import principals as principals_mod
+        from familia.acl import graph_io
 
         graph = graph_io.load_graph_value("shared:family.graph")
         edges_raw = graph.get("edges") or []

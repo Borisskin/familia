@@ -32,16 +32,16 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from familia.principals import resolve_actor
 from loguru import logger
-from pydantic import Field
-
 from nanobot.bus.events import CallbackEvent, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
 from nanobot.utils.helpers import split_message
+from pydantic import Field
+
+from familia.principals import resolve_actor
 
 VK_API_BASE = "https://api.vk.com/method"
 # VK messages.send hard limit is 4096 chars; leave a small safety margin
@@ -221,7 +221,8 @@ class VKChannel(BaseChannel):
 
         try:
             await self._refresh_long_poll_server()
-        except Exception as e:
+        # Startup must report any VK transport or payload failure without crashing.
+        except Exception as e:  # noqa: BLE001
             logger.error("VK: failed to get long poll server: {}", e)
             self._running = False
             return
@@ -231,7 +232,8 @@ class VKChannel(BaseChannel):
                 await self._poll_once()
             except asyncio.CancelledError:
                 break
-            except Exception as e:
+            # Keep long polling alive across transport and malformed-response errors.
+            except Exception as e:  # noqa: BLE001
                 logger.exception(
                     "VK: poll error ({}: {!r}) — retrying in 3s",
                     type(e).__name__, e,
@@ -243,8 +245,9 @@ class VKChannel(BaseChannel):
         if self._client:
             try:
                 await self._client.aclose()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # Shutdown cleanup must not mask termination of the channel.
+                logger.debug("VK: client close failed during shutdown: {}", exc)
             self._client = None
 
     # --- VK API plumbing ---------------------------------------------------
@@ -278,7 +281,8 @@ class VKChannel(BaseChannel):
                         type="typing",
                         group_id=self.config.group_id,
                     )
-                except Exception as e:
+                # Typing indicators are best-effort across all VK API failures.
+                except Exception as e:  # noqa: BLE001
                     logger.debug("VK: setActivity failed: {}", e)
                 await asyncio.sleep(4)
         except asyncio.CancelledError:
@@ -320,7 +324,8 @@ class VKChannel(BaseChannel):
         for path in msg.media or []:
             try:
                 attachments.append(await self._upload_media(int(msg.chat_id), path))
-            except Exception as e:
+            # A single media adapter failure must not discard the text message.
+            except Exception as e:  # noqa: BLE001
                 logger.error("VK: failed to upload {}: {}", path, e)
 
         keyboard_json: str | None = None
@@ -328,7 +333,8 @@ class VKChannel(BaseChannel):
         if kb_spec:
             try:
                 keyboard_json = _build_vk_keyboard(kb_spec)
-            except Exception as e:
+            # Keyboard metadata is untrusted extension input.
+            except Exception as e:  # noqa: BLE001
                 logger.error("VK: invalid keyboard spec: {}", e)
 
         # VK rejects messages.send with error 914 ("Message is too long")
@@ -415,7 +421,8 @@ class VKChannel(BaseChannel):
     async def _safe_handle_update(self, update: dict[str, Any]) -> None:
         try:
             await self._handle_update(update)
-        except Exception:
+        # Each scheduled update is isolated from the long-poll loop.
+        except Exception:  # noqa: BLE001
             logger.exception("VK: unhandled error in update handler")
 
     async def _handle_update(self, update: dict[str, Any]) -> None:
@@ -510,7 +517,8 @@ class VKChannel(BaseChannel):
                     },
                 },
             )
-        except Exception:
+        # One malformed message or downstream bus failure must not stop VK updates.
+        except Exception:  # noqa: BLE001
             logger.exception("VK: error handling message from {}", from_id)
             self._stop_typing(str(peer_id))
 
@@ -563,7 +571,8 @@ class VKChannel(BaseChannel):
                 user_id=user_id,
                 peer_id=peer_id,
             )
-        except Exception as e:
+        # Event acknowledgement is best-effort and independent of callback delivery.
+        except Exception as e:  # noqa: BLE001
             logger.warning("VK: sendMessageEventAnswer failed: {}", e)
 
         decoded: Any = payload_raw
@@ -590,12 +599,14 @@ class VKChannel(BaseChannel):
         if pressed_label and conv_msg_id is not None:
             try:
                 await self._collapse_keyboard(peer_id, conv_msg_id, pressed_label, payload_raw)
-            except Exception as e:
+            # Keyboard collapse is cosmetic after VK has acknowledged the event.
+            except Exception as e:  # noqa: BLE001
                 logger.warning("VK: failed to collapse keyboard: {}", e)
 
         try:
             actor = resolve_actor("vk", str(user_id))
-        except Exception:
+        # Registry resolution must degrade to an unknown actor, not lose the callback.
+        except Exception:  # noqa: BLE001
             actor = None
 
         await self.bus.publish_callback(
@@ -736,7 +747,8 @@ class VKChannel(BaseChannel):
                         notes.append("[wall post: (empty text)]")
                 else:
                     notes.append(f"[{att_type}: unsupported]")
-            except Exception as e:
+            # Attachments are independent; retain the rest of the inbound message.
+            except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "VK: failed to download {} attachment: {!r} — raw: {}",
                     att_type, e, att,

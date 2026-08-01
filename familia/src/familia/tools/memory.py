@@ -26,10 +26,14 @@ from typing import Any
 
 import httpx
 from loguru import logger
+from nanobot.agent.tools.base import Tool, tool_parameters
+from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
 
 from familia import audit
-from familia.acl import codec, schema as acl_schema
+from familia.acl import codec
+from familia.acl import schema as acl_schema
 from familia.acl.graph_io import resolve_admin_key
+from familia.acl.peers import is_peer
 from familia.acl.principal_memory import (
     _NO_MATCHING_STATIC_POLICY,
     _decode_atomic_memory_catalog,
@@ -37,7 +41,6 @@ from familia.acl.principal_memory import (
     decide_memory_read,
     is_valid_atomic_memory_key,
 )
-from familia.acl.peers import is_peer
 from familia.acl.reachable import reachable_tag_ids
 from familia.memx_client import memx_base_url
 from familia.policy import Decision, PolicyContext, get_engine
@@ -48,8 +51,7 @@ from familia.principals import (
     pair_namespace_token,
 )
 from familia.roles import get_effective_roles
-from nanobot.agent.tools.base import Tool, tool_parameters
-from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
+
 SCOPE_DESC = (
     "Memory read scope. Only 'private' is accepted; 'shared' and 'pair' "
     "are rejected before policy or storage access. Own private keys are "
@@ -570,8 +572,9 @@ class MemoryGetTool(Tool):
                     reason=audit_reason,
                     tags=list(audit_tags),
                 )
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # Audit failure must not alter the already computed read result.
+                logger.warning("peer-private audit logging failed: {}", exc)
             return result
         full_key, err = _resolve_full_key(
             normalized_scope, key, actor_id, target_actor=target_actor,
