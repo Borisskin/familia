@@ -1,10 +1,10 @@
 {
   "schema_version": "1.0",
-  "backend_version": "0.4.1",
-  "release_tag": "image-v0.4.1",
+  "backend_version": "0.4.2",
+  "release_tag": "image-v0.4.2",
   "release_scope": "backend-only",
   "component_versions": {
-    "familia": "0.4.1",
+    "familia": "0.4.2",
     "vendored_nanobot": "0.1.5.post2",
     "memx": "0.1.0",
     "memx_sdk": "0.1.1",
