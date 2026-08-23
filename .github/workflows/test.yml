@@ -16,10 +16,10 @@ jobs:
 
     steps:
       - name: Check out Familia
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Check out declared nanobot upstream
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: HKUDS/nanobot
           ref: 950dddec499fbbe0353e997158c99808f0bb41e1
@@ -29,7 +29,7 @@ jobs:
         run: ln -s "$GITHUB_WORKSPACE/upstream-nanobot" "$GITHUB_WORKSPACE/../nanobot"
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
