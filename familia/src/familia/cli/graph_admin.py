@@ -953,10 +953,13 @@ def cmd_migrate_hybrid_storage(args: argparse.Namespace) -> int:
     """Consolidate legacy history privately, then erase three flats unread."""
     import asyncio
 
-    from familia.acl.graph_io import get_raw, resolve_admin_key
+    from familia.acl.graph_io import get_raw, resolve_admin_key, set_raw
     from familia.memory_migration import (
+        LEGACY_TRANSITION_COMPLETION_KEY,
+        LEGACY_TRANSITION_COMPLETION_MARKER,
         apply_legacy_transition_plan,
         build_legacy_transition_plan,
+        legacy_transition_is_complete,
         make_configured_history_consolidator,
     )
     from familia.memx_client import memx_base_url
@@ -983,6 +986,39 @@ def cmd_migrate_hybrid_storage(args: argparse.Namespace) -> int:
     }
     if not known_actors:
         raise ValueError("no principals found; refusing legacy-history transition")
+
+    admin_key: str | None = None
+    if not args.dry_run:
+        admin_key = resolve_admin_key()
+        marker = get_raw(
+            LEGACY_TRANSITION_COMPLETION_KEY,
+            api_key=admin_key,
+        )
+        if legacy_transition_is_complete(marker):
+            result = {
+                "status": "complete",
+                "applied_actions": 0,
+                "written_keys": [],
+                "failed_actors": [],
+                "failed_actions": [],
+                "fatal_failure": None,
+                "dream_cursor_updated": False,
+            }
+            audit.log_event(
+                "migrate_hybrid_storage",
+                status=result["status"],
+                principals_count=len(known_actors),
+                applied_actions=result["applied_actions"],
+                written_keys=result["written_keys"],
+                failed_actors=result["failed_actors"],
+                dream_cursor_updated=result["dream_cursor_updated"],
+                completion_marker="already_complete",
+            )
+            if getattr(args, "json", False):
+                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            else:
+                print("migration=complete applied=0 failed_actors=-")
+            return 0
 
     plan = build_legacy_transition_plan(
         workspace=workspace,
@@ -1012,9 +1048,10 @@ def cmd_migrate_hybrid_storage(args: argparse.Namespace) -> int:
         ) -> str:
             raise RuntimeError("history consolidator called without an approved history action")
 
+    assert admin_key is not None
     ingestor = PrincipalMemoryIngestor(
         base_url=memx_base_url(),
-        api_key=resolve_admin_key(),
+        api_key=admin_key,
     )
     result = asyncio.run(
         apply_legacy_transition_plan(
@@ -1025,6 +1062,14 @@ def cmd_migrate_hybrid_storage(args: argparse.Namespace) -> int:
             consolidate_history=consolidator,
         )
     )
+    completion_marker = "absent"
+    if result["status"] == "complete":
+        set_raw(
+            LEGACY_TRANSITION_COMPLETION_KEY,
+            LEGACY_TRANSITION_COMPLETION_MARKER,
+            api_key=admin_key,
+        )
+        completion_marker = "written"
     audit.log_event(
         "migrate_hybrid_storage",
         status=result["status"],
@@ -1033,6 +1078,7 @@ def cmd_migrate_hybrid_storage(args: argparse.Namespace) -> int:
         written_keys=result["written_keys"],
         failed_actors=result["failed_actors"],
         dream_cursor_updated=result["dream_cursor_updated"],
+        completion_marker=completion_marker,
     )
     if getattr(args, "json", False):
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))

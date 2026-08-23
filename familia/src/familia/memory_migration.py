@@ -23,6 +23,16 @@ MEMORY_CONTRACT_MIGRATION_KINDS = {
 }
 
 LEGACY_TRANSITION_SCHEMA_VERSION = "2.0.0"
+LEGACY_TRANSITION_COMPLETION_KEY = "shared:familia.migrations.legacy-history-v1"
+LEGACY_TRANSITION_COMPLETION_MARKER = {
+    "schema_version": "1.0.0",
+    "migration": "legacy-history-v1",
+    "status": "complete",
+    # This value is the immutable contract of the v1 marker. Do not couple it
+    # to a future MEMORY_CONTRACT_VERSION bump: completed v1 transitions must
+    # remain completed in later releases.
+    "target_contract_version": "2.0.0",
+}
 _PRINCIPAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
@@ -36,6 +46,30 @@ class MigrationPreflightError(MigrationError):
 
 class MigrationBlockedError(MigrationError):
     """Plan fails the canonical transition contract and cannot be applied."""
+
+
+def legacy_transition_is_complete(value: Any) -> bool:
+    """Return whether the exact one-time transition marker is present.
+
+    A missing value permits the initial transition or a retry after failure.
+    Any present but unknown value blocks the migration so it cannot silently
+    skip legacy history or repeat an already completed import.
+    """
+
+    if value is None:
+        return False
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise MigrationBlockedError(
+                "legacy-history completion marker is not valid JSON"
+            ) from exc
+    if value != LEGACY_TRANSITION_COMPLETION_MARKER:
+        raise MigrationBlockedError(
+            "legacy-history completion marker has an unsupported value"
+        )
+    return True
 
 
 def memory_contract_migration_kind(source_contract_version: str) -> str:

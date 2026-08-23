@@ -171,39 +171,24 @@ class LegacyMemoryTransitionTests(unittest.TestCase):
         )
         self.assertEqual(history["disposition"], "llm_required")
 
-    def test_planner_has_no_marker_or_skip_api(self) -> None:
-        _write_history(
-            self.workspace,
-            [_history_record(1, "kanin_mikhail", "Личный факт")],
+    def test_completion_marker_accepts_only_the_exact_value(self) -> None:
+        self.assertFalse(memory_migration.legacy_transition_is_complete(None))
+        self.assertTrue(
+            memory_migration.legacy_transition_is_complete(
+                json.dumps(memory_migration.LEGACY_TRANSITION_COMPLETION_MARKER)
+            )
         )
-        build_parameters = inspect.signature(
-            memory_migration.build_legacy_transition_plan
-        ).parameters
-        self.assertNotIn("get_value", build_parameters)
-        plan = memory_migration.build_legacy_transition_plan(
-            workspace=self.workspace,
-            known_actors={"kanin_mikhail"},
-        )
-        history_actions = [
-            action
-            for action in plan["actions"]
-            if action.get("actor") == "kanin_mikhail"
-        ]
-        violations = []
-        if hasattr(memory_migration, "_history_marker"):
-            violations.append("_history_marker")
-        if any(
-            action.get("disposition") != "llm_required"
-            for action in history_actions
-        ):
-            violations.append("non_llm_required_history_action")
-        if any(
-            action.get("reason") == "history_already_imported"
-            for action in history_actions
-        ):
-            violations.append("history_already_imported")
 
-        self.assertEqual(violations, [])
+        for invalid in (
+            "not-json",
+            json.dumps({"status": "complete"}),
+            {**memory_migration.LEGACY_TRANSITION_COMPLETION_MARKER, "extra": True},
+        ):
+            with (
+                self.subTest(invalid=invalid),
+                self.assertRaises(memory_migration.MigrationBlockedError),
+            ):
+                memory_migration.legacy_transition_is_complete(invalid)
 
     def test_schema_less_known_actor_remains_exact_and_flat_owner_is_ignored(self) -> None:
         legacy_fact = (
@@ -941,6 +926,7 @@ class LegacyMemoryTransitionTests(unittest.TestCase):
             violations.append("FAMILIA_OWNER_ACTOR guess")
         for forbidden in (
             "--legacy-owner",
+            "--force",
             "USER",
             "MEMORY",
             "HEARTBEAT",
@@ -949,6 +935,99 @@ class LegacyMemoryTransitionTests(unittest.TestCase):
                 violations.append(f"help:{forbidden}")
 
         self.assertEqual(violations, [])
+
+    def test_cli_skips_completed_transition_before_building_plan(self) -> None:
+        args = SimpleNamespace(
+            workspace=self.workspace,
+            config=None,
+            dry_run=False,
+            json=True,
+        )
+        output = io.StringIO()
+        with (
+            patch.object(
+                graph_admin,
+                "_load_principals_json",
+                return_value=(
+                    self.workspace / "principals.json",
+                    {"principals": [{"id": "member_beta"}]},
+                ),
+            ),
+            patch(
+                "familia.acl.graph_io.resolve_admin_key",
+                return_value="synthetic-admin-key",
+            ),
+            patch(
+                "familia.acl.graph_io.get_raw",
+                return_value=json.dumps(
+                    memory_migration.LEGACY_TRANSITION_COMPLETION_MARKER
+                ),
+            ) as get_marker,
+            patch("familia.acl.graph_io.set_raw") as set_marker,
+            patch.object(
+                memory_migration,
+                "build_legacy_transition_plan",
+                side_effect=AssertionError("history plan must not be built"),
+            ) as build_plan,
+            patch.object(graph_admin.audit, "log_event"),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(graph_admin.cmd_migrate_hybrid_storage(args), 0)
+
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "status": "complete",
+                "applied_actions": 0,
+                "written_keys": [],
+                "failed_actors": [],
+                "failed_actions": [],
+                "fatal_failure": None,
+                "dream_cursor_updated": False,
+            },
+        )
+        self.assertEqual(_release_schema_errors(json.loads(output.getvalue())), [])
+        get_marker.assert_called_once_with(
+            memory_migration.LEGACY_TRANSITION_COMPLETION_KEY,
+            api_key="synthetic-admin-key",
+        )
+        build_plan.assert_not_called()
+        set_marker.assert_not_called()
+
+    def test_cli_blocks_unknown_marker_before_building_plan(self) -> None:
+        args = SimpleNamespace(
+            workspace=self.workspace,
+            config=None,
+            dry_run=False,
+            json=True,
+        )
+        with (
+            patch.object(
+                graph_admin,
+                "_load_principals_json",
+                return_value=(
+                    self.workspace / "principals.json",
+                    {"principals": [{"id": "member_beta"}]},
+                ),
+            ),
+            patch(
+                "familia.acl.graph_io.resolve_admin_key",
+                return_value="synthetic-admin-key",
+            ),
+            patch(
+                "familia.acl.graph_io.get_raw",
+                return_value='{"status":"complete"}',
+            ),
+            patch.object(
+                memory_migration,
+                "build_legacy_transition_plan",
+                side_effect=AssertionError("history plan must not be built"),
+            ) as build_plan,
+            self.assertRaises(memory_migration.MigrationBlockedError),
+        ):
+            graph_admin.cmd_migrate_hybrid_storage(args)
+
+        build_plan.assert_not_called()
 
     def test_graph_admin_pair_acl_uses_exact_underscore_without_memory_contract(
         self,
@@ -1006,6 +1085,8 @@ class LegacyMemoryTransitionTests(unittest.TestCase):
                 "familia.acl.graph_io.resolve_admin_key",
                 return_value="synthetic-admin-key",
             ),
+            patch("familia.acl.graph_io.get_raw", return_value=None),
+            patch("familia.acl.graph_io.set_raw") as set_marker,
             patch(
                 "familia.memx_client.memx_base_url",
                 return_value="http://synthetic-memx",
@@ -1033,6 +1114,12 @@ class LegacyMemoryTransitionTests(unittest.TestCase):
                         graph_admin.cmd_migrate_hybrid_storage(args),
                         expected_exit_code,
                     )
+
+            set_marker.assert_called_once_with(
+                memory_migration.LEGACY_TRANSITION_COMPLETION_KEY,
+                memory_migration.LEGACY_TRANSITION_COMPLETION_MARKER,
+                api_key="synthetic-admin-key",
+            )
 
 
 if __name__ == "__main__":

@@ -82,12 +82,14 @@ _MAX_VALUE_BYTES = 64 * 1024
 
 # SR-14 belt-and-suspenders. Tool-level refusal so that policy
 # misconfiguration cannot accidentally open chat-side writes to
-# structural keys (graphs/roles). The canonical write paths are
-# admin_grant/admin_revoke (for roles) and the `familia` CLI (for graphs).
+# structural keys (graphs/roles/migrations). The canonical write paths are
+# admin_grant/admin_revoke (for roles) and the `familia` CLI (for graphs and
+# migration state).
 _RESERVED_STRUCTURAL_PREFIXES = (
     "shared:roles.",
     "shared:family.graph",
     "shared:topics.graph",
+    "shared:familia.migrations.",
 )
 
 

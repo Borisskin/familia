@@ -86,11 +86,17 @@ rules:
   # Read открыт: roles.py:fetch_admin_grants нужен на каждый turn (любой
   # actor пересчитывает свои роли); family/topics graphs читаются всеми
   # участниками для kinship-резолва и vocabulary-builder'а.
+  # Служебная отметка перехода также закрыта для записи из диалога: её меняет
+  # только команда обновления после полного успешного переноса.
   - name: "reserved: structural shared keys — write только из CLI/панели"
     action: memory.write
-    to_chat: ["shared:roles.*", "shared:family.graph*", "shared:topics.graph*"]
+    to_chat:
+      - "shared:roles.*"
+      - "shared:family.graph*"
+      - "shared:topics.graph*"
+      - "shared:familia.migrations.*"
     decision: deny
-    reason: "shared:roles.* / shared:family.graph / shared:topics.graph редактируются только через CLI"
+    reason: "служебные shared-ключи редактируются только через CLI"
 
   # Владелец — read/write всех scope'ов (включая reserved выше — он admin).
   - name: "owner: memory.* — всё"

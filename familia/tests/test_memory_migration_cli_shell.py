@@ -540,6 +540,7 @@ def test_both_migration_cli_json_boundaries_match_release_schema(
                 return_value=object(),
             ),
             patch("familia.acl.graph_io.get_raw", return_value=None),
+            patch("familia.acl.graph_io.set_raw"),
             patch(
                 "familia.acl.graph_io.resolve_admin_key",
                 return_value="admin-key",
@@ -679,6 +680,7 @@ def test_graph_registry_preserves_string_ids_for_builder_validation(
                 return_value=ingestor,
             ),
             patch("familia.acl.graph_io.get_raw", return_value=None),
+            patch("familia.acl.graph_io.set_raw"),
             patch(
                 "familia.acl.graph_io.resolve_admin_key",
                 return_value="admin-key",

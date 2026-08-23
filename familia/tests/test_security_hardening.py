@@ -291,3 +291,19 @@ def test_owner_chat_write_to_shared_roles_denied(registry, policy_with_reserved)
         to_chat="shared:roles.admin_grants",
     ))
     assert d.decision is Decision.DENY
+
+
+def test_owner_chat_cannot_write_migration_marker(
+    registry,
+    policy_with_reserved,
+):
+    from familia.policy import Decision, PolicyContext, get_engine
+    from familia.roles import set_effective_roles_for_tests
+
+    set_effective_roles_for_tests({"owner": {"admin"}, "member_a": set()})
+    d = get_engine().evaluate(PolicyContext(
+        action="memory.write",
+        actor="owner",
+        to_chat="shared:familia.migrations.legacy-history-v1",
+    ))
+    assert d.decision is Decision.DENY
