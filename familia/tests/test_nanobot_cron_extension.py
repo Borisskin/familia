@@ -4,6 +4,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 
 def test_heartbeat_source_reader_uses_principal_memx(monkeypatch) -> None:
     from familia.nanobot_extension import cron
@@ -43,6 +45,34 @@ def test_heartbeat_source_reader_fails_closed_without_memx_key(monkeypatch) -> N
     reader = cron.make_heartbeat_source_reader("principal_a")
 
     assert reader() == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_dream_profile_reader_uses_only_installed_principal(monkeypatch) -> None:
+    from familia.nanobot_extension import cron
+
+    class _Registry:
+        def get(self, actor_id: str):
+            if actor_id == "principal_a":
+                return SimpleNamespace(id="principal_a", memx_key="mem_key_a")
+            return None
+
+    class _Client:
+        def __init__(self, actor_id: str, memx_key: str) -> None:
+            assert actor_id == "principal_a"
+            assert memx_key == "mem_key_a"
+
+        async def get_profile_snapshot(self):
+            return {"value": "name=Alice", "version": 12.0}
+
+    monkeypatch.setattr(cron, "get_registry", lambda: _Registry())
+    monkeypatch.setattr(cron, "PrincipalMemoryClient", _Client)
+
+    reader = cron.make_dream_profile_reader()
+
+    assert await reader("principal_a") == {"value": "name=Alice", "version": 12.0}
+    with pytest.raises(RuntimeError):
+        await reader("principal_b")
 
 
 def test_make_dream_tool_installers_registers_dream_memory_tool(
@@ -177,4 +207,32 @@ def test_legacy_cron_creator_is_preserved_without_inventing_target(tmp_path) -> 
     assert loaded is not None
     assert loaded.payload.creator_actor == "owner"
     assert loaded.payload.target_actor is None
+
+
+@pytest.mark.asyncio
+async def test_cron_tool_persists_route_actor_separately_from_creator(
+    tmp_path, monkeypatch
+) -> None:
+    from nanobot.agent.tools.cron import CronTool
+    from nanobot.cron.service import CronService
+
+    service = CronService(tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(CronService, "_arm_timer", lambda _self: None)
+    service._running = True
+    tool = CronTool(
+        service,
+        current_actor_getter=lambda: "principal_creator",
+        target_actor_getter=lambda channel, chat_id: (
+            "principal_recipient"
+            if (channel, chat_id) == ("telegram", "1001")
+            else None
+        ),
+    )
+    tool.set_context("telegram", "1001")
+
+    await tool.execute(action="add", message="remind me", every_seconds=60)
+
+    job = service.list_jobs()[0]
+    assert job.payload.creator_actor == "principal_creator"
+    assert job.payload.target_actor == "principal_recipient"
     assert service._load_store().version == 2

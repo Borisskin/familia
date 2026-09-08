@@ -7,11 +7,14 @@ import hashlib
 import json
 import os
 import re
+import socket
 import stat
+import subprocess
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlparse
 
 SNAPSHOT_SCHEMA_VERSION = "1.0.0"
 SNAPSHOT_FORMAT_VERSION = "1.0.0"
@@ -719,18 +722,38 @@ def _within(path: Path, parent: Path) -> bool:
         return False
 
 
-def _load_known_actors(source_root: Path) -> set[str]:
-    candidates = (source_root / "principals.json", source_root / "config" / "principals.json")
-    for candidate in candidates:
-        if not candidate.exists():
-            continue
-        value = json.loads(candidate.read_text(encoding="utf-8"))
-        return {
-            item["id"]
-            for item in value.get("principals", [])
-            if isinstance(item, dict) and isinstance(item.get("id"), str)
-        }
-    return set()
+def _load_known_actors(principals_path: Path) -> set[str]:
+    """Load one explicit, non-empty principals registry.
+
+    The migration must never silently fall back to a process-global registry.
+    ``load_registry`` performs the existing duplicate-key checks after this
+    function has rejected malformed or empty JSON structures.
+    """
+
+    try:
+        value = _load_json(principals_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise MigrationPreflightError("principals registry is missing or invalid") from exc
+    entries = value.get("principals")
+    if not isinstance(entries, list) or not entries:
+        raise MigrationPreflightError("principals registry is missing or empty")
+    actor_ids: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise MigrationPreflightError("principals registry entry invalid")
+        actor = entry.get("id")
+        if not isinstance(actor, str) or _canonical_actor(actor) is None:
+            raise MigrationPreflightError("principals registry id invalid")
+        if actor in actor_ids:
+            raise MigrationPreflightError("principals registry contains duplicate id")
+        actor_ids.append(actor)
+
+    from familia.principals import load_registry
+
+    registry = load_registry(principals_path)
+    if set(registry.ids) != set(actor_ids):
+        raise MigrationPreflightError("principals registry could not be loaded")
+    return set(actor_ids)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -738,6 +761,270 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise MigrationError("JSON object required")
     return value
+
+
+def _target_config(config_path: Path, install_root: Path, workspace: Path, principals: Path) -> dict[str, Any]:
+    """Validate the explicit target contract without reading process config."""
+
+    if not _within(config_path.resolve(strict=True), install_root):
+        raise MigrationPreflightError("target config must be inside install root")
+    config = _load_json(config_path)
+    required = {
+        "schema_version",
+        "isolation_id",
+        "install_root",
+        "workspace",
+        "principals",
+        "runner",
+        "memx",
+        "redis",
+        "network",
+        "model",
+    }
+    if config.get("schema_version") != "1.0.0" or not required.issubset(config):
+        raise MigrationPreflightError("target config schema invalid")
+    if not isinstance(config["isolation_id"], str) or not config["isolation_id"].strip():
+        raise MigrationPreflightError("target isolation id invalid")
+    for key, path in (
+        ("install_root", install_root),
+        ("workspace", workspace),
+        ("principals", principals),
+    ):
+        if config[key] != str(path):
+            raise MigrationPreflightError(f"target config {key} mismatch")
+
+    model = config["model"]
+    if not isinstance(model, dict) or not all(
+        isinstance(model.get(key), str) and model[key].strip()
+        for key in ("provider", "name", "config_path")
+    ):
+        raise MigrationPreflightError("target model config invalid")
+    model_path = Path(model["config_path"]).expanduser()
+    if not model_path.is_absolute() or not _within(model_path.resolve(strict=False), install_root):
+        raise MigrationPreflightError("target model config outside install root")
+
+    for section in ("runner", "memx", "redis"):
+        value = config[section]
+        if not isinstance(value, dict):
+            raise MigrationPreflightError(f"target {section} config invalid")
+        for key in ("name", "id", "image_digest"):
+            if not isinstance(value.get(key), str) or not value[key].strip():
+                raise MigrationPreflightError(f"target {section} identity invalid")
+        if re.fullmatch(r"[0-9a-f]{64}", value["id"]) is None:
+            raise MigrationPreflightError(f"target {section} id invalid")
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", value["image_digest"]) is None:
+            raise MigrationPreflightError(f"target {section} image digest invalid")
+        endpoint_alias = value.get("endpoint_alias")
+        if endpoint_alias is not None and (
+            not isinstance(endpoint_alias, str) or not endpoint_alias.strip()
+        ):
+            raise MigrationPreflightError(f"target {section} endpoint alias invalid")
+    network = config["network"]
+    if not isinstance(network, dict) or not all(
+        isinstance(network.get(key), str) and network[key].strip()
+        for key in ("name", "id")
+    ):
+        raise MigrationPreflightError("target network identity invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", network["id"]) is None:
+        raise MigrationPreflightError("target network id invalid")
+
+    memx = config["memx"]
+    redis = config["redis"]
+    if not all(
+        isinstance(memx.get(key), str) and memx[key].strip()
+        for key in ("base_url", "api_key", "redis_env", "redis_url")
+    ):
+        raise MigrationPreflightError("target memX config invalid")
+    if not isinstance(redis.get("storage_volume"), dict) or not isinstance(
+        redis.get("storage_destination"), str
+    ):
+        raise MigrationPreflightError("target Redis storage config invalid")
+    if not isinstance(redis.get("port"), int) or not 1 <= redis["port"] <= 65535:
+        raise MigrationPreflightError("target Redis port invalid")
+    if not isinstance(redis.get("database"), int) or not 0 <= redis["database"] <= 65535:
+        raise MigrationPreflightError("target Redis database invalid")
+    for key in ("name", "id"):
+        if not isinstance(redis["storage_volume"].get(key), str) or not redis["storage_volume"][key].strip():
+            raise MigrationPreflightError("target Redis volume identity invalid")
+    if not redis["storage_destination"].startswith("/"):
+        raise MigrationPreflightError("target Redis storage destination invalid")
+    runner_mount = config["runner"].get("install_mount")
+    if not isinstance(runner_mount, dict) or not all(
+        isinstance(runner_mount.get(key), str) and runner_mount[key].strip()
+        for key in ("name", "id", "destination")
+    ):
+        raise MigrationPreflightError("target install volume config invalid")
+    return config
+
+
+def _docker_inspect(kind: str, reference: str) -> dict[str, Any]:
+    """Inspect exactly one object through the selected local Docker daemon."""
+
+    env = {key: value for key, value in os.environ.items() if key not in {"DOCKER_HOST", "DOCKER_CONTEXT"}}
+    try:
+        completed = subprocess.run(
+            ["docker", "--context", "default", "inspect", "--type", kind, reference],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise MigrationPreflightError("Docker inspect unavailable") from exc
+    try:
+        values = json.loads(completed.stdout)
+    except (TypeError, ValueError) as exc:
+        raise MigrationPreflightError("Docker inspect returned invalid JSON") from exc
+    if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+        raise MigrationPreflightError("Docker inspect returned an unexpected object count")
+    return values[0]
+
+
+def _docker_verify_target(config: dict[str, Any]) -> None:
+    """Prove the target is the one running isolated Docker environment."""
+
+    isolation_id = config["isolation_id"]
+    label_key = "familia.target"
+    expected_network = config["network"]
+    containers = {
+        section: _docker_inspect("container", config[section]["name"])
+        for section in ("runner", "memx", "redis")
+    }
+    expected_ids = {config[section]["id"] for section in containers}
+    expected_hostname = config["runner"].get("hostname")
+    actual_hostname = (containers["runner"].get("Config") or {}).get("Hostname")
+    if expected_hostname is not None:
+        if actual_hostname != expected_hostname:
+            raise MigrationPreflightError("current container is not the configured runner")
+    else:
+        host_id = socket.gethostname().lower()
+        runner_id = config["runner"]["id"].lower()
+        if not (runner_id.startswith(host_id) or host_id.startswith(runner_id[:12])):
+            raise MigrationPreflightError("current container is not the configured runner")
+
+    network_members: set[str] = set()
+    for section, actual in containers.items():
+        declared = config[section]
+        if actual.get("Id") != declared["id"] or str(actual.get("Name", "")).lstrip("/") != declared["name"]:
+            raise MigrationPreflightError(f"Docker {section} identity mismatch")
+        if actual.get("Image") != declared["image_digest"]:
+            raise MigrationPreflightError(f"Docker {section} image mismatch")
+        if not (actual.get("State") or {}).get("Running"):
+            raise MigrationPreflightError(f"Docker {section} is not running")
+        labels = (actual.get("Config") or {}).get("Labels") or {}
+        if labels.get(label_key) != isolation_id:
+            raise MigrationPreflightError(f"Docker {section} isolation label mismatch")
+        networks = (actual.get("NetworkSettings") or {}).get("Networks") or {}
+        if set(networks) != {expected_network["name"]}:
+            raise MigrationPreflightError(f"Docker {section} has an external network")
+        network_info = networks.get(expected_network["name"]) or {}
+        if network_info.get("NetworkID") != expected_network["id"]:
+            raise MigrationPreflightError(f"Docker {section} network mismatch")
+        network_members.add(actual["Id"])
+
+    actual_network = _docker_inspect("network", expected_network["name"])
+    if actual_network.get("Id") != expected_network["id"] or not actual_network.get("Internal"):
+        raise MigrationPreflightError("Docker target network is not internal")
+    labels = actual_network.get("Labels") or {}
+    if labels.get(label_key) != isolation_id:
+        raise MigrationPreflightError("Docker target network isolation label mismatch")
+    actual_members = set((actual_network.get("Containers") or {}).keys())
+    if actual_members != network_members or actual_members != expected_ids:
+        raise MigrationPreflightError("Docker target network membership mismatch")
+
+    for section, actual in containers.items():
+        declared_mount = config[section].get("install_mount") if section == "runner" else None
+        if declared_mount is None:
+            continue
+        mounts = actual.get("Mounts") or []
+        if not any(
+            mount.get("Type") == "volume"
+            and mount.get("Name") == declared_mount["name"]
+            and mount.get("Destination") == declared_mount["destination"]
+            and mount.get("RW") is True
+            for mount in mounts
+        ):
+            raise MigrationPreflightError("install root is not on the configured runner volume")
+    runner_volume = _docker_inspect("volume", config["runner"]["install_mount"]["name"])
+    runner_mount = config["runner"]["install_mount"]
+    runner_volume_id = runner_volume.get("Id") or runner_volume.get("Name")
+    if runner_volume.get("Name") != runner_mount["name"] or runner_volume_id != runner_mount.get("id", runner_mount["name"]):
+        raise MigrationPreflightError("runner install volume identity mismatch")
+    runner_volume_labels = runner_volume.get("Labels") or {}
+    if runner_volume_labels.get(label_key) != isolation_id:
+        raise MigrationPreflightError("runner install volume isolation label mismatch")
+
+    redis = containers["redis"]
+    redis_volume = _docker_inspect("volume", config["redis"]["storage_volume"]["name"])
+    declared_volume = config["redis"]["storage_volume"]
+    redis_volume_id = redis_volume.get("Id") or redis_volume.get("Name")
+    if redis_volume.get("Name") != declared_volume["name"] or redis_volume_id != declared_volume["id"]:
+        raise MigrationPreflightError("Redis storage volume identity mismatch")
+    volume_labels = redis_volume.get("Labels") or {}
+    if volume_labels.get(label_key) != isolation_id:
+        raise MigrationPreflightError("Redis storage volume isolation label mismatch")
+    if not any(
+        mount.get("Type") == "volume"
+        and mount.get("Name") == declared_volume["name"]
+        and mount.get("Destination") == config["redis"]["storage_destination"]
+        for mount in redis.get("Mounts") or []
+    ):
+        raise MigrationPreflightError("Redis storage is not attached to the target")
+
+    memx = config["memx"]
+    parsed = urlparse(memx["base_url"])
+    memx_alias = memx.get("endpoint_alias", memx["name"])
+    if parsed.scheme not in {"http", "https"} or parsed.hostname != memx_alias:
+        raise MigrationPreflightError("memX address is not the target network endpoint")
+    memx_network = (containers["memx"].get("NetworkSettings") or {}).get("Networks", {}).get(expected_network["name"], {})
+    if parsed.hostname not in (memx_network.get("Aliases") or []):
+        raise MigrationPreflightError("memX address alias is not attached to target network")
+    memx_env = {
+        item.split("=", 1)[0]: item.split("=", 1)[1]
+        for item in (containers["memx"].get("Config") or {}).get("Env") or []
+        if isinstance(item, str) and "=" in item
+    }
+    if memx_env.get(memx["redis_env"]) != memx["redis_url"]:
+        raise MigrationPreflightError("memX Redis backend does not match target")
+    redis_url = urlparse(memx["redis_url"])
+    redis_alias = config["redis"].get("endpoint_alias", config["redis"]["name"])
+    if (
+        redis_url.hostname != redis_alias
+        or redis_url.port != config["redis"]["port"]
+        or redis_url.path != f"/{config['redis']['database']}"
+    ):
+        raise MigrationPreflightError("memX Redis host is not the target Redis")
+
+
+def _target_get_raw(base_url: str, api_key: str) -> Callable[[str], Any]:
+    """Build a raw memX reader bound to explicit target credentials."""
+
+    import httpx
+
+    def _get(key: str) -> Any:
+        try:
+            response = httpx.get(
+                f"{base_url.rstrip('/')}/get",
+                headers={"x-api-key": api_key},
+                params={"key": key},
+                timeout=5.0,
+            )
+        except httpx.HTTPError as exc:
+            raise MigrationError(f"target memX read failed: {type(exc).__name__}") from exc
+        if response.status_code == 404:
+            return None
+        if response.status_code >= 400:
+            raise MigrationError(f"target memX read failed: status {response.status_code}")
+        try:
+            payload = response.json()
+        except (TypeError, ValueError) as exc:
+            raise MigrationError("target memX returned invalid JSON") from exc
+        if isinstance(payload, dict) and "value" in payload:
+            return payload["value"]
+        return payload
+
+    return _get
 
 
 def cli(argv: list[str] | None = None) -> int:
@@ -748,8 +1035,10 @@ def cli(argv: list[str] | None = None) -> int:
         )
     )
     parser.add_argument("--snapshot", type=Path, required=True)
-    parser.add_argument("--target", type=Path, required=True)
-    parser.add_argument("--source-root", type=Path)
+    parser.add_argument("--install-root", type=Path, required=True)
+    parser.add_argument("--workspace", type=Path, required=True)
+    parser.add_argument("--principals", type=Path, required=True)
+    parser.add_argument("--target-config", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--journal", type=Path, required=True)
     parser.add_argument("--classifications", type=Path)
@@ -762,36 +1051,47 @@ def cli(argv: list[str] | None = None) -> int:
 
         from scripts.compare_memory_state import load_and_validate_manifest
 
-        from familia.acl.graph_io import get_raw, resolve_admin_key
-        from familia.memx_client import memx_base_url
         from familia.principal_memory_ingestor import PrincipalMemoryIngestor
 
         snapshot_root = args.snapshot.resolve(strict=True)
         snapshot = load_and_validate_manifest(snapshot_root / "manifest.json")
-        target_root = args.target.resolve(strict=True)
+        target_root = args.install_root.resolve(strict=True)
         marker_path = target_root / ".familia-memory-migration-target.json"
         marker = _load_json(marker_path)
         validate_migration_preflight(snapshot, target_root, marker)
-        source_root = (args.source_root or (target_root / "state" / "files")).resolve(strict=True)
-        if not _within(source_root, target_root):
-            raise MigrationPreflightError("source root must be inside isolated target")
+        source_root = args.workspace.resolve(strict=True)
+        principals_path = args.principals.resolve(strict=True)
+        if not _within(source_root, target_root) or not source_root.is_dir():
+            raise MigrationPreflightError("workspace must be inside isolated target")
+        if not _within(principals_path, target_root) or not principals_path.is_file():
+            raise MigrationPreflightError("principals registry must be inside isolated target")
+        target_config = _target_config(
+            args.target_config.resolve(strict=True),
+            target_root,
+            source_root,
+            principals_path,
+        )
         for output in (args.manifest, args.journal):
             resolved_parent = output.absolute().parent.resolve(strict=True)
             if not _within(resolved_parent, target_root):
                 raise MigrationPreflightError("manifest and journal must stay in isolated target")
+        known_actors = _load_known_actors(principals_path)
         plan = build_legacy_transition_plan(
             workspace=source_root,
-            known_actors=_load_known_actors(source_root),
+            known_actors=known_actors,
         )
         _write_private_atomic(args.manifest, _canonical_bytes(plan) + b"\n")
         result: dict[str, Any] = {"status": "dry_run"}
         if args.apply:
+            _docker_verify_target(target_config)
             llm_required = any(
                 action.get("disposition") == "llm_required"
                 for action in plan["actions"]
             )
             if llm_required:
-                consolidator = make_configured_history_consolidator()
+                consolidator = make_configured_history_consolidator(
+                    Path(target_config["model"]["config_path"])
+                )
             else:
 
                 async def consolidator(
@@ -803,15 +1103,17 @@ def cli(argv: list[str] | None = None) -> int:
                         "history consolidator called without an approved history action"
                     )
 
+            memx = target_config["memx"]
             ingestor = PrincipalMemoryIngestor(
-                base_url=memx_base_url(),
-                api_key=resolve_admin_key(),
+                base_url=memx["base_url"],
+                api_key=memx["api_key"],
+                principal_exists=known_actors.__contains__,
             )
             result = asyncio.run(
                 apply_legacy_transition_plan(
                     plan=plan,
                     workspace=source_root,
-                    get_value=get_raw,
+                    get_value=_target_get_raw(memx["base_url"], memx["api_key"]),
                     ingestor=ingestor,
                     consolidate_history=consolidator,
                 )

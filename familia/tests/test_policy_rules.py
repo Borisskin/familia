@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from familia.policy import Decision, PolicyContext
+from familia.policy import Decision, PolicyContext, PolicyRule
 from familia.policy.engine import PolicyEngine, load_engine
 
 
@@ -161,3 +161,47 @@ def test_default_deny_when_rules_exist_but_none_match(tmp_path: Path) -> None:
         action="memory.read", actor="owner",
     ))
     assert unknown.decision is Decision.DENY
+
+
+def test_memory_policy_audit_omits_value_and_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from familia import audit
+
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        audit,
+        "log_event",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    engine = PolicyEngine(
+        rules=[
+            PolicyRule(
+                name="deny private memory writes",
+                action=["memory.write"],
+                actor=["member_a"],
+                to_chat=["private:member_a:*"],
+                decision=Decision.DENY,
+                reason="operator denial",
+            )
+        ]
+    )
+    result = engine.evaluate(
+        PolicyContext(
+            action="memory.write",
+            actor="member_a",
+            to_chat="private:member_a:memory:fact-17",
+            extra={"value": "secret fact", "api_key": "live-api-key"},
+        )
+    )
+
+    assert result.decision is Decision.DENY
+    assert events and events[-1][0] == "policy"
+    fields = events[-1][1]
+    rendered = repr(fields)
+    assert "secret fact" not in rendered
+    assert "live-api-key" not in rendered
+    assert "value" not in fields
+    assert "api_key" not in fields
+    assert fields["action"] == "memory.write"
+    assert fields["to_chat"] == "private:member_a:memory:fact-17"

@@ -13,13 +13,15 @@ heartbeat tick, breaking the upcoming-events check. The fix accepts both
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from familia import principals as principals_mod
+from familia.policy import Decision, PolicyDecision, PolicyRule
 from familia.principals import Identity, Principal, PrincipalRegistry
 from familia.tools import memory as memory_mod
-from familia.tools.memory import MemoryGetTool, _resolve_full_key
+from familia.tools.memory import MemoryGetTool, MemorySetTool, _resolve_full_key
 
 
 @pytest.fixture
@@ -183,3 +185,75 @@ def test_memory_get_rejects_legacy_scope_before_any_read_dependency(
         "http": 0,
         "memx": 0,
     }
+
+
+@pytest.mark.parametrize(
+    ("value", "decision"),
+    [(None, Decision.DENY), ("secret fact", Decision.ASK)],
+)
+def test_memory_set_policy_denial_precedes_topic_and_memx_write(
+    monkeypatch: pytest.MonkeyPatch,
+    registry: PrincipalRegistry,
+    value: str | None,
+    decision: Decision,
+) -> None:
+    denied = MagicMock()
+    denied.evaluate.return_value = PolicyDecision(
+        decision,
+        PolicyRule(name="deny private writes", reason="blocked"),
+    )
+    monkeypatch.setattr(memory_mod, "get_engine", lambda: denied)
+    topic_write_state = AsyncMock()
+    monkeypatch.setattr(memory_mod, "_topic_write_state", topic_write_state)
+    ingestor = MagicMock()
+    ingestor.ingest = AsyncMock(return_value="committed: should not run")
+    monkeypatch.setattr(memory_mod, "get_current_actor", lambda: "member_a")
+
+    result = asyncio.run(
+        MemorySetTool(ingestor=ingestor).execute(
+            fact_id="fact-17", value=value, topic="family-topic"
+        )
+    )
+
+    assert result.startswith("Policy denied memory.write")
+    assert "secret fact" not in result
+    denied.evaluate.assert_called_once()
+    context = denied.evaluate.call_args.args[0]
+    assert context.action == "memory.write"
+    assert context.actor == "member_a"
+    assert context.to_chat == "private:member_a:memory:fact-17"
+    topic_write_state.assert_not_awaited()
+    ingestor.ingest.assert_not_awaited()
+
+
+def test_memory_set_policy_allow_reaches_exact_ingestor_operation(
+    monkeypatch: pytest.MonkeyPatch,
+    registry: PrincipalRegistry,
+) -> None:
+    allowed = MagicMock()
+    allowed.evaluate.return_value = PolicyDecision(
+        Decision.ALLOW,
+        PolicyRule(name="allow private writes"),
+    )
+    monkeypatch.setattr(memory_mod, "get_engine", lambda: allowed)
+    ingestor = MagicMock()
+    ingestor.ingest = AsyncMock(return_value="committed: stored")
+    monkeypatch.setattr(memory_mod, "get_current_actor", lambda: "member_a")
+
+    result = asyncio.run(
+        MemorySetTool(ingestor=ingestor).execute(
+            fact_id="fact-17", value="stored fact"
+        )
+    )
+
+    assert result == "committed: stored"
+    allowed.evaluate.assert_called_once()
+    ingestor.ingest.assert_awaited_once_with(
+        server_principal="member_a",
+        server_topic=None,
+        operation={
+            "kind": "memory",
+            "fact_id": "fact-17",
+            "value": "stored fact",
+        },
+    )

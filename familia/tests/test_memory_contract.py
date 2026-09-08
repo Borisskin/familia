@@ -209,13 +209,18 @@ def test_contract_records_simple_private_write_and_consolidation_rules() -> None
     }
 
     assert contract["consolidation"] == {
-        "supported_sources": ["vk_private", "telegram_private"],
-        "automatic_destination": "private_owner_untagged",
+        "supported_sources": [
+            "vk_private",
+            "telegram_private",
+            "cron_service",
+        ],
+        "automatic_destination": "private_owner_untagged_when_proven",
         "owner_resolver": {
-            "input": ["session_key", "messages"],
+            "input": ["session_key", "messages", "session_context"],
             "result": "principal_or_none",
             "before_model": True,
         },
+        "unowned_cron_destination": "service_session_only",
         "archive_sink": {
             "input": ["principal", "messages"],
             "success": "return_without_exception",

@@ -2,7 +2,7 @@
 # upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
 
 diff --git a/nanobot/nanobot/cli/commands.py b/nanobot/nanobot/cli/commands.py
-index 7892df0..1115b35 100644
+index 7892df0..4d075ae 100644
 --- a/nanobot/nanobot/cli/commands.py
 +++ b/nanobot/nanobot/cli/commands.py
 @@ -49,6 +49,15 @@ class SafeFileHistory(FileHistory):
@@ -100,7 +100,15 @@ index 7892df0..1115b35 100644
  
          from nanobot.agent.tools.cron import CronTool
          from nanobot.agent.tools.message import MessageTool
-@@ -765,11 +806,48 @@ def _run_gateway(
+@@ -736,6 +777,7 @@ def _run_gateway(
+                 session_key=f"cron:{job.id}",
+                 channel=job.payload.channel or "cli",
+                 chat_id=job.payload.to or "direct",
++                expected_actor=getattr(job.payload, "target_actor", None),
+                 on_progress=_silent,
+             )
+         finally:
+@@ -765,11 +807,48 @@ def _run_gateway(
  
      # Create channel manager (forwards SessionManager so the WebSocket channel
      # can serve the embedded webui's REST surface).
@@ -151,7 +159,7 @@ index 7892df0..1115b35 100644
          # Prefer the most recently updated non-internal session on an enabled channel.
          for item in session_manager.list_sessions():
              key = item.get("key") or ""
-@@ -816,6 +894,7 @@ def _run_gateway(
+@@ -816,6 +895,7 @@ def _run_gateway(
          await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
  
      hb_cfg = config.gateway.heartbeat
@@ -159,7 +167,7 @@ index 7892df0..1115b35 100644
      heartbeat = HeartbeatService(
          workspace=config.workspace_path,
          provider=provider,
-@@ -825,6 +904,7 @@ def _run_gateway(
+@@ -825,6 +905,7 @@ def _run_gateway(
          interval_s=hb_cfg.interval_s,
          enabled=hb_cfg.enabled,
          timezone=config.agents.defaults.timezone,
@@ -167,7 +175,7 @@ index 7892df0..1115b35 100644
      )
  
      if channels.enabled_channels:
-@@ -887,7 +967,7 @@ def _run_gateway(
+@@ -887,7 +968,7 @@ def _run_gateway(
      agent.dream.max_batch_size = dream_cfg.max_batch_size
      agent.dream.max_iterations = dream_cfg.max_iterations
      agent.dream.annotate_line_ages = dream_cfg.annotate_line_ages
@@ -176,7 +184,7 @@ index 7892df0..1115b35 100644
      cron.register_system_job(CronJob(
          id="dream",
          name="dream",
-@@ -896,6 +976,32 @@ def _run_gateway(
+@@ -896,6 +977,32 @@ def _run_gateway(
      ))
      console.print(f"[green]✓[/green] Dream: {dream_cfg.describe_schedule()}")
  
@@ -209,7 +217,7 @@ index 7892df0..1115b35 100644
      async def _open_browser_when_ready() -> None:
          """Wait for the gateway to bind, then point the user's browser at the webui."""
          if not open_browser_url:
-@@ -921,10 +1027,99 @@ def _run_gateway(
+@@ -921,10 +1028,99 @@ def _run_gateway(
          except Exception as e:
              console.print(f"[yellow]Could not open browser ({e}); visit {open_browser_url}[/yellow]")
  
@@ -309,7 +317,7 @@ index 7892df0..1115b35 100644
              tasks = [
                  agent.run(),
                  channels.start_all(),
-@@ -945,11 +1140,74 @@ def _run_gateway(
+@@ -945,11 +1141,74 @@ def _run_gateway(
              heartbeat.stop()
              cron.stop()
              agent.stop()
@@ -384,7 +392,7 @@ index 7892df0..1115b35 100644
  # ============================================================================
  # Agent Commands
  # ============================================================================
-@@ -1011,6 +1269,7 @@ def agent(
+@@ -1011,6 +1270,7 @@ def agent(
          disabled_skills=config.agents.defaults.disabled_skills,
          session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
          tools_config=config.tools,

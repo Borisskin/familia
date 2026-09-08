@@ -154,6 +154,7 @@ class AgentLoop:
 
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
     _PENDING_USER_TURN_KEY = "pending_user_turn"
+    _PRIVATE_SESSION_ROUTE_KEY = "_private_session_route"
 
     def __init__(
         self,
@@ -195,9 +196,14 @@ class AgentLoop:
         dream_turn_context: CallableABC[[], Any] | None = None,
         dream_restore_policy: CallableABC[[list[str] | None], str | None] | None = None,
         dream_batch_context: CallableABC[[list[dict[str, Any]]], Any] | None = None,
+        dream_profile_reader: CallableABC[[str], Any] | None = None,
+        dream_profile_context: CallableABC[[dict[str, Any]], Any] | None = None,
         archive_sink: Callable[[str, list[dict]], Awaitable[Any]] | None = None,
         private_session_owner_resolver: (
-            Callable[[str, list[dict]], Awaitable[str | None]] | None
+            Callable[
+                [str, list[dict], dict[str, Any] | None], Awaitable[str | None]
+            ]
+            | None
         ) = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
@@ -290,6 +296,8 @@ class AgentLoop:
             dream_tool_installers=self._dream_tool_installers,
             dream_turn_context=dream_turn_context,
             dream_batch_context=dream_batch_context,
+            dream_profile_reader=dream_profile_reader,
+            dream_profile_context=dream_profile_context,
         )
         if archive_sink is None and private_session_owner_resolver is not None:
             archive_sink = self.dream.archive_private
@@ -388,6 +396,7 @@ class AgentLoop:
                     current_actor_getter=cron_options.get("current_actor_getter"),
                     is_admin_getter=cron_options.get("is_admin_getter"),
                     reachable_tags_getter=cron_options.get("reachable_tags_getter"),
+                    target_actor_getter=cron_options.get("target_actor_getter"),
                 )
             )
 
@@ -835,9 +844,13 @@ class AgentLoop:
 
             session, pending = self.auto_compact.prepare_session(session, key)
 
+            consolidation_kwargs: dict[str, Any] = {"session_summary": pending}
+            route_context = session.metadata.get(self._PRIVATE_SESSION_ROUTE_KEY)
+            if route_context is not None:
+                consolidation_kwargs["session_context"] = route_context
             session = await self.consolidator.maybe_consolidate_by_tokens(
                 session,
-                session_summary=pending,
+                **consolidation_kwargs,
             )
             # Persist subagent follow-ups into durable history BEFORE prompt
             # assembly. ContextBuilder merges adjacent same-role messages for
@@ -883,10 +896,16 @@ class AgentLoop:
             "private_mode_proof" in metadata
             and metadata["private_mode_proof"] is not None
         )
+        incoming_session_key = session_key or msg.session_key
+        is_cron_service_route = (
+            incoming_session_key.startswith("cron:")
+            and isinstance(metadata.get("private_session_route"), dict)
+        )
         if (
             self.consolidator.archive_sink_enabled
             and msg.channel in {"telegram", "vk"}
             and not has_private_mode_proof
+            and not is_cron_service_route
         ):
             raise ValueError(
                 "private_mode_proof is required for server messages"
@@ -906,18 +925,28 @@ class AgentLoop:
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        key = session_key or msg.session_key
+        key = incoming_session_key
         session = self.sessions.get_or_create(key)
         if self._restore_runtime_checkpoint(session):
             self.sessions.save(session)
         if self._restore_pending_user_turn(session):
             self.sessions.save(session)
 
+        route = metadata.get("private_session_route")
+        if key.startswith("cron:") and isinstance(route, dict):
+            if session.metadata.get(self._PRIVATE_SESSION_ROUTE_KEY) != route:
+                session.metadata[self._PRIVATE_SESSION_ROUTE_KEY] = copy.deepcopy(route)
+                self.sessions.save(session)
+
         session, pending = self.auto_compact.prepare_session(session, key)
 
+        consolidation_kwargs = {"session_summary": pending}
+        route_context = session.metadata.get(self._PRIVATE_SESSION_ROUTE_KEY)
+        if route_context is not None:
+            consolidation_kwargs["session_context"] = route_context
         session = await self.consolidator.maybe_consolidate_by_tokens(
             session,
-            session_summary=pending,
+            **consolidation_kwargs,
         )
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
@@ -941,6 +970,7 @@ class AgentLoop:
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             meta = dict(msg.metadata or {})
+            meta.pop("private_session_route", None)
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
             await self.bus.publish_outbound(
@@ -1035,6 +1065,7 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = dict(msg.metadata or {})
+        meta.pop("private_session_route", None)
         if on_stream is not None and stop_reason != "error":
             meta["_streamed"] = True
         return OutboundMessage(
@@ -1271,12 +1302,15 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        expected_actor: str | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload.
 
         ``actor`` pins the principal for this turn so scoped tools (memX)
         resolve keys under the right identity — used by cron delivery where
         the recipient's principal is known from ``payload.to``.
+        ``expected_actor`` is the persisted cron recipient and is checked by
+        the consolidation owner resolver without trusting the job creator.
         """
         await self._connect_mcp()
         direct_actor_resolver = getattr(self, "_direct_actor_resolver", None)
@@ -1317,6 +1351,14 @@ class AgentLoop:
                 metadata["private_mode_proof"] = private_mode_proof
         elif actor is None and direct_actor_resolver is not None:
             actor = direct_actor_resolver(channel, chat_id)
+        if session_key.startswith("cron:"):
+            metadata["private_session_route"] = {
+                "channel": channel,
+                "chat_id": str(chat_id),
+                "target_actor": (
+                    expected_actor if expected_actor is not None else actor
+                ),
+            }
         msg = InboundMessage(
             channel=channel, sender_id=actor or "user", chat_id=chat_id,
             content=content, media=media or [],

@@ -431,6 +431,17 @@ def _current_actor_and_key() -> tuple[str | None, str | None, str | None]:
     return actor_id, principal.memx_key, None
 
 
+def _check_memory_write_policy(*, actor: str, full_key: str) -> str | None:
+    """Return a safe error when policy does not explicitly allow a write."""
+    decision = get_engine().evaluate(
+        PolicyContext(action="memory.write", actor=actor, to_chat=full_key)
+    )
+    if decision.decision is Decision.ALLOW:
+        return None
+    reason = decision.reason or f"policy decision {decision.decision.value}"
+    return f"Policy denied memory.write на '{full_key}': {reason}"
+
+
 _ACTOR_PARAM_DESC = (
     "Optional principal id whose namespace to read. Defaults to the "
     "current actor (own namespace) and is valid only for 'private'. "
@@ -827,6 +838,12 @@ class MemorySetTool(Tool):
         actor_id, api_key, err = _current_actor_and_key()
         if err:
             return err
+        policy_error = _check_memory_write_policy(
+            actor=actor_id,
+            full_key=f"private:{actor_id}:memory:{fact_id}",
+        )
+        if policy_error:
+            return policy_error
         delete = value is None
         server_topic: str | None = None
         requested_topic = ""

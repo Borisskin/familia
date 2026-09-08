@@ -777,6 +777,7 @@ def _run_gateway(
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
+                expected_actor=getattr(job.payload, "target_actor", None),
                 on_progress=_silent,
             )
         finally:

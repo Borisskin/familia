@@ -2,7 +2,7 @@ name: tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, build/test]
     tags: ["v*"]
   pull_request:
 
@@ -56,11 +56,25 @@ jobs:
       - name: Test Familia integration points in nanobot
         run: |
           pytest -q \
+            nanobot/tests/agent/test_auto_compact.py \
             nanobot/tests/agent/test_context_prompt_cache.py \
             nanobot/tests/agent/test_consolidator.py \
             nanobot/tests/agent/test_dream.py \
+            nanobot/tests/agent/test_loop_consolidation_tokens.py \
+            nanobot/tests/agent/test_loop_cron_timezone.py \
+            nanobot/tests/agent/test_loop_save_turn.py \
             nanobot/tests/agent/test_memory_store.py \
-            nanobot/tests/agent/test_memory_store_durability.py
+            nanobot/tests/agent/test_memory_store_durability.py \
+            nanobot/tests/agent/test_consolidate_offset.py \
+            nanobot/tests/cli/test_commands.py \
+            nanobot/tests/cli/test_extension_boundaries.py \
+            nanobot/tests/cron/test_cron_tool_list.py \
+            nanobot/tests/cron/test_cron_tool_schema_contract.py \
+            nanobot/tests/cron/test_cron_tool_to_override.py \
+            nanobot/tests/cron/test_cron_tool_visibility.py
 
       - name: Verify exact nanobot patch reconstruction
         run: python patches/test_check_exact_reconstruction.py -v
+
+      - name: Verify patch header normalization
+        run: pytest -q patches/test_regenerate_headers.py

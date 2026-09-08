@@ -170,13 +170,18 @@ MEMORY_CONTRACT: Final[dict[str, Any]] = {
         "delete_missing": "success",
     },
     "consolidation": {
-        "supported_sources": ["vk_private", "telegram_private"],
-        "automatic_destination": "private_owner_untagged",
+        "supported_sources": [
+            "vk_private",
+            "telegram_private",
+            "cron_service",
+        ],
+        "automatic_destination": "private_owner_untagged_when_proven",
         "owner_resolver": {
-            "input": ["session_key", "messages"],
+            "input": ["session_key", "messages", "session_context"],
             "result": "principal_or_none",
             "before_model": True,
         },
+        "unowned_cron_destination": "service_session_only",
         "archive_sink": {
             "input": ["principal", "messages"],
             "success": "return_without_exception",

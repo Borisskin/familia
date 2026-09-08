@@ -17,7 +17,7 @@ import pytest
 from familia import principals as principals_mod
 from familia.principals import Identity, Principal, PrincipalRegistry
 from nanobot.agent.memory import Consolidator, MemoryStore
-from familia.policy import Decision, PolicyContext
+from familia.policy import Decision, PolicyContext, PolicyDecision, PolicyRule
 from familia.policy.engine import load_engine
 from familia.tools.dream_memory import DreamMemorySetTool
 from nanobot.providers.base import LLMResponse
@@ -170,6 +170,64 @@ def test_dream_consolidator_denied_for_memory_read(policy_engine) -> None:
     assert r.decision is Decision.DENY
 
 
+@pytest.mark.parametrize(
+    ("kind", "fact_id", "value", "expected_key", "decision"),
+    [
+        (
+            "profile", None, "secret profile",
+            "private:member_a:value:user_profile", Decision.DENY,
+        ),
+        (
+            "memory", "fact-17", "secret fact",
+            "private:member_a:memory:fact-17", Decision.ASK,
+        ),
+        (
+            "delete", "fact-17", None,
+            "private:member_a:memory:fact-17", Decision.DENY,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_dream_memory_set_policy_denial_precedes_ingestor(
+    monkeypatch: pytest.MonkeyPatch,
+    known_member: PrincipalRegistry,
+    kind: str,
+    fact_id: str | None,
+    value: str | None,
+    expected_key: str,
+    decision: Decision,
+) -> None:
+    from familia.tools import memory as memory_mod
+    from familia.principals import set_current_actor
+    from familia.tools.dream_memory import CONSOLIDATOR_ACTOR
+
+    denied = MagicMock()
+    denied.evaluate.return_value = PolicyDecision(
+        decision,
+        PolicyRule(name="deny automatic writes", reason="blocked"),
+    )
+    monkeypatch.setattr(memory_mod, "get_engine", lambda: denied)
+    ingestor = MagicMock()
+    ingestor.ingest = AsyncMock(return_value="committed: should not run")
+    principal_getter = MagicMock(return_value="member_a")
+    tool = DreamMemorySetTool(
+        ingestor=ingestor,
+        server_principal_getter=principal_getter,
+    )
+    set_current_actor(CONSOLIDATOR_ACTOR)
+
+    result = await tool.execute(kind=kind, fact_id=fact_id, value=value)
+
+    assert result.startswith("Policy denied memory.write")
+    assert "secret" not in result
+    denied.evaluate.assert_called_once()
+    context = denied.evaluate.call_args.args[0]
+    assert context.action == "memory.write"
+    assert context.actor == CONSOLIDATOR_ACTOR
+    assert context.to_chat == expected_key
+    ingestor.ingest.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_dream_memory_set_tool_delegates_without_own_http_writer() -> None:
     from familia.principals import set_current_actor
@@ -272,6 +330,19 @@ async def test_dream_batch_context_fixes_private_owner(
             "value": "works at Example",
         },
     )
+
+
+def test_dream_profile_context_exposes_only_captured_revision() -> None:
+    from familia.bootstrap import (
+        make_dream_profile_context,
+        make_dream_profile_version_resolver,
+    )
+
+    version = make_dream_profile_version_resolver()
+    assert version() is None
+    with make_dream_profile_context()({"value": "profile", "version": 17.0}):
+        assert version() == 17.0
+    assert version() is None
 
 
 @pytest.mark.asyncio
@@ -396,6 +467,8 @@ def test_bootstrap_wires_history_validator_dream_scope_and_restore_policy(
 
     assert callable(kwargs["history_actor_validator"])
     assert callable(kwargs["dream_turn_context"])
+    assert callable(kwargs["dream_profile_reader"])
+    assert callable(kwargs["dream_profile_context"])
     restore_policy = kwargs["dream_restore_policy"]
     assert callable(restore_policy)
     assert isinstance(restore_policy(["SOUL.md"]), str)
@@ -412,3 +485,107 @@ def test_bootstrap_wires_private_session_owner_resolver(tmp_path: Path) -> None:
         kwargs["private_session_owner_resolver"],
         PrivateSessionOwnerResolver,
     )
+
+
+def _dream_restore_context(
+    *,
+    actor: str | None,
+    changed_file: str,
+    restore_policy,
+):
+    from nanobot.bus.events import InboundMessage
+    from nanobot.command.router import CommandContext
+
+    git = MagicMock()
+    git.is_initialized.return_value = True
+    if changed_file.startswith(" "):
+        old_path = json.dumps(f"a/{changed_file}")
+        new_path = json.dumps(f"b/{changed_file}")
+    else:
+        old_path = f"a/{changed_file}"
+        new_path = f"b/{changed_file}"
+    git.show_commit_diff.return_value = (
+        MagicMock(sha="dream-sha"),
+        f"diff --git {old_path} {new_path}\n"
+        f"--- {old_path}\n"
+        f"+++ {new_path}\n",
+    )
+    git.revert.return_value = "safety-sha"
+    loop = MagicMock()
+    loop.consolidator.store.git = git
+    loop.dream_restore_policy = restore_policy
+    message = InboundMessage(
+        channel="telegram",
+        sender_id="101",
+        chat_id="101",
+        content="/dream-restore dream-sha",
+        actor=actor,
+    )
+    context = CommandContext(
+        msg=message,
+        session=None,
+        key=message.session_key,
+        raw=message.content,
+        args="dream-sha",
+        loop=loop,
+    )
+    return git, context
+
+
+@pytest.mark.asyncio
+async def test_familia_dream_restore_policy_blocks_soul() -> None:
+    from familia.bootstrap import make_dream_restore_policy
+    from nanobot.command.builtin import cmd_dream_restore
+
+    git, context = _dream_restore_context(
+        actor=None,
+        changed_file="SOUL.md",
+        restore_policy=make_dream_restore_policy(),
+    )
+
+    result = await cmd_dream_restore(context)
+
+    git.revert.assert_not_called()
+    assert "does not restore `SOUL.md`" in result.content
+
+
+@pytest.mark.parametrize(
+    "changed_file",
+    ["unknown.md", "subdir/SOUL.md", "sOuL.Md", " SOUL.md"],
+)
+@pytest.mark.asyncio
+async def test_familia_dream_restore_policy_blocks_unknown_or_distorted_path(
+    changed_file: str,
+) -> None:
+    from familia.bootstrap import make_dream_restore_policy
+    from nanobot.command.builtin import cmd_dream_restore
+
+    git, context = _dream_restore_context(
+        actor=None,
+        changed_file=changed_file,
+        restore_policy=make_dream_restore_policy(),
+    )
+
+    result = await cmd_dream_restore(context)
+
+    git.revert.assert_not_called()
+    assert "cannot verify which files" in result.content
+
+
+@pytest.mark.parametrize("changed_file", ["USER.md", "memory/MEMORY.md"])
+@pytest.mark.asyncio
+async def test_familia_dream_restore_policy_allows_known_non_soul_diff(
+    changed_file: str,
+) -> None:
+    from familia.bootstrap import make_dream_restore_policy
+    from nanobot.command.builtin import cmd_dream_restore
+
+    git, context = _dream_restore_context(
+        actor="principal_alpha",
+        changed_file=changed_file,
+        restore_policy=make_dream_restore_policy(),
+    )
+
+    await cmd_dream_restore(context)
+
+    git.revert.assert_called_once_with("dream-sha")

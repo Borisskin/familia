@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock, call
@@ -44,15 +45,25 @@ def registry(monkeypatch: pytest.MonkeyPatch) -> PrincipalRegistry:
 
 
 class _ScriptedProvider:
-    def __init__(self, analysis: str, tool_calls: list[ToolCallRequest]) -> None:
+    def __init__(
+        self,
+        analysis: str,
+        tool_calls: list[ToolCallRequest],
+        *,
+        phase1_finish_reason: str = "stop",
+    ) -> None:
         self.analysis = analysis
         self.tool_calls = tool_calls
+        self.phase1_finish_reason = phase1_finish_reason
         self.phase2_calls = 0
         self.tool_results: list[str] = []
 
     async def chat_with_retry(self, **kwargs: Any) -> LLMResponse:
         if kwargs.get("tools") is None:
-            return LLMResponse(content=self.analysis)
+            return LLMResponse(
+                content=self.analysis,
+                finish_reason=self.phase1_finish_reason,
+            )
         self.phase2_calls += 1
         if self.phase2_calls == 1:
             return LLMResponse(
@@ -190,6 +201,117 @@ async def test_token_consolidation_keeps_source_when_private_archive_is_denied_i
 
 
 @pytest.mark.asyncio
+async def test_unowned_cron_consolidation_stays_in_service_session(
+    tmp_path: Path,
+) -> None:
+    provider = _ScriptedProvider("service-only summary", [])
+    store = MemoryStore(tmp_path)
+    session = Session(key="cron:job-1")
+    session.add_message("user", "scheduled instruction")
+    session.add_message("assistant", "service response")
+    session.add_message("user", "next scheduled instruction")
+    sessions = Mock()
+    sessions.get_or_create.return_value = session
+    private_sink = AsyncMock()
+    consolidator = Consolidator(
+        store=store,
+        provider=provider,
+        model="test-model",
+        sessions=sessions,
+        context_window_tokens=100,
+        build_messages=Mock(return_value=[]),
+        get_tool_definitions=Mock(return_value=[]),
+        max_completion_tokens=0,
+        archive_sink=private_sink,
+        private_session_owner_resolver=AsyncMock(return_value=None),
+    )
+    consolidator._SAFETY_BUFFER = 0
+    consolidator.estimate_session_prompt_tokens = Mock(
+        side_effect=[(1000, "test"), (0, "test")]
+    )
+    consolidator.pick_consolidation_boundary = Mock(return_value=(2, 500))
+
+    await consolidator.maybe_consolidate_by_tokens(
+        session,
+        session_context={
+            "channel": "telegram",
+            "chat_id": "unknown",
+            "target_actor": None,
+        },
+    )
+
+    private_sink.assert_not_awaited()
+    assert session.last_consolidated == 2
+    assert session.metadata["_last_summary"]["text"] == "service-only summary"
+    assert not store.history_file.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("analysis", "finish_reason"),
+    [("", "stop"), ("provider failed", "error")],
+)
+async def test_token_consolidation_rejects_failed_phase1_before_phase2(
+    tmp_path: Path,
+    analysis: str,
+    finish_reason: str,
+) -> None:
+    provider = _ScriptedProvider(
+        analysis,
+        [],
+        phase1_finish_reason=finish_reason,
+    )
+    dream, store = _dream(tmp_path, provider)
+    session = Session(key="telegram:private-chat")
+    session.add_message("user", "old user message")
+    session.add_message("assistant", "old assistant message")
+    session.add_message("user", "current user message")
+    session.add_message("assistant", "current assistant message")
+    expected_messages = [dict(message) for message in session.messages]
+    expected_last_consolidated = session.last_consolidated
+    sessions = Mock()
+    sessions.get_or_create.return_value = session
+    consolidator = Consolidator(
+        store=store,
+        provider=provider,
+        model="test-model",
+        sessions=sessions,
+        context_window_tokens=100,
+        build_messages=Mock(return_value=[]),
+        get_tool_definitions=Mock(return_value=[]),
+        max_completion_tokens=0,
+        archive_sink=dream.archive_private,
+        private_session_owner_resolver=AsyncMock(return_value="actor_alpha"),
+    )
+    consolidator._SAFETY_BUFFER = 0
+    consolidator.estimate_session_prompt_tokens = Mock(
+        side_effect=[(1000, "test"), (0, "test")]
+    )
+    consolidator.pick_consolidation_boundary = Mock(return_value=(2, 500))
+
+    with pytest.raises(RuntimeError):
+        await consolidator.maybe_consolidate_by_tokens(session)
+
+    assert provider.phase2_calls == 0
+    assert session.messages == expected_messages
+    assert session.last_consolidated == expected_last_consolidated
+    sessions.save.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dream_accepts_successful_skip_without_memory_operations(
+    tmp_path: Path,
+) -> None:
+    provider = _ScriptedProvider("[SKIP]", [])
+    dream, store = _dream(tmp_path, provider)
+    store.append_history("No durable fact", actor="actor_alpha")
+
+    assert await dream.run() is True
+    assert provider.phase2_calls >= 1
+    assert store.get_last_dream_cursor() == 1
+
+
+@pytest.mark.asyncio
 async def test_private_archive_applies_memory_and_delete_for_fixed_owner(
     tmp_path: Path,
     registry: PrincipalRegistry,
@@ -272,6 +394,185 @@ async def test_private_archive_applies_memory_and_delete_for_fixed_owner(
             },
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_profile_snapshot_is_prompted_and_written_with_exact_version(
+    tmp_path: Path,
+    registry: PrincipalRegistry,
+) -> None:
+    provider = _ScriptedProvider(
+        "[PROFILE] kind=profile value=name=Alice; birth=1990; city=Paris; surname=Smith",
+        [
+            _call(
+                "profile",
+                kind="profile",
+                value="name=Alice; birth=1990; city=Paris; surname=Smith",
+            )
+        ],
+    )
+    ingestor = Mock()
+    ingestor.ingest = AsyncMock(return_value="committed: stored")
+    snapshot = {"value": "name=Alice; birth=1990; city=Paris", "version": 41.0}
+    reader = AsyncMock(return_value=snapshot)
+    active_snapshot: dict[str, Any] = {}
+
+    @contextmanager
+    def profile_context(value: dict[str, Any]):
+        active_snapshot.update(value)
+        try:
+            yield
+        finally:
+            active_snapshot.clear()
+
+    def install_memory_tool(tools, _store) -> None:
+        for name in ("read_file", "edit_file", "write_file"):
+            tools.unregister(name)
+        tools.register(
+            dream_memory_mod.DreamMemorySetTool(
+                ingestor=ingestor,
+                server_principal_getter=lambda: "actor_alpha",
+                profile_version_getter=lambda: active_snapshot.get("version"),
+            )
+        )
+
+    dream = Dream(
+        store=MemoryStore(tmp_path),
+        provider=provider,
+        model="test-model",
+        dream_tool_installers=[install_memory_tool],
+        dream_turn_context=make_dream_turn_context(),
+        dream_profile_reader=reader,
+        dream_profile_context=profile_context,
+    )
+
+    await dream.archive_private("actor_alpha", [{"role": "user", "content": "Добавь фамилию"}])
+
+    assert reader.await_args_list == [call("actor_alpha")]
+    assert ingestor.ingest.await_args_list == [
+        call(
+            server_principal="actor_alpha",
+            server_topic=None,
+            operation={
+                "kind": "profile",
+                "value": "name=Alice; birth=1990; city=Paris; surname=Smith",
+            },
+            expected_version=41.0,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_profile_conflict_rereads_and_reanalyzes_before_retry(
+    tmp_path: Path,
+    registry: PrincipalRegistry,
+) -> None:
+    class _ProfileProvider:
+        def __init__(self) -> None:
+            self.phase1_calls = 0
+            self.phase2_calls = 0
+
+        async def chat_with_retry(self, **kwargs: Any) -> LLMResponse:
+            if kwargs.get("tools") is None:
+                self.phase1_calls += 1
+                return LLMResponse(
+                    content=(
+                        "[PROFILE] kind=profile value="
+                        f"name=Alice; city=Paris; surname=Smith{self.phase1_calls}"
+                    ),
+                    finish_reason="stop",
+                )
+            self.phase2_calls += 1
+            if self.phase2_calls in (1, 2):
+                return LLMResponse(
+                    content="",
+                    tool_calls=[
+                        _call(
+                            f"profile-{self.phase2_calls}",
+                            kind="profile",
+                            value=(
+                                "name=Alice; city=Paris; "
+                                f"surname=Smith{self.phase1_calls}"
+                            ),
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            return LLMResponse(content="done", finish_reason="stop")
+
+    provider = _ProfileProvider()
+    ingestor = Mock()
+    ingestor.ingest = AsyncMock(
+        side_effect=[
+            "profile_conflict: profile changed during analysis",
+            "committed: stored",
+        ]
+    )
+    snapshots = iter(
+        [
+            {"value": "name=Alice; city=Paris", "version": 7.0},
+            {"value": "name=Alice; city=Paris; surname=Jones", "version": 8.0},
+        ]
+    )
+    reader = AsyncMock(side_effect=lambda _principal: next(snapshots))
+    active_snapshot: dict[str, Any] = {}
+
+    @contextmanager
+    def profile_context(value: dict[str, Any]):
+        active_snapshot.update(value)
+        try:
+            yield
+        finally:
+            active_snapshot.clear()
+
+    def install_memory_tool(tools, _store) -> None:
+        for name in ("read_file", "edit_file", "write_file"):
+            tools.unregister(name)
+        tools.register(
+            dream_memory_mod.DreamMemorySetTool(
+                ingestor=ingestor,
+                server_principal_getter=lambda: "actor_alpha",
+                profile_version_getter=lambda: active_snapshot.get("version"),
+            )
+        )
+
+    dream = Dream(
+        store=MemoryStore(tmp_path),
+        provider=provider,
+        model="test-model",
+        dream_tool_installers=[install_memory_tool],
+        dream_turn_context=make_dream_turn_context(),
+        dream_profile_reader=reader,
+        dream_profile_context=profile_context,
+    )
+
+    await dream.archive_private("actor_alpha", [{"role": "user", "content": "Добавь фамилию"}])
+
+    assert provider.phase1_calls == 2
+    assert reader.await_count == 2
+    assert [call.kwargs["expected_version"] for call in ingestor.ingest.await_args_list] == [7.0, 8.0]
+
+
+@pytest.mark.asyncio
+async def test_profile_read_error_prevents_phase1_and_phase2(tmp_path: Path) -> None:
+    provider = Mock()
+    provider.chat_with_retry = AsyncMock()
+    def install_memory_tool(tools, _store) -> None:
+        tools.unregister("edit_file")
+        tools.register(dream_memory_mod.DreamMemorySetTool())
+
+    dream = Dream(
+        store=MemoryStore(tmp_path),
+        provider=provider,
+        dream_tool_installers=[install_memory_tool],
+        model="test-model",
+        dream_profile_reader=AsyncMock(side_effect=RuntimeError("memX unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="profile read failed"):
+        await dream.archive_private("actor_alpha", [{"role": "user", "content": "x"}])
+
+    provider.chat_with_retry.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -2,7 +2,7 @@
 # upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
 
 diff --git a/nanobot/nanobot/agent/tools/cron.py b/nanobot/nanobot/agent/tools/cron.py
-index 127ac6c..2102706 100644
+index 127ac6c..fe7843d 100644
 --- a/nanobot/nanobot/agent/tools/cron.py
 +++ b/nanobot/nanobot/agent/tools/cron.py
 @@ -2,10 +2,11 @@
@@ -41,7 +41,7 @@ index 127ac6c..2102706 100644
      job_id=StringSchema("REQUIRED when action='remove'. Job ID to remove (obtain via action='list')."),
      required=["action"],
      description=(
-@@ -55,9 +72,36 @@ _CRON_PARAMETERS = tool_parameters_schema(
+@@ -55,9 +72,40 @@ _CRON_PARAMETERS = tool_parameters_schema(
  class CronTool(Tool):
      """Tool to schedule reminders and recurring tasks."""
  
@@ -54,6 +54,7 @@ index 127ac6c..2102706 100644
 +        current_actor_getter: Callable[[], str | None] | None = None,
 +        is_admin_getter: Callable[[str | None], bool] | None = None,
 +        reachable_tags_getter: Callable[[str | None], set[str]] | None = None,
++        target_actor_getter: Callable[[str, str], str | None] | None = None,
 +    ):
          self._cron = cron_service
          self._default_timezone = default_timezone
@@ -76,10 +77,13 @@ index 127ac6c..2102706 100644
 +        # tags are stored on jobs but ``cron list``
 +        # falls back to the legacy ownership-only filter.
 +        self._reachable_tags_getter = reachable_tags_getter
++        # Resolve the saved delivery route to a principal at job creation;
++        # execution still revalidates the route before private archival.
++        self._target_actor_getter = target_actor_getter
          self._channel: ContextVar[str] = ContextVar("cron_channel", default="")
          self._chat_id: ContextVar[str] = ContextVar("cron_chat_id", default="")
          self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
-@@ -127,12 +171,14 @@ class CronTool(Tool):
+@@ -127,12 +175,14 @@ class CronTool(Tool):
          at: str | None = None,
          job_id: str | None = None,
          deliver: bool = True,
@@ -95,7 +99,7 @@ index 127ac6c..2102706 100644
          elif action == "list":
              return self._list_jobs()
          elif action == "remove":
-@@ -148,6 +194,8 @@ class CronTool(Tool):
+@@ -148,6 +198,8 @@ class CronTool(Tool):
          tz: str | None,
          at: str | None,
          deliver: bool = True,
@@ -104,7 +108,7 @@ index 127ac6c..2102706 100644
      ) -> str:
          if not message:
              return (
-@@ -159,6 +207,15 @@ class CronTool(Tool):
+@@ -159,6 +211,15 @@ class CronTool(Tool):
          chat_id = self._chat_id.get()
          if not channel or not chat_id:
              return "Error: no session context (channel/chat_id)"
@@ -120,11 +124,16 @@ index 127ac6c..2102706 100644
          if tz and not cron_expr:
              return "Error: tz can only be used with cron_expr"
          if tz:
-@@ -191,15 +248,41 @@ class CronTool(Tool):
+@@ -191,15 +252,48 @@ class CronTool(Tool):
          else:
              return "Error: either every_seconds, cron_expr, or at is required"
  
 +        creator = self._current_actor_getter() if self._current_actor_getter else None
++        target_actor = (
++            self._target_actor_getter(channel, target_chat_id)
++            if self._target_actor_getter is not None
++            else None
++        )
 +        # Tag write-side ACL: if a reachable getter is wired, every tag must
 +        # be in the actor's reachable set. Admin bypass: if is_admin_getter
 +        # says yes, skip the check.
@@ -157,13 +166,15 @@ index 127ac6c..2102706 100644
              delete_after_run=delete_after,
 +            created_by=creator,
 +            tags=clean_tags,
++            creator_actor=creator,
++            target_actor=target_actor,
          )
 +        if clean_tags:
 +            return f"Created job '{job.name}' (id: {job.id}, теги: {', '.join(clean_tags)})"
          return f"Created job '{job.name}' (id: {job.id})"
  
      def _format_timing(self, schedule: CronSchedule) -> str:
-@@ -242,12 +325,56 @@ class CronTool(Tool):
+@@ -242,12 +336,56 @@ class CronTool(Tool):
              return "Dream memory consolidation for long-term memory."
          return "System-managed internal job."
  
@@ -222,7 +233,7 @@ index 127ac6c..2102706 100644
              timing = self._format_timing(j.schedule)
              parts = [f"- {j.name} (id: {j.id}, {timing})"]
              if j.payload.kind == "system_event":
-@@ -255,11 +382,27 @@ class CronTool(Tool):
+@@ -255,11 +393,27 @@ class CronTool(Tool):
                  parts.append("  Protected: visible for inspection, but cannot be removed.")
              parts.extend(self._format_state(j.state, j.schedule))
              lines.append("\n".join(parts))

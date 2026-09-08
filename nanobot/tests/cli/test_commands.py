@@ -1485,7 +1485,7 @@ def test_channels_login_requires_channel_name() -> None:
     assert result.exit_code == 2
 
 
-def _dream_restore_context(
+def _standalone_dream_restore_context(
     *,
     actor: str | None,
     changed_file: str,
@@ -1531,72 +1531,13 @@ def _dream_restore_context(
 
 
 @pytest.mark.asyncio
-async def test_familia_dream_restore_policy_blocks_soul() -> None:
-    from familia.bootstrap import make_dream_restore_policy
-    from nanobot.command.builtin import cmd_dream_restore
-
-    git, context = _dream_restore_context(
-        actor=None,
-        changed_file="SOUL.md",
-        restore_policy=make_dream_restore_policy(),
-    )
-
-    result = await cmd_dream_restore(context)
-
-    git.revert.assert_not_called()
-    assert "does not restore `SOUL.md`" in result.content
-
-
-@pytest.mark.parametrize(
-    "changed_file",
-    ["unknown.md", "subdir/SOUL.md", "sOuL.Md", " SOUL.md"],
-)
-@pytest.mark.asyncio
-async def test_familia_dream_restore_policy_blocks_unknown_or_distorted_path(
-    changed_file: str,
-) -> None:
-    from familia.bootstrap import make_dream_restore_policy
-    from nanobot.command.builtin import cmd_dream_restore
-
-    git, context = _dream_restore_context(
-        actor=None,
-        changed_file=changed_file,
-        restore_policy=make_dream_restore_policy(),
-    )
-
-    result = await cmd_dream_restore(context)
-
-    git.revert.assert_not_called()
-    assert "cannot verify which files" in result.content
-
-
-@pytest.mark.asyncio
 async def test_standalone_dream_restore_with_actor_and_no_policy_reverts() -> None:
     from nanobot.command.builtin import cmd_dream_restore
 
-    git, context = _dream_restore_context(
+    git, context = _standalone_dream_restore_context(
         actor="principal_alpha",
         changed_file="SOUL.md",
         restore_policy=None,
-    )
-
-    await cmd_dream_restore(context)
-
-    git.revert.assert_called_once_with("dream-sha")
-
-
-@pytest.mark.parametrize("changed_file", ["USER.md", "memory/MEMORY.md"])
-@pytest.mark.asyncio
-async def test_familia_dream_restore_policy_allows_known_non_soul_diff(
-    changed_file: str,
-) -> None:
-    from familia.bootstrap import make_dream_restore_policy
-    from nanobot.command.builtin import cmd_dream_restore
-
-    git, context = _dream_restore_context(
-        actor="principal_alpha",
-        changed_file=changed_file,
-        restore_policy=make_dream_restore_policy(),
     )
 
     await cmd_dream_restore(context)

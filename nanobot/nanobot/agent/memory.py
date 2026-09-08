@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 import hashlib
+import inspect
 import json
+import math
 import os
 import re
 import uuid
@@ -691,7 +693,10 @@ class Consolidator:
         max_completion_tokens: int = 4096,
         archive_sink: Callable[[str, list[dict]], Awaitable[Any]] | None = None,
         private_session_owner_resolver: (
-            Callable[[str, list[dict]], Awaitable[str | None]] | None
+            Callable[
+                [str, list[dict], dict[str, Any] | None], Awaitable[str | None]
+            ]
+            | None
         ) = None,
     ):
         if archive_sink is not None and private_session_owner_resolver is None:
@@ -811,6 +816,7 @@ class Consolidator:
         messages: list[dict],
         *,
         session_key: str | None = None,
+        session_context: dict[str, Any] | None = None,
     ) -> Any:
         """Summarize messages via LLM and append to history.jsonl.
 
@@ -833,8 +839,17 @@ class Consolidator:
                 raise ValueError(
                     "private_session_owner_resolver is required when archive_sink is configured"
                 )
-            resolution = await resolver(session_key, messages)
+            resolution = await self._resolve_private_owner(
+                resolver,
+                session_key,
+                messages,
+                session_context,
+            )
             if not isinstance(resolution, str) or not resolution:
+                if isinstance(session_key, str) and session_key.startswith("cron:"):
+                    # Unproven cron ownership stays inside the service session:
+                    # summarize without writing private/shared history.
+                    return await self._archive_service_summary(messages)
                 raise RuntimeError("private session owner is unavailable")
             return await self._archive_sink(resolution, messages)
         last_summary: str | None = None
@@ -845,6 +860,57 @@ class Consolidator:
             if summary:
                 last_summary = summary
         return last_summary
+
+    @staticmethod
+    async def _resolve_private_owner(
+        resolver: Callable[..., Awaitable[str | None]],
+        session_key: str,
+        messages: list[dict],
+        session_context: dict[str, Any] | None,
+    ) -> str | None:
+        """Call legacy two-argument owner resolvers without weakening routes."""
+        if session_context is None:
+            return await resolver(session_key, messages)
+        try:
+            parameters = inspect.signature(resolver).parameters.values()
+            accepts_context = any(
+                parameter.kind is inspect.Parameter.VAR_POSITIONAL
+                for parameter in parameters
+            ) or sum(
+                parameter.kind
+                in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+                for parameter in parameters
+            ) >= 3
+        except (TypeError, ValueError):
+            accepts_context = True
+        if accepts_context:
+            return await resolver(session_key, messages, session_context)
+        return await resolver(session_key, messages)
+
+    async def _archive_service_summary(self, messages: list[dict]) -> str:
+        """Summarize an unowned cron turn without persisting memory history."""
+        formatted = MemoryStore._format_messages(messages)
+        response = await self.provider.chat_with_retry(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": render_template(
+                        "agent/consolidator_archive.md",
+                        strip=True,
+                    ),
+                },
+                {"role": "user", "content": formatted},
+            ],
+            tools=None,
+            tool_choice=None,
+        )
+        if response.finish_reason == "error":
+            raise RuntimeError(f"LLM returned error: {response.content}")
+        return response.content or "[no summary]"
 
     async def _archive_one(self, messages: list[dict], actor: str | None) -> str | None:
         try:
@@ -882,6 +948,7 @@ class Consolidator:
         session: Session,
         *,
         session_summary: str | None = None,
+        session_context: dict[str, Any] | None = None,
     ) -> Session:
         """Loop: archive old messages until prompt fits within safe budget.
 
@@ -962,11 +1029,17 @@ class Consolidator:
                     source,
                     len(chunk),
                 )
-                summary = await self.archive(chunk, session_key=session.key)
+                context = session_context
+                if context is None:
+                    context = session.metadata.get("_private_session_route")
+                archive_kwargs: dict[str, Any] = {"session_key": session.key}
+                if context is not None:
+                    archive_kwargs["session_context"] = context
+                summary = await self.archive(chunk, **archive_kwargs)
+                if summary:
+                    last_summary = summary
                 if self._archive_sink is None:
-                    if summary:
-                        last_summary = summary
-                    else:
+                    if not summary:
                         break
                 session.last_consolidated = end_idx
                 changed = True
@@ -1013,6 +1086,7 @@ class Consolidator:
 # Keep code and prompt aligned — if you bump this, the LLM's instruction string
 # updates automatically.
 _STALE_THRESHOLD_DAYS = 14
+_DREAM_PROFILE_RETRIES = 2
 
 
 class Dream:
@@ -1035,6 +1109,8 @@ class Dream:
         dream_tool_installers: list[Callable[[ToolRegistry, MemoryStore], None]] | None = None,
         dream_turn_context: Callable[[], ContextManager[Any]] | None = None,
         dream_batch_context: Callable[[list[dict[str, Any]]], ContextManager[Any]] | None = None,
+        dream_profile_reader: Callable[[str], Any] | None = None,
+        dream_profile_context: Callable[[dict[str, Any]], ContextManager[Any]] | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -1049,6 +1125,8 @@ class Dream:
         self._dream_tool_installers = dream_tool_installers or []
         self._dream_turn_context = dream_turn_context
         self._dream_batch_context = dream_batch_context
+        self._dream_profile_reader = dream_profile_reader
+        self._dream_profile_context = dream_profile_context
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
 
@@ -1125,6 +1203,9 @@ Output one line per finding in exactly one of these forms:
 
 Rules:
 - PROFILE is the current participant profile or a correction to it.
+- When a current profile is supplied below, PROFILE must be a complete replacement
+  profile: preserve every existing detail that the history does not correct.
+- Never read or mention another participant's profile.
 - MEMORY is one atomic durable fact with a stable fact_id.
 - Do not combine facts, invent routing, or copy temporary status and filler.
 - Reuse the same semantic fact_id when a newer statement replaces an old one.
@@ -1146,6 +1227,56 @@ Rules:
 Never add owner, scope, topic, actor, other participant, or storage key fields.
 If nothing needs updating, stop without calling tools."""
 
+    async def _read_dream_profile(self, principal: str) -> dict[str, Any] | None:
+        """Read the server-scoped profile snapshot before Dream analysis."""
+        if self._dream_profile_reader is None:
+            return None
+        try:
+            snapshot = self._dream_profile_reader(principal)
+            if inspect.isawaitable(snapshot):
+                snapshot = await snapshot
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("automatic private memory profile read failed") from exc
+        if not isinstance(snapshot, dict):
+            raise RuntimeError("automatic private memory profile snapshot is invalid")
+        value = snapshot.get("value")
+        version = snapshot.get("version")
+        if value is not None and not isinstance(value, str):
+            raise RuntimeError("automatic private memory profile snapshot is invalid")
+        if version is not None:
+            if not isinstance(version, (int, float)) or isinstance(version, bool):
+                raise RuntimeError("automatic private memory profile snapshot is invalid")
+            try:
+                version = float(version)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError(
+                    "automatic private memory profile snapshot is invalid"
+                ) from exc
+            if not math.isfinite(version):
+                raise RuntimeError("automatic private memory profile snapshot is invalid")
+        return {"value": value, "version": version}
+
+    @staticmethod
+    def _profile_conflict(result: Any) -> bool:
+        """Return whether Phase 2 stopped on a profile CAS conflict."""
+        for event in getattr(result, "tool_events", None) or []:
+            detail = str(event.get("detail") or "").lower()
+            if event.get("name") == "dream_memory_set" and "profile_conflict" in detail:
+                return True
+        return "profile_conflict" in str(getattr(result, "error", "") or "").lower()
+
+    @staticmethod
+    def _profile_prompt(snapshot: dict[str, Any] | None) -> str:
+        if snapshot is None:
+            return ""
+        value = snapshot.get("value") or "(no profile is installed)"
+        version = snapshot.get("version")
+        return (
+            "\n## Current Profile\n"
+            f"version={version!r}\n"
+            f"{value}\n"
+        )
+
     async def archive_private(
         self,
         principal: str,
@@ -1160,79 +1291,100 @@ If nothing needs updating, stop without calling tools."""
             raise RuntimeError("automatic private memory tool is not configured")
 
         history_text = MemoryStore._format_messages(messages)
-        phase1_response = await self.provider.chat_with_retry(
-            model=self.model,
-            messages=[
+        for profile_attempt in range(_DREAM_PROFILE_RETRIES):
+            profile_snapshot = await self._read_dream_profile(principal)
+            phase1_response = await self.provider.chat_with_retry(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": self._atomic_operation_phase1_prompt(),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"## Conversation History\n{history_text}"
+                            f"{self._profile_prompt(profile_snapshot)}"
+                        ),
+                    },
+                ],
+                tools=None,
+                tool_choice=None,
+            )
+            if phase1_response.finish_reason != "stop":
+                raise RuntimeError("automatic private memory analysis did not complete")
+            analysis = (phase1_response.content or "").strip()
+            if not analysis:
+                raise RuntimeError("automatic private memory analysis was empty")
+            runner_messages: list[dict[str, Any]] = [
                 {
                     "role": "system",
-                    "content": self._atomic_operation_phase1_prompt(),
+                    "content": self._atomic_operation_phase2_prompt(),
                 },
                 {
                     "role": "user",
-                    "content": f"## Conversation History\n{history_text}",
+                    "content": f"## Analysis Result\n{analysis}",
                 },
-            ],
-            tools=None,
-            tool_choice=None,
-        )
-        analysis = phase1_response.content or ""
-        runner_messages: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": self._atomic_operation_phase2_prompt(),
-            },
-            {
-                "role": "user",
-                "content": f"## Analysis Result\n{analysis}",
-            },
-        ]
+            ]
 
-        turn_context = (
-            self._dream_turn_context()
-            if self._dream_turn_context is not None
-            else nullcontext()
-        )
-        principal_context = (
-            self._dream_batch_context(principal)
-            if self._dream_batch_context is not None
-            else nullcontext()
-        )
-        with turn_context, principal_context:
-            result = await self._runner.run(
-                AgentRunSpec(
-                    initial_messages=runner_messages,
-                    tools=self._tools,
-                    model=self.model,
-                    max_iterations=self.max_iterations,
-                    max_tool_result_chars=self.max_tool_result_chars,
-                    fail_on_tool_error=True,
+            turn_context = (
+                self._dream_turn_context()
+                if self._dream_turn_context is not None
+                else nullcontext()
+            )
+            principal_context = (
+                self._dream_batch_context(principal)
+                if self._dream_batch_context is not None
+                else nullcontext()
+            )
+            profile_context = (
+                self._dream_profile_context(profile_snapshot)
+                if self._dream_profile_context is not None
+                and profile_snapshot is not None
+                else nullcontext()
+            )
+            with turn_context, principal_context, profile_context:
+                result = await self._runner.run(
+                    AgentRunSpec(
+                        initial_messages=runner_messages,
+                        tools=self._tools,
+                        model=self.model,
+                        max_iterations=self.max_iterations,
+                        max_tool_result_chars=self.max_tool_result_chars,
+                        fail_on_tool_error=True,
+                    )
+                )
+
+            if self._profile_conflict(result):
+                if profile_attempt + 1 < _DREAM_PROFILE_RETRIES:
+                    continue
+                raise RuntimeError("automatic private memory profile conflict")
+
+            required_operations = sum(
+                1
+                for line in analysis.splitlines()
+                if line.strip().startswith(("[PROFILE]", "[MEMORY]", "[DELETE]"))
+            )
+            tool_events = result.tool_events or []
+            successful_operations = sum(
+                1
+                for event in tool_events
+                if (
+                    event.get("name") == "dream_memory_set"
+                    and event.get("status") == "ok"
                 )
             )
-
-        required_operations = sum(
-            1
-            for line in analysis.splitlines()
-            if line.strip().startswith(("[PROFILE]", "[MEMORY]", "[DELETE]"))
-        )
-        tool_events = result.tool_events or []
-        successful_operations = sum(
-            1
-            for event in tool_events
             if (
-                event.get("name") == "dream_memory_set"
-                and event.get("status") == "ok"
-            )
-        )
-        if (
-            result.stop_reason != "completed"
-            or result.error
-            or any(event.get("status") != "ok" for event in tool_events)
-            or successful_operations < required_operations
-        ):
-            raise RuntimeError(
-                "automatic private memory operations were not fully applied"
-            )
-        return None
+                result.stop_reason != "completed"
+                or result.error
+                or any(event.get("status") != "ok" for event in tool_events)
+                or successful_operations < required_operations
+            ):
+                raise RuntimeError(
+                    "automatic private memory operations were not fully applied"
+                )
+            return None
+        raise RuntimeError("automatic private memory profile conflict")
 
     # -- skill listing --------------------------------------------------------
 

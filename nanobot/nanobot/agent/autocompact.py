@@ -93,9 +93,15 @@ class AutoCompact:
                     last_active = session.updated_at
                     summary = ""
                     if archive_msgs:
+                        archive_kwargs: dict[str, Any] = {"session_key": key}
+                        route_context = session.metadata.get(
+                            "_private_session_route"
+                        )
+                        if route_context is not None:
+                            archive_kwargs["session_context"] = route_context
                         summary = await self.consolidator.archive(
                             archive_msgs,
-                            session_key=key,
+                            **archive_kwargs,
                         ) or ""
                     if summary and summary != "(nothing)":
                         session.metadata["_last_summary"] = {

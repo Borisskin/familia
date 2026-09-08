@@ -80,6 +80,7 @@ class CronTool(Tool):
         current_actor_getter: Callable[[], str | None] | None = None,
         is_admin_getter: Callable[[str | None], bool] | None = None,
         reachable_tags_getter: Callable[[str | None], set[str]] | None = None,
+        target_actor_getter: Callable[[str, str], str | None] | None = None,
     ):
         self._cron = cron_service
         self._default_timezone = default_timezone
@@ -102,6 +103,9 @@ class CronTool(Tool):
         # tags are stored on jobs but ``cron list``
         # falls back to the legacy ownership-only filter.
         self._reachable_tags_getter = reachable_tags_getter
+        # Resolve the saved delivery route to a principal at job creation;
+        # execution still revalidates the route before private archival.
+        self._target_actor_getter = target_actor_getter
         self._channel: ContextVar[str] = ContextVar("cron_channel", default="")
         self._chat_id: ContextVar[str] = ContextVar("cron_chat_id", default="")
         self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
@@ -249,6 +253,11 @@ class CronTool(Tool):
             return "Error: either every_seconds, cron_expr, or at is required"
 
         creator = self._current_actor_getter() if self._current_actor_getter else None
+        target_actor = (
+            self._target_actor_getter(channel, target_chat_id)
+            if self._target_actor_getter is not None
+            else None
+        )
         # Tag write-side ACL: if a reachable getter is wired, every tag must
         # be in the actor's reachable set. Admin bypass: if is_admin_getter
         # says yes, skip the check.
@@ -280,6 +289,8 @@ class CronTool(Tool):
             delete_after_run=delete_after,
             created_by=creator,
             tags=clean_tags,
+            creator_actor=creator,
+            target_actor=target_actor,
         )
         if clean_tags:
             return f"Created job '{job.name}' (id: {job.id}, теги: {', '.join(clean_tags)})"

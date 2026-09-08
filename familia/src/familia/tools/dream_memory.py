@@ -36,9 +36,11 @@ class DreamMemorySetTool(Tool):
         *,
         ingestor: Any | None = None,
         server_principal_getter: Callable[[], Any] | None = None,
+        profile_version_getter: Callable[[], Any] | None = None,
     ) -> None:
         self._ingestor = ingestor
         self._server_principal_getter = server_principal_getter
+        self._profile_version_getter = profile_version_getter
 
     @property
     def name(self) -> str:
@@ -68,7 +70,9 @@ class DreamMemorySetTool(Tool):
             )
         if extra:
             return "Error: dream_memory_set received unsupported operation fields"
-        if self._ingestor is None or not callable(getattr(self._ingestor, "ingest", None)):
+        if self._ingestor is None or not callable(
+            getattr(self._ingestor, "ingest", None)
+        ):
             return "Error: Dream automatic memory ingestor is not configured"
         if not callable(self._server_principal_getter):
             return "Error: Dream trusted server principal is not configured"
@@ -76,7 +80,10 @@ class DreamMemorySetTool(Tool):
             server_principal = self._server_principal_getter()
         # The configured principal getter is supplied by the host runtime.
         except Exception as exc:  # noqa: BLE001
-            return f"Error: Dream trusted server principal failed ({type(exc).__name__})"
+            return (
+                "Error: Dream trusted server principal failed "
+                f"({type(exc).__name__})"
+            )
         if not isinstance(server_principal, str) or not server_principal:
             return "Error: denied_invalid: Dream private owner is unavailable"
 
@@ -89,11 +96,30 @@ class DreamMemorySetTool(Tool):
             operation["value"] = value
             if fact_id is not None:
                 operation["fact_id"] = fact_id
-        result = await self._ingestor.ingest(
-            server_principal=server_principal,
-            server_topic=None,
-            operation=operation,
+        from familia.tools.memory import _check_memory_write_policy
+
+        policy_key = (
+            f"private:{server_principal}:value:user_profile"
+            if kind == "profile"
+            else f"private:{server_principal}:memory:{fact_id}"
         )
+        policy_error = _check_memory_write_policy(
+            actor=CONSOLIDATOR_ACTOR,
+            full_key=policy_key,
+        )
+        if policy_error:
+            return policy_error
+        ingest_kwargs: dict[str, Any] = {
+            "server_principal": server_principal,
+            "server_topic": None,
+            "operation": operation,
+        }
+        if kind == "profile" and self._profile_version_getter is not None:
+            try:
+                ingest_kwargs["expected_version"] = self._profile_version_getter()
+            except Exception as exc:  # noqa: BLE001
+                return f"Error: profile read context failed ({type(exc).__name__})"
+        result = await self._ingestor.ingest(**ingest_kwargs)
         if isinstance(result, str) and result.startswith(
             ("committed:", "deleted:", "absent:")
         ):

@@ -34,6 +34,10 @@ _dream_principal: ContextVar[str | None] = ContextVar(
     "familia_dream_principal",
     default=None,
 )
+_dream_profile: ContextVar[dict[str, Any] | None] = ContextVar(
+    "familia_dream_profile",
+    default=None,
+)
 
 
 def make_context_extensions(workspace: Any) -> list[Any]:
@@ -103,11 +107,14 @@ def make_agent_loop_kwargs(workspace: Any) -> dict[str, Any]:
             "current_actor_getter": get_current_actor,
             "is_admin_getter": make_admin_check(),
             "reachable_tags_getter": make_reachable_tags_getter(),
+            "target_actor_getter": make_principal_actor_resolver(),
         },
         "dream_tool_installers": make_dream_tool_installers(),
         "dream_turn_context": make_dream_turn_context(),
         "dream_restore_policy": make_dream_restore_policy(),
         "dream_batch_context": make_dream_batch_context(),
+        "dream_profile_reader": make_dream_profile_reader(),
+        "dream_profile_context": make_dream_profile_context(),
     }
 
 
@@ -122,7 +129,17 @@ def make_dream_tool_installers() -> list[Any]:
     """Return familia Dream memory tool installers for nanobot Dream."""
     from familia.nanobot_extension.cron import make_dream_tool_installers as _make
 
-    return _make(server_principal_getter=make_dream_server_context_resolver())
+    return _make(
+        server_principal_getter=make_dream_server_context_resolver(),
+        profile_version_getter=make_dream_profile_version_resolver(),
+    )
+
+
+def make_dream_profile_reader() -> Any:
+    """Return the Familia-owned reader for the current participant profile."""
+    from familia.nanobot_extension.cron import make_dream_profile_reader as _make
+
+    return _make()
 
 
 def make_dream_restore_policy() -> Any:
@@ -192,6 +209,37 @@ def make_dream_batch_context() -> Any:
             _dream_principal.reset(token)
 
     return _scope
+
+
+def make_dream_profile_context() -> Any:
+    """Bind the profile revision used by the active Dream write."""
+
+    @contextmanager
+    def _scope(snapshot: dict[str, Any]):
+        token = _dream_profile.set(snapshot)
+        try:
+            yield
+        finally:
+            _dream_profile.reset(token)
+
+    return _scope
+
+
+def make_dream_profile_version_resolver() -> Any:
+    """Return the revision captured before the active Dream analysis."""
+
+    def _resolve() -> float | None:
+        snapshot = _dream_profile.get()
+        if not isinstance(snapshot, dict):
+            return None
+        version = snapshot.get("version")
+        return (
+            version
+            if isinstance(version, (int, float)) and not isinstance(version, bool)
+            else None
+        )
+
+    return _resolve
 
 
 def make_dream_server_context_resolver() -> Any:
@@ -642,6 +690,18 @@ def make_principal_chat_validator() -> Any:
         return False
 
     return _validate
+
+
+def make_principal_actor_resolver() -> Any:
+    """Return ``(channel, chat_id) -> actor`` for saved cron routes."""
+    from familia.principals import get_registry
+
+    def _resolve(channel: str, chat_id: str) -> str | None:
+        if not channel or not chat_id:
+            return None
+        return get_registry().resolve(channel, str(chat_id))
+
+    return _resolve
 
 
 def apply_heartbeat_defaults(hb_cfg: Any) -> None:

@@ -13,6 +13,7 @@ from familia.acl import codec
 from familia.principals import get_registry
 
 _MAX_CAS_ATTEMPTS = 3
+_UNSET_EXPECTED_VERSION = object()
 _FACT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _SEMANTIC_RESULT_FIELDS = frozenset(
     {"ok", "status", "committed", "updated", "retryable", "version"}
@@ -47,10 +48,12 @@ class PrincipalMemoryIngestor:
         base_url: str,
         api_key: str,
         server_topic_validator: Callable[[str], bool] | None = None,
+        principal_exists: Callable[[str], bool] | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._server_topic_validator = server_topic_validator
+        self._principal_exists = principal_exists
 
     async def ingest(
         self,
@@ -58,11 +61,19 @@ class PrincipalMemoryIngestor:
         server_principal: str,
         server_topic: str | None,
         operation: dict[str, Any],
+        expected_version: float | None | object = _UNSET_EXPECTED_VERSION,
     ) -> str:
+        principal_known = False
+        if isinstance(server_principal, str) and server_principal.strip():
+            principal_known = (
+                self._principal_exists(server_principal)
+                if self._principal_exists is not None
+                else get_registry().get(server_principal) is not None
+            )
         if (
             not isinstance(server_principal, str)
             or not server_principal.strip()
-            or get_registry().get(server_principal) is None
+            or principal_known is not True
         ):
             return "denied_invalid: unknown server principal"
         if not isinstance(operation, dict):
@@ -70,6 +81,16 @@ class PrincipalMemoryIngestor:
 
         kind = operation.get("kind")
         delete = kind == "delete"
+        if expected_version is not _UNSET_EXPECTED_VERSION and kind != "profile":
+            return "denied_invalid: expected profile version is only valid for profile"
+        if expected_version is not _UNSET_EXPECTED_VERSION:
+            try:
+                expected_version = _parse_memx_version(
+                    expected_version,
+                    allow_none=True,
+                )
+            except ValueError:
+                return "denied_invalid: expected profile version is invalid"
         if delete and server_topic is not None:
             return "denied_invalid: delete does not accept server topic"
         if server_topic is not None:
@@ -138,10 +159,10 @@ class PrincipalMemoryIngestor:
                             return "error: memX returned a non-JSON current record"
 
                     if current_payload is None:
-                        expected_ts: float | None = None
+                        current_ts: float | None = None
                     elif isinstance(current_payload, dict):
                         try:
-                            expected_ts = _parse_memx_version(
+                            current_ts = _parse_memx_version(
                                 current_payload.get("ts"),
                                 allow_none=False,
                             )
@@ -149,6 +170,13 @@ class PrincipalMemoryIngestor:
                             return "error: memX current record has invalid ts"
                     else:
                         return "error: memX current record is invalid"
+
+                    if expected_version is not _UNSET_EXPECTED_VERSION:
+                        if current_ts != expected_version:
+                            return "profile_conflict: profile changed during analysis"
+                        expected_ts = expected_version
+                    else:
+                        expected_ts = current_ts
 
                     write_payload: dict[str, Any] = {"key": full_key}
                     if delete:
@@ -248,11 +276,15 @@ class PrincipalMemoryIngestor:
                         and payload.get("updated") is False
                         and payload.get("retryable") is True
                     ):
+                        if expected_version is not _UNSET_EXPECTED_VERSION:
+                            return "profile_conflict: memX conditional profile commit conflict"
                         continue
                     return "error: memX did not confirm the conditional commit"
         except httpx.HTTPError as exc:
             return f"error: memX unreachable ({type(exc).__name__}: {exc})"
 
+        if expected_version is not _UNSET_EXPECTED_VERSION:
+            return "profile_conflict: memX conditional profile commit failed"
         return (
             "retryable_failure: memX conditional commit failed after "
             f"{_MAX_CAS_ATTEMPTS} attempts"

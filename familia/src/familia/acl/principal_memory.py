@@ -24,15 +24,18 @@ a fallback path in ContextBuilder.
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 from loguru import logger
 
 from familia.acl import codec, graph_io
 from familia.acl.graph_io import GraphIOError, get_raw, set_raw
+from familia.memx_client import memx_base_url
 
 _FAMILY_RELATIONS = frozenset(
     {
@@ -417,6 +420,50 @@ class PrincipalMemoryClient:
             logger.warning("principal_memory.get({}): {}", suffix, exc)
             return None
         return _coerce_to_str(raw)
+
+    async def get_profile_snapshot(self) -> dict[str, Any]:
+        """Read this principal's profile and memX revision atomically enough for CAS."""
+        url = f"{memx_base_url().rstrip('/')}/get"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    url,
+                    headers={"x-api-key": self._api_key},
+                    params={"key": self._own_key("value:user_profile")},
+                )
+        except httpx.HTTPError as exc:
+            raise GraphIOError(
+                f"principal profile read failed ({type(exc).__name__})"
+            ) from exc
+        if response.status_code == 404:
+            return {"value": None, "version": None}
+        if response.status_code >= 400:
+            raise GraphIOError(
+                f"principal profile read returned status {response.status_code}"
+            )
+        try:
+            payload = response.json()
+        except (TypeError, ValueError) as exc:
+            raise GraphIOError("principal profile read returned non-JSON data") from exc
+        if payload is None:
+            return {"value": None, "version": None}
+        if not isinstance(payload, dict) or set(payload) < {"value", "ts"}:
+            raise GraphIOError("principal profile read returned an invalid record")
+        value = payload.get("value")
+        version = payload.get("ts")
+        if value is not None and not isinstance(value, str):
+            raise GraphIOError("principal profile read returned an invalid value")
+        if not isinstance(version, (int, float)) or isinstance(version, bool):
+            raise GraphIOError("principal profile read returned an invalid version")
+        try:
+            version = float(version)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise GraphIOError(
+                "principal profile read returned an invalid version"
+            ) from exc
+        if not math.isfinite(version):
+            raise GraphIOError("principal profile read returned an invalid version")
+        return {"value": value, "version": version}
 
     def set(self, suffix: str, value: str) -> None:
         """Write own ``private:<self.principal_id>:<suffix>`` value.

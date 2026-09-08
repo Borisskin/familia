@@ -58,6 +58,44 @@ async def test_private_session_key_resolves_exact_owner(
 
 
 @pytest.mark.asyncio
+async def test_cron_route_resolves_saved_recipient_owner(resolver) -> None:
+    result = await resolver(
+        "cron:job-1",
+        [{"role": "user", "actor": "principal_alpha", "content": "run"}],
+        {
+            "channel": "telegram",
+            "chat_id": "1001|alice",
+            "target_actor": "principal_alpha",
+        },
+    )
+
+    assert result == "principal_alpha"
+
+
+@pytest.mark.asyncio
+async def test_cron_route_never_substitutes_creator_for_mismatched_recipient(
+    resolver,
+) -> None:
+    result = await resolver(
+        "cron:job-2",
+        [{"role": "user", "actor": "principal_alpha", "content": "run"}],
+        {
+            "channel": "telegram",
+            "chat_id": "1001|alice",
+            "target_actor": "principal_beta",
+            "creator_actor": "principal_beta",
+        },
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_cron_route_without_proof_has_no_owner(resolver) -> None:
+    assert await resolver("cron:job-3", [], None) is None
+
+
+@pytest.mark.asyncio
 async def test_other_user_actor_returns_no_owner(resolver) -> None:
     result = await resolver(
         "telegram:1001",

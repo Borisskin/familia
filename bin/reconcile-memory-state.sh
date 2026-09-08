@@ -5,8 +5,10 @@
 set -euo pipefail
 
 SNAPSHOT=""
-TARGET=""
-SOURCE_ROOT=""
+INSTALL_ROOT=""
+WORKSPACE=""
+PRINCIPALS=""
+TARGET_CONFIG=""
 MANIFEST=""
 JOURNAL=""
 CLASSIFICATIONS=""
@@ -14,17 +16,19 @@ APPLY=false
 JSON=false
 
 usage() {
-    echo "usage: $0 --snapshot DIR --target DIR --manifest FILE --journal FILE [--source-root DIR] [--classifications FILE] [--apply] [--json]" >&2
+    echo "usage: $0 --snapshot DIR --install-root DIR --workspace DIR --principals FILE --target-config FILE --manifest FILE --journal FILE [--classifications FILE] [--apply] [--json]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --snapshot|--target|--source-root|--manifest|--journal|--classifications)
+        --snapshot|--install-root|--workspace|--principals|--target-config|--manifest|--journal|--classifications)
             [[ $# -ge 2 ]] || { usage; exit 2; }
             case "$1" in
                 --snapshot) SNAPSHOT="$2" ;;
-                --target) TARGET="$2" ;;
-                --source-root) SOURCE_ROOT="$2" ;;
+                --install-root) INSTALL_ROOT="$2" ;;
+                --workspace) WORKSPACE="$2" ;;
+                --principals) PRINCIPALS="$2" ;;
+                --target-config) TARGET_CONFIG="$2" ;;
                 --manifest) MANIFEST="$2" ;;
                 --journal) JOURNAL="$2" ;;
                 --classifications) CLASSIFICATIONS="$2" ;;
@@ -39,7 +43,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$SNAPSHOT" || -z "$TARGET" || -z "$MANIFEST" || -z "$JOURNAL" ]]; then
+if [[ -z "$SNAPSHOT" || -z "$INSTALL_ROOT" || -z "$WORKSPACE" || -z "$PRINCIPALS" || -z "$TARGET_CONFIG" || -z "$MANIFEST" || -z "$JOURNAL" ]]; then
     echo "migration=refused reason=required_paths_missing" >&2
     exit 2
 fi
@@ -47,11 +51,13 @@ fi
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 ARGS=(
     --snapshot "$SNAPSHOT"
-    --target "$TARGET"
+    --install-root "$INSTALL_ROOT"
+    --workspace "$WORKSPACE"
+    --principals "$PRINCIPALS"
+    --target-config "$TARGET_CONFIG"
     --manifest "$MANIFEST"
     --journal "$JOURNAL"
 )
-[[ -z "$SOURCE_ROOT" ]] || ARGS+=(--source-root "$SOURCE_ROOT")
 [[ -z "$CLASSIFICATIONS" ]] || ARGS+=(--classifications "$CLASSIFICATIONS")
 [[ "$APPLY" != true ]] || ARGS+=(--apply)
 [[ "$JSON" != true ]] || ARGS+=(--json)

@@ -11,6 +11,23 @@
 
 set -euo pipefail
 
+normalize_diff_headers() {
+    sed \
+        -e "/^diff --git /s|^diff --git a/up/|diff --git a/|" \
+        -e "/^diff --git /s|^diff --git a/current/|diff --git a/|" \
+        -e "/^diff --git /s| b/up/| b/|" \
+        -e "/^diff --git /s| b/current/| b/|" \
+        -e "/^--- /s|^--- a/up/|--- a/|" \
+        -e "/^--- /s|^--- a/current/|--- a/|" \
+        -e "/^+++ /s|^+++ b/up/|+++ b/|" \
+        -e "/^+++ /s|^+++ b/current/|+++ b/|"
+}
+
+if [[ "${NORMALIZE_HEADERS_ONLY:-}" == "1" ]]; then
+    normalize_diff_headers
+    exit 0
+fi
+
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 UPSTREAM_VERSION="${UPSTREAM_VERSION:-0.1.5.post2}"
 UPSTREAM="${UPSTREAM:-950dddec499fbbe0353e997158c99808f0bb41e1}"
@@ -25,11 +42,6 @@ fi
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-if tmp_win="$(cd "$tmp" && pwd -W 2>/dev/null)"; then
-    tmp_win="$(printf '%s' "$tmp_win" | tr '\\' '/')"
-else
-    tmp_win="$tmp"
-fi
 
 mkdir -p "$tmp/up/raw" "$tmp/up/nanobot/nanobot" "$tmp/current/nanobot"
 git -c "safe.directory=$UPSTREAM_REPO" -C "$UPSTREAM_REPO" archive "$UPSTREAM" nanobot pyproject.toml README.md \
@@ -65,31 +77,24 @@ emit_patch() {
     name="$(patch_name_for "$rel")"
     local left="$tmp/up/nanobot/$rel"
     local right="$tmp/current/nanobot/$rel"
+    local left_rel="up/nanobot/$rel"
+    local right_rel="current/nanobot/$rel"
 
     if [[ -f "$left" && -f "$right" ]]; then
-        diff_args=("$left" "$right")
+        diff_args=("$left_rel" "$right_rel")
     elif [[ -f "$left" ]]; then
-        diff_args=("$left" /dev/null)
+        diff_args=("$left_rel" /dev/null)
     else
-        diff_args=(/dev/null "$right")
+        diff_args=(/dev/null "$right_rel")
     fi
 
-    {
+    (
+        cd "$tmp"
         echo "# nanobot baseline: $UPSTREAM_VERSION"
         echo "# upstream commit: $UPSTREAM"
         echo
         git diff --no-index "${diff_args[@]}" 2>/dev/null || true
-    } \
-        | sed \
-            -e "s|$tmp/up/|a/|g" \
-            -e "s|$tmp/current/|b/|g" \
-            -e "s|$tmp_win/up/|a/|g" \
-            -e "s|$tmp_win/current/|b/|g" \
-            -e "s|a/a/|a/|g" \
-            -e "s|b/b/|b/|g" \
-            -e "s|a/b/|a/|g" \
-            -e "s|b/a/|b/|g" \
-        > "patches/$name"
+    ) | normalize_diff_headers > "patches/$name"
     echo "  patches/$name"
 }
 

@@ -27,6 +27,157 @@ class _RecordingIngestor:
         return "committed:private:alice:memory:legacy-history"
 
 
+def _write_target_config(
+    target_root: Path,
+    workspace: Path,
+    principals: Path,
+) -> Path:
+    config_path = target_root / "target-config.json"
+    config = {
+        "schema_version": "1.0.0",
+        "isolation_id": "synthetic-target",
+        "install_root": str(target_root.resolve()),
+        "workspace": str(workspace.resolve()),
+        "principals": str(principals.resolve()),
+        "runner": {
+            "name": "runner",
+            "id": "a" * 64,
+            "image_digest": "sha256:" + "1" * 64,
+            "install_mount": {
+                "name": "runner-volume",
+                "id": "runner-volume",
+                "destination": "/work",
+            },
+        },
+        "memx": {
+            "name": "memx",
+            "id": "b" * 64,
+            "image_digest": "sha256:" + "2" * 64,
+            "base_url": "http://memx:8000",
+            "api_key": "synthetic-key",
+            "redis_env": "REDIS_URL",
+            "redis_url": "redis://redis:6379/0",
+        },
+        "redis": {
+            "name": "redis",
+            "id": "c" * 64,
+            "image_digest": "sha256:" + "3" * 64,
+            "storage_volume": {"name": "redis-volume", "id": "redis-volume"},
+            "storage_destination": "/data",
+            "port": 6379,
+            "database": 0,
+        },
+        "network": {
+            "name": "familia-internal",
+            "id": "d" * 64,
+        },
+        "model": {
+            "provider": "synthetic",
+            "name": "synthetic-model",
+            "config_path": str((target_root / "model.json").resolve()),
+        },
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    return config_path
+
+
+def _docker_target_objects() -> dict[str, dict[str, object]]:
+    labels = {"familia.target": "synthetic-target"}
+    network_id = "d" * 64
+    ids = {"runner": "a" * 64, "memx": "b" * 64, "redis": "c" * 64}
+    objects: dict[str, dict[str, object]] = {}
+    for section, image in (
+        ("runner", "sha256:" + "1" * 64),
+        ("memx", "sha256:" + "2" * 64),
+        ("redis", "sha256:" + "3" * 64),
+    ):
+        env = ["REDIS_URL=redis://redis:6379/0"] if section == "memx" else []
+        mounts = (
+            [{"Type": "volume", "Name": "runner-volume", "Destination": "/work", "RW": True}]
+            if section == "runner"
+            else (
+                [{"Type": "volume", "Name": "redis-volume", "Destination": "/data", "RW": True}]
+                if section == "redis"
+                else []
+            )
+        )
+        objects[f"container:{section}"] = {
+            "Id": ids[section],
+            "Name": "/" + section,
+            "Image": image,
+            "State": {"Running": True},
+            "Config": {"Labels": labels, "Env": env},
+            "NetworkSettings": {
+                "Networks": {
+                    "familia-internal": {
+                        "NetworkID": network_id,
+                        "Aliases": [section],
+                    }
+                }
+            },
+            "Mounts": mounts,
+        }
+    objects["network:familia-internal"] = {
+        "Id": network_id,
+        "Name": "familia-internal",
+        "Internal": True,
+        "Labels": labels,
+        "Containers": {value: {} for value in ids.values()},
+    }
+    objects["volume:runner-volume"] = {
+        "Name": "runner-volume",
+        "Id": "runner-volume",
+        "Labels": labels,
+    }
+    objects["volume:redis-volume"] = {
+        "Name": "redis-volume",
+        "Id": "redis-volume",
+        "Labels": labels,
+    }
+    return objects
+
+
+def test_f2_registry_is_explicit_and_missing_registry_refuses(tmp_path: Path) -> None:
+    install_root = tmp_path / "install"
+    workspace = install_root / "workspace"
+    workspace.mkdir(parents=True)
+    from familia.memory_migration import MigrationPreflightError, _load_known_actors
+
+    with pytest.raises(MigrationPreflightError, match="principals registry"):
+        _load_known_actors(install_root / "principals.json")
+
+    principals = install_root / "principals.json"
+    principals.write_text("{broken", encoding="utf-8")
+    with pytest.raises((MigrationPreflightError, json.JSONDecodeError)):
+        _load_known_actors(principals)
+
+
+def test_f2_docker_proof_binds_runner_memx_redis_and_internal_storage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target_root = tmp_path / "isolated"
+    workspace = target_root / "state" / "files"
+    principals = workspace / "principals.json"
+    workspace.mkdir(parents=True)
+    config_path = _write_target_config(target_root, workspace, principals)
+    config = memory_migration._target_config(
+        config_path, target_root.resolve(), workspace.resolve(), principals.resolve()
+    )
+    objects = _docker_target_objects()
+    monkeypatch.setattr(
+        memory_migration,
+        "_docker_inspect",
+        lambda kind, reference: objects[f"{kind}:{reference}"],
+    )
+    monkeypatch.setattr(memory_migration.socket, "gethostname", lambda: "a" * 12)
+    memory_migration._docker_verify_target(config)
+
+    objects["network:familia-internal"]["Internal"] = False
+    with pytest.raises(memory_migration.MigrationPreflightError, match="internal"):
+        memory_migration._docker_verify_target(config)
+
+
 def test_obsolete_isolated_migration_api_is_absent() -> None:
     obsolete_symbols = {
         "MIGRATION_SCHEMA_VERSION",
@@ -194,10 +345,12 @@ def test_isolated_cli_is_only_a_canonical_transition_shell(tmp_path: Path) -> No
         json.dumps({"target_id": "isolated-test"}),
         encoding="utf-8",
     )
-    (workspace / "principals.json").write_text(
-        json.dumps({"principals": [{"id": "alice"}]}),
+    principals_path = workspace / "principals.json"
+    principals_path.write_text(
+        json.dumps({"principals": [{"id": "alice", "memx_key": "alice-key"}]}),
         encoding="utf-8",
     )
+    target_config = _write_target_config(target_root, workspace, principals_path)
 
     flat_paths = (
         workspace / "USER.md",
@@ -267,6 +420,7 @@ def test_isolated_cli_is_only_a_canonical_transition_shell(tmp_path: Path) -> No
         ),
         patch.object(Path, "read_bytes", new=read_history_only),
         patch.object(memory_migration, "validate_migration_preflight"),
+        patch.object(memory_migration, "_docker_verify_target"),
         patch.object(
             memory_migration,
             "build_legacy_transition_plan",
@@ -287,6 +441,7 @@ def test_isolated_cli_is_only_a_canonical_transition_shell(tmp_path: Path) -> No
             return_value=ingestor,
         ) as ingestor_type,
         patch("familia.acl.graph_io.get_raw", return_value=None) as get_value,
+        patch.object(memory_migration, "_target_get_raw", return_value=get_value),
         patch("familia.acl.graph_io.resolve_admin_key", return_value="admin-key"),
         patch("familia.memx_client.memx_base_url", return_value="http://memx.test"),
     ):
@@ -294,10 +449,14 @@ def test_isolated_cli_is_only_a_canonical_transition_shell(tmp_path: Path) -> No
             [
                 "--snapshot",
                 str(snapshot_root),
-                "--target",
+                "--install-root",
                 str(target_root),
-                "--source-root",
+                "--workspace",
                 str(workspace),
+                "--principals",
+                str(principals_path),
+                "--target-config",
+                str(target_config),
                 "--manifest",
                 str(target_root / "migration-plan.json"),
                 "--journal",
@@ -335,10 +494,11 @@ def test_isolated_cli_is_only_a_canonical_transition_shell(tmp_path: Path) -> No
         if action["component"] == "history"
     } == {"memory/history.jsonl"}
 
-    ingestor_type.assert_called_once_with(
-        base_url="http://memx.test",
-        api_key="admin-key",
-    )
+    ingestor_type.assert_called_once()
+    ingestor_kwargs = ingestor_type.call_args.kwargs
+    assert ingestor_kwargs["base_url"] == "http://memx:8000"
+    assert ingestor_kwargs["api_key"] == "synthetic-key"
+    assert ingestor_kwargs["principal_exists"]("alice") is True
     assert len(ingestor.calls) == 1
     assert history_path.resolve() in observed_reads
     assert forbidden_reads.isdisjoint(observed_reads)
@@ -362,10 +522,12 @@ def _run_stubbed_apply_cli(
         json.dumps({"target_id": "isolated-test"}),
         encoding="utf-8",
     )
-    (workspace / "principals.json").write_text(
-        json.dumps({"principals": [{"id": "alice"}]}),
+    principals_path = workspace / "principals.json"
+    principals_path.write_text(
+        json.dumps({"principals": [{"id": "alice", "memx_key": "alice-key"}]}),
         encoding="utf-8",
     )
+    target_config = _write_target_config(target_root, workspace, principals_path)
     plan = {
         "status": "ready",
         "actions": [
@@ -378,10 +540,14 @@ def _run_stubbed_apply_cli(
     argv = [
         "--snapshot",
         str(snapshot_root),
-        "--target",
+        "--install-root",
         str(target_root),
-        "--source-root",
+        "--workspace",
         str(workspace),
+        "--principals",
+        str(principals_path),
+        "--target-config",
+        str(target_config),
         "--manifest",
         str(target_root / "migration-plan.json"),
         "--journal",
@@ -397,6 +563,7 @@ def _run_stubbed_apply_cli(
             return_value={"snapshot_id": "a" * 64},
         ),
         patch.object(memory_migration, "validate_migration_preflight"),
+        patch.object(memory_migration, "_docker_verify_target"),
         patch.object(
             memory_migration,
             "build_legacy_transition_plan",
@@ -412,8 +579,6 @@ def _run_stubbed_apply_cli(
             return_value=object(),
         ),
         patch("familia.acl.graph_io.get_raw", return_value=None),
-        patch("familia.acl.graph_io.resolve_admin_key", return_value="admin-key"),
-        patch("familia.memx_client.memx_base_url", return_value="http://memx.test"),
     ):
         return memory_migration.cli(argv)
 
@@ -431,10 +596,12 @@ def test_both_migration_cli_json_boundaries_match_release_schema(
         json.dumps({"target_id": "isolated-test"}),
         encoding="utf-8",
     )
-    (workspace / "principals.json").write_text(
-        json.dumps({"principals": [{"id": "alice"}]}),
+    principals_path = workspace / "principals.json"
+    principals_path.write_text(
+        json.dumps({"principals": [{"id": "alice", "memx_key": "alice-key"}]}),
         encoding="utf-8",
     )
+    target_config = _write_target_config(target_root, workspace, principals_path)
     plan = memory_migration.build_legacy_transition_plan(
         workspace=workspace,
         known_actors={"alice"},
@@ -461,10 +628,14 @@ def test_both_migration_cli_json_boundaries_match_release_schema(
         argv = [
             "--snapshot",
             str(snapshot_root),
-            "--target",
+            "--install-root",
             str(target_root),
-            "--source-root",
+            "--workspace",
             str(workspace),
+            "--principals",
+            str(principals_path),
+            "--target-config",
+            str(target_config),
             "--manifest",
             str(target_root / "migration-plan.json"),
             "--journal",
@@ -480,6 +651,7 @@ def test_both_migration_cli_json_boundaries_match_release_schema(
                 return_value={"snapshot_id": "a" * 64},
             ),
             patch.object(memory_migration, "validate_migration_preflight"),
+            patch.object(memory_migration, "_docker_verify_target"),
             patch.object(
                 memory_migration,
                 "build_legacy_transition_plan",

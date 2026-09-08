@@ -254,7 +254,7 @@ def test_add_with_reachable_tags_persists_with_tags_field(svc):
                tags=["child", "school"])
     assert "Created job" in out
     [job] = svc.list_jobs()
-    assert sorted(job.payload.tags) == ["school", "child"]
+    assert sorted(job.payload.tags) == ["child", "school"]
 
 
 def test_list_filters_by_tag_intersection(svc):

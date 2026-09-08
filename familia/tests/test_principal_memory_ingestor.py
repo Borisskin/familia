@@ -475,6 +475,57 @@ async def test_ingestor_uses_server_principal_and_conditional_semantic_write(
 
 
 @pytest.mark.asyncio
+async def test_ingestor_profile_uses_captured_version_without_stale_retry(
+    principal_registry: PrincipalRegistry,
+) -> None:
+    ingestor = _ingestor_class()(
+        base_url="http://mock-memx:8000",
+        api_key="automatic-writer-key",
+    )
+    with patch("familia.principal_memory_ingestor.httpx.AsyncClient") as client_cls:
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=_response({"value": "old", "ts": 41.0}))
+        client.post = AsyncMock(return_value=_committed_response())
+        client_cls.return_value.__aenter__.return_value = client
+
+        result = await ingestor.ingest(
+            server_principal="member_a",
+            server_topic=None,
+            operation={"kind": "profile", "value": "new"},
+            expected_version=41.0,
+        )
+
+    assert result.startswith("committed:")
+    client.get.assert_awaited_once()
+    assert client.post.await_args.kwargs["json"]["expected_ts"] == 41.0
+
+
+@pytest.mark.asyncio
+async def test_ingestor_profile_conflict_never_reuses_stale_value(
+    principal_registry: PrincipalRegistry,
+) -> None:
+    ingestor = _ingestor_class()(
+        base_url="http://mock-memx:8000",
+        api_key="automatic-writer-key",
+    )
+    with patch("familia.principal_memory_ingestor.httpx.AsyncClient") as client_cls:
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=_response({"value": "newer", "ts": 42.0}))
+        client.post = AsyncMock()
+        client_cls.return_value.__aenter__.return_value = client
+
+        result = await ingestor.ingest(
+            server_principal="member_a",
+            server_topic=None,
+            operation={"kind": "profile", "value": "stale"},
+            expected_version=41.0,
+        )
+
+    assert result.startswith("profile_conflict:")
+    client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_ingestor_stores_two_memory_facts_as_two_atomic_keys(
     principal_registry: PrincipalRegistry,
 ) -> None:

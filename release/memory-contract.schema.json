@@ -314,6 +314,7 @@
         "supported_sources",
         "automatic_destination",
         "owner_resolver",
+        "unowned_cron_destination",
         "archive_sink",
         "retry",
         "session_serialization",
@@ -323,21 +324,26 @@
         "supported_sources": {
           "const": [
             "vk_private",
-            "telegram_private"
+            "telegram_private",
+            "cron_service"
           ]
         },
         "automatic_destination": {
-          "const": "private_owner_untagged"
+          "const": "private_owner_untagged_when_proven"
         },
         "owner_resolver": {
           "const": {
             "input": [
               "session_key",
-              "messages"
+              "messages",
+              "session_context"
             ],
             "result": "principal_or_none",
             "before_model": true
           }
+        },
+        "unowned_cron_destination": {
+          "const": "service_session_only"
         },
         "archive_sink": {
           "const": {

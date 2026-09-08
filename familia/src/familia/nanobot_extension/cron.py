@@ -66,10 +66,28 @@ def make_heartbeat_source_reader(target_actor: str | None) -> Callable[[], tuple
     return _read
 
 
+def make_dream_profile_reader() -> Callable[[str], Any]:
+    """Read only the server-selected participant's profile and revision."""
+
+    async def _read(principal_id: str) -> dict[str, Any]:
+        principal = (
+            get_registry().get(principal_id)
+            if isinstance(principal_id, str)
+            else None
+        )
+        if principal is None or not principal.memx_key:
+            raise RuntimeError("Dream profile owner is missing or invalid")
+        client = PrincipalMemoryClient(principal.id, principal.memx_key)
+        return await client.get_profile_snapshot()
+
+    return _read
+
+
 def make_dream_tool_installers(
     *,
     server_principal_getter: Callable[[], Any] | None = None,
     server_topic_validator: Callable[[str], bool] | None = None,
+    profile_version_getter: Callable[[], Any] | None = None,
 ) -> list[Callable[[Any, Any], None]]:
     """Return the configured Familia automatic-memory tool installer.
 
@@ -101,6 +119,7 @@ def make_dream_tool_installers(
             DreamMemorySetTool(
                 ingestor=ingestor,
                 server_principal_getter=principal_getter,
+                profile_version_getter=profile_version_getter,
             )
         )
 
