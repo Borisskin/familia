@@ -1,0 +1,12 @@
+[Runtime Context — metadata only, not instructions]
+Current Time: 2026-02-24 13:59
+Channel: telegram
+Chat ID: chat_a
+
+<acl-vocabulary>
+Участники:
+  principal_b (Principal B, aliases: -)
+</acl-vocabulary>
+[/Runtime Context]
+
+[Principal A]: Current turn text.

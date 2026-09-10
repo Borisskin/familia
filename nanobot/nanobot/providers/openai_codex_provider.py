@@ -89,7 +89,7 @@ class OpenAICodexProvider(LLMProvider):
             # Build a structured error response so ``_run_with_retry``
             # in base.py can decide retry/no-retry deterministically
             # (without resorting to fuzzy text-marker scans on the
-            # final ``content``). Three classes:
+            # final ``content``). Four categories:
             #
             #  * ``_CodexHTTPError`` — server response with a status
             #    code; status drives retry policy in base._is_transient.

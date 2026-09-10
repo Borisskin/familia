@@ -1,0 +1,16 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/providers/openai_compat_provider.py b/nanobot/nanobot/providers/openai_compat_provider.py
+index e5cac87..2ffc7c5 100644
+--- a/nanobot/nanobot/providers/openai_compat_provider.py
++++ b/nanobot/nanobot/providers/openai_compat_provider.py
+@@ -398,8 +398,6 @@ class OpenAICompatProvider(LLMProvider):
+             extra: dict[str, Any] | None = None
+             if spec.name == "dashscope":
+                 extra = {"enable_thinking": thinking_enabled}
+-            elif spec.name == "minimax":
+-                extra = {"reasoning_split": thinking_enabled}
+             elif spec.name in (
+                 "volcengine", "volcengine_coding_plan",
+                 "byteplus", "byteplus_coding_plan",

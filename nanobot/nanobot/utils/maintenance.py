@@ -1,8 +1,7 @@
 """Background maintenance utilities for the nanobot runtime.
 
-Three system jobs are registered at gateway start (see
-``register_maintenance_system_jobs``); each is dispatched through the
-existing cron service:
+System jobs are registered by the gateway startup path; each is
+dispatched through the existing cron service:
 
 * ``media_cleanup`` — hourly. Drops media files in ``~/.nanobot/media/``
   whose mtime is older than ``MEDIA_TTL_SECONDS`` (default 24 h). Media
@@ -107,10 +106,10 @@ def cleanup_media(ttl_seconds: int = MEDIA_TTL_SECONDS) -> tuple[int, int]:
 def cleanup_sessions(ttl_seconds: int = SESSIONS_TTL_SECONDS) -> tuple[int, int]:
     """Delete ``workspace/sessions/*.jsonl`` files unmodified for *ttl*.
 
-    A 90-day-quiet sender is exceedingly likely to have left the
-    family or moved to a different channel; their old session file is
-    no longer informative. If they do come back, a fresh session is
-    created automatically — same effect as a brand-new chat.
+    A 90-day-quiet sender is likely to have stopped using the current
+    channel or moved to a different one; their old session file is no
+    longer informative. If they do come back, a fresh session is created
+    automatically — same effect as a brand-new chat.
 
     Returns ``(files_deleted, bytes_freed)``.
     """
@@ -192,12 +191,18 @@ def disk_usage_report() -> dict:
     data_dir = get_data_dir()
     workspace = get_workspace_path()
 
+    audit_file = (
+        os.environ.get("NANOBOT_AUDIT_FILE")
+        or os.environ.get("FAMILIA_AUDIT_FILE")
+        or str(data_dir / "audit.jsonl")
+    )
+
     categories = [
         ("media", get_media_dir()),
         ("sessions", workspace / "sessions"),
         ("memory", workspace / "memory"),
         ("workspace_git", workspace / ".git"),
-        ("audit", Path(os.environ.get("FAMILIA_AUDIT_FILE", str(data_dir / "audit.jsonl")))),
+        ("audit", Path(audit_file)),
         ("cron", workspace / "cron"),
         ("logs", data_dir / "logs"),
     ]

@@ -1,0 +1,117 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/runtime_adapters.py b/nanobot/nanobot/runtime_adapters.py
+new file mode 100644
+index 0000000..54c4c6e
+--- /dev/null
++++ b/nanobot/nanobot/runtime_adapters.py
+@@ -0,0 +1,108 @@
++"""Discover optional runtime adapter providers through neutral entry points."""
++
++from __future__ import annotations
++
++from functools import lru_cache
++from importlib.metadata import entry_points
++from pathlib import Path
++from typing import Any
++
++from loguru import logger
++
++_ENTRY_POINT_GROUP = "nanobot.runtime_adapters"
++
++
++@lru_cache
++def _load_adapters() -> tuple[Any, ...]:
++    adapters: list[Any] = []
++    for ep in entry_points(group=_ENTRY_POINT_GROUP):
++        try:
++            adapters.append(ep.load())
++        except Exception as exc:
++            logger.warning("Failed to load runtime adapter '{}': {}", ep.name, exc)
++    return tuple(adapters)
++
++
++def _call(adapter: Any, method_name: str, *args: Any) -> Any:
++    method = getattr(adapter, method_name, None)
++    if not callable(method):
++        return None
++    # Adapter method failures are real runtime failures, not "adapter absent".
++    # Let callers fail closed instead of silently falling back to legacy paths.
++    return method(*args)
++
++
++def _merge_kwargs(items: list[dict[str, Any]]) -> dict[str, Any]:
++    merged: dict[str, Any] = {}
++    for kwargs in items:
++        for key, value in kwargs.items():
++            if key in merged and isinstance(merged[key], list) and isinstance(value, list):
++                merged[key].extend(value)
++            elif key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
++                merged[key].update(value)
++            else:
++                merged[key] = value
++    return merged
++
++
++def make_agent_loop_kwargs(workspace: Path) -> dict[str, Any]:
++    """Return adapter kwargs for AgentLoop without importing product packages directly."""
++    items = [
++        kwargs
++        for adapter in _load_adapters()
++        if isinstance((kwargs := _call(adapter, "make_agent_loop_kwargs", workspace)), dict)
++    ]
++    return _merge_kwargs(items)
++
++
++def make_channel_manager_kwargs() -> dict[str, Any]:
++    """Return adapter kwargs for ChannelManager."""
++    items = [
++        kwargs
++        for adapter in _load_adapters()
++        if isinstance((kwargs := _call(adapter, "make_channel_manager_kwargs")), dict)
++    ]
++    return _merge_kwargs(items)
++
++
++def make_callback_handlers(bus: Any) -> list[Any]:
++    """Return callback handlers provided by installed runtime adapters."""
++    handlers: list[Any] = []
++    for adapter in _load_adapters():
++        result = _call(adapter, "make_callback_handlers", bus)
++        if isinstance(result, list):
++            handlers.extend(result)
++    return handlers
++
++
++def resolve_heartbeat_target(
++    target_actor: str,
++    enabled_channels: set[str],
++) -> tuple[str, str] | None:
++    """Resolve heartbeat target through the first adapter that owns it."""
++    for adapter in _load_adapters():
++        result = _call(adapter, "resolve_heartbeat_target", target_actor, enabled_channels)
++        if result is not None:
++            return result
++    return None
++
++
++def apply_heartbeat_defaults(hb_cfg: Any) -> None:
++    """Let installed adapters fill heartbeat defaults."""
++    for adapter in _load_adapters():
++        _call(adapter, "apply_heartbeat_defaults", hb_cfg)
++
++
++def make_heartbeat_source_reader(target_actor: str | None) -> Any:
++    """Return a heartbeat source reader from the first adapter that provides one."""
++    for adapter in _load_adapters():
++        result = _call(adapter, "make_heartbeat_source_reader", target_actor)
++        if result is not None:
++            return result
++    return None
++
++
++def reload_runtime_registry() -> None:
++    """Reload mutable adapter registry state during gateway hot reload."""
++    for adapter in _load_adapters():
++        _call(adapter, "reload_runtime_registry")

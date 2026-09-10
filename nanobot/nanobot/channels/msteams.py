@@ -274,7 +274,7 @@ class MSTeamsChannel(BaseChannel):
                 logger.debug("MSTeams ignoring empty message after Teams text sanitization")
                 return
 
-        if self.should_drop_inbound(sender_id):
+        if await self.should_drop_inbound(sender_id):
             logger.warning(
                 "Access denied for sender {} on channel {}. "
                 "Add them to allowFrom list in config to grant access.",

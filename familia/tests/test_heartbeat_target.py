@@ -161,3 +161,127 @@ def test_validator_rejects_empty_inputs(registry):
     validate = familia_bootstrap.make_principal_chat_validator()
     assert validate("", "1000001") is False
     assert validate("vk", "") is False
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_execution_sets_and_restores_target_actor(
+    monkeypatch: pytest.MonkeyPatch,
+    registry: PrincipalRegistry,
+    tmp_path,
+) -> None:
+    from familia.nanobot_extension import cron
+    from familia.principals import get_current_actor, set_current_actor
+    from nanobot.heartbeat.service import HeartbeatService
+
+    class _Client:
+        def __init__(self, actor_id: str, memx_key: str) -> None:
+            assert (actor_id, memx_key) == ("member_a", "k2")
+
+        def get(self, key: str) -> str:
+            assert key == "value:heartbeat"
+            return "check calendar"
+
+    monkeypatch.setattr(cron, "PrincipalMemoryClient", _Client)
+    reader = cron.make_heartbeat_source_reader("member_a")
+    observed: list[str | None] = []
+
+    async def _execute(tasks: str) -> str:
+        assert tasks == "calendar task"
+        observed.append(get_current_actor())
+        return "done"
+
+    async def _decide(_content: str) -> tuple[str, str]:
+        return "run", "calendar task"
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=object(),
+        model="test",
+        on_execute=_execute,
+        source_reader=reader,
+    )
+    service._decide = _decide
+
+    previous = get_current_actor()
+    set_current_actor("caller")
+    try:
+        assert await service.trigger_now() == "done"
+        assert observed == ["member_a"]
+        assert get_current_actor() == "caller"
+    finally:
+        set_current_actor(previous)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_execution_error_is_observable_and_restores_actor(
+    monkeypatch: pytest.MonkeyPatch,
+    registry: PrincipalRegistry,
+    tmp_path,
+) -> None:
+    from familia.nanobot_extension import cron
+    from familia.principals import get_current_actor, set_current_actor
+    from nanobot.heartbeat.service import HeartbeatService
+
+    class _Client:
+        def __init__(self, _actor_id: str, _memx_key: str) -> None:
+            pass
+
+        def get(self, _key: str) -> str:
+            return "task"
+
+    monkeypatch.setattr(cron, "PrincipalMemoryClient", _Client)
+    reader = cron.make_heartbeat_source_reader("member_a")
+
+    async def _execute(_tasks: str) -> str:
+        assert get_current_actor() == "member_a"
+        raise RuntimeError("heartbeat boom")
+
+    async def _decide(_content: str) -> tuple[str, str]:
+        return "run", "task"
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=object(),
+        model="test",
+        on_execute=_execute,
+        source_reader=reader,
+    )
+    service._decide = _decide
+
+    previous = get_current_actor()
+    set_current_actor("caller")
+    try:
+        with pytest.raises(RuntimeError, match="heartbeat boom"):
+            await service.trigger_now()
+        assert service.last_error == "heartbeat boom"
+        assert get_current_actor() == "caller"
+    finally:
+        set_current_actor(previous)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_without_explicit_target_never_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from familia.nanobot_extension import cron
+    from nanobot.heartbeat.service import HeartbeatService
+
+    (tmp_path / "HEARTBEAT.md").write_text("stale default task", encoding="utf-8")
+    monkeypatch.setattr(cron, "get_registry", lambda: pytest.fail("registry must not be guessed"))
+    executed: list[str] = []
+
+    async def _execute(tasks: str) -> str:
+        executed.append(tasks)
+        return "unexpected"
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=object(),
+        model="test",
+        on_execute=_execute,
+        source_reader=cron.make_heartbeat_source_reader(None),
+    )
+
+    assert await service.trigger_now() is None
+    assert executed == []

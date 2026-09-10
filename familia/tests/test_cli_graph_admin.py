@@ -11,12 +11,14 @@ boundary.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 
 from familia.cli import graph_admin
+from familia.principals import Principal, PrincipalRegistry
 
 
 @pytest.fixture
@@ -43,6 +45,112 @@ def fake_store():
 
 def _run(argv: list[str]) -> int:
     return graph_admin.main(argv)
+
+
+# ---- person add-node id normalization --------------------------------------
+
+def test_person_add_node_normalizes_new_actor_id(fake_store):
+    store, _ = fake_store
+
+    rc = _run(["graph", "person", "add-node", "  member_2  "])
+
+    assert rc == 0
+    assert store[graph_admin.FAMILY_KEY]["nodes"][0]["id"] == "member_2"
+
+
+def test_person_add_node_rejects_normalized_collision_with_legacy_id(fake_store):
+    store, _ = fake_store
+    store[graph_admin.FAMILY_KEY]["nodes"].append(
+        {"id": "member_2", "type": "principal"}
+    )
+
+    rc = _run(["graph", "person", "add-node", "  member_2  "])
+
+    assert rc == 2
+    assert [node["id"] for node in store[graph_admin.FAMILY_KEY]["nodes"]] == [
+        "member_2"
+    ]
+
+
+def test_person_add_node_rejects_spaces_in_new_actor_id(fake_store):
+    store, _ = fake_store
+
+    rc = _run(["graph", "person", "add-node", "member two"])
+
+    assert rc == 2
+    assert store[graph_admin.FAMILY_KEY]["nodes"] == []
+
+
+def test_acl_fallback_uses_declared_memx_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from familia import principals as principals_mod
+
+    acl_path = tmp_path / "custom-acl-name.json"
+    acl_path.write_text(
+        json.dumps(
+            {
+                "opaque-key-a": ["shared:*", "pair:legacy:*"],
+                "opaque-key-b": ["shared:*"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry = PrincipalRegistry(
+        [
+            Principal(id="actor-a", memx_key="opaque-key-a"),
+            Principal(id="actor-b", memx_key="opaque-key-b"),
+        ]
+    )
+    monkeypatch.setattr(graph_admin, "_memx_acl_path", lambda: acl_path)
+    monkeypatch.setattr(principals_mod, "get_registry", lambda: registry)
+
+    graph_admin._try_sync_memx_acl("actor-a")
+
+    updated = json.loads(acl_path.read_text(encoding="utf-8"))
+    pair_scope = "pair:actor-a_actor-b:*"
+    assert pair_scope in updated["opaque-key-a"]
+    assert pair_scope in updated["opaque-key-b"]
+    assert "actor-a_key" not in updated
+    assert "actor-b_key" not in updated
+
+
+def test_acl_fallback_skips_only_ambiguous_pair_namespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from familia import principals as principals_mod
+
+    acl_path = tmp_path / "acl.json"
+    original = {
+        "key-a": ["shared:*"],
+        "key-ab": ["shared:*"],
+        "key-bc": ["shared:*"],
+        "key-c": ["shared:*"],
+    }
+    acl_path.write_text(json.dumps(original), encoding="utf-8")
+    registry = PrincipalRegistry(
+        [
+            Principal(id="a", memx_key="key-a"),
+            Principal(id="a_b", memx_key="key-ab"),
+            Principal(id="b_c", memx_key="key-bc"),
+            Principal(id="c", memx_key="key-c"),
+        ]
+    )
+    monkeypatch.setattr(graph_admin, "_memx_acl_path", lambda: acl_path)
+    monkeypatch.setattr(principals_mod, "get_registry", lambda: registry)
+
+    graph_admin._try_sync_memx_acl("c")
+
+    updated = json.loads(acl_path.read_text(encoding="utf-8"))
+    for scopes in updated.values():
+        assert "pair:a_b_c:*" not in scopes
+
+    assert "pair:a_a_b:*" in updated["key-a"]
+    assert "pair:a_c:*" in updated["key-c"]
+    assert "pair:a_b_b_c:*" in updated["key-ab"]
+    assert "pair:b_c_c:*" in updated["key-bc"]
 
 
 # ---- topic add-node ---------------------------------------------------------
@@ -170,16 +278,16 @@ def test_seed_topics_dry_run_changes_nothing(fake_store):
     store, _ = fake_store
     store[graph_admin.FAMILY_KEY]["nodes"] = [
         {"id": "owner", "type": "principal"},
-        {"id": "varya", "type": "subject", "kind": "person",
+        {"id": "child", "type": "subject", "kind": "person",
          "aliases": ["alias_a"]},
     ]
     store[graph_admin.FAMILY_KEY]["edges"] = [
-        {"from": "owner", "to": "varya", "rel": "parent_of"},
+        {"from": "owner", "to": "child", "rel": "parent_of"},
     ]
     rc = _run(["migrate", "seed-topics-from-subjects"])  # dry-run default
     assert rc == 0
     # Subject still in family.graph; topics.graph untouched
-    assert any(n["id"] == "varya"
+    assert any(n["id"] == "child"
                for n in store[graph_admin.FAMILY_KEY]["nodes"])
     assert store[graph_admin.TOPICS_KEY]["nodes"] == []
 
@@ -188,27 +296,27 @@ def test_seed_topics_apply_moves_subject(fake_store):
     store, _ = fake_store
     store[graph_admin.FAMILY_KEY]["nodes"] = [
         {"id": "owner", "type": "principal"},
-        {"id": "varya", "type": "subject", "kind": "person",
+        {"id": "child", "type": "subject", "kind": "person",
          "aliases": ["alias_a"]},
         {"id": "syava", "type": "subject", "kind": "pet",
          "aliases": ["alias_b"]},
     ]
     store[graph_admin.FAMILY_KEY]["edges"] = [
-        {"from": "owner", "to": "varya", "rel": "parent_of"},
+        {"from": "owner", "to": "child", "rel": "parent_of"},
         {"from": "owner", "to": "syava", "rel": "owner_of"},
     ]
     rc = _run(["migrate", "seed-topics-from-subjects", "--apply"])
     assert rc == 0
     family_ids = [n["id"] for n in store[graph_admin.FAMILY_KEY]["nodes"]]
     assert "owner" in family_ids
-    assert "varya" not in family_ids
+    assert "child" not in family_ids
     assert "syava" not in family_ids
     topic_ids = [n["id"] for n in store[graph_admin.TOPICS_KEY]["nodes"]]
-    assert sorted(topic_ids) == ["syava", "varya"]
+    assert sorted(topic_ids) == ["child", "syava"]
     # concerns edges with proper concerns_as
     edges = store[graph_admin.TOPICS_KEY]["edges"]
     by_topic = {e["from"]: e for e in edges}
-    assert by_topic["varya"]["concerns_as"] == "parent_of"
+    assert by_topic["child"]["concerns_as"] == "parent_of"
     assert by_topic["syava"]["concerns_as"] == "owner_of"
 
 
@@ -217,7 +325,7 @@ def test_seed_topics_idempotent(fake_store):
     store, _ = fake_store
     store[graph_admin.FAMILY_KEY]["nodes"] = [{"id": "owner", "type": "principal"}]
     store[graph_admin.TOPICS_KEY]["nodes"] = [
-        {"id": "varya", "type": "topic", "kind": "person", "aliases": ["alias_a"]}
+        {"id": "child", "type": "topic", "kind": "person", "aliases": ["alias_a"]}
     ]
     rc = _run(["migrate", "seed-topics-from-subjects", "--apply"])
     assert rc == 0
@@ -232,18 +340,18 @@ def test_topic_to_principal_dry_run(fake_store):
         {"id": "member_a", "type": "principal"},
     ]
     store[graph_admin.TOPICS_KEY]["nodes"] = [
-        {"id": "varya", "type": "topic", "kind": "person", "aliases": ["alias_a"]}
+        {"id": "child", "type": "topic", "kind": "person", "aliases": ["alias_a"]}
     ]
     store[graph_admin.TOPICS_KEY]["edges"] = [
-        {"from": "varya", "to": "owner", "rel": "concerns",
+        {"from": "child", "to": "owner", "rel": "concerns",
          "concerns_as": "parent_of"},
-        {"from": "varya", "to": "member_a", "rel": "concerns",
+        {"from": "child", "to": "member_a", "rel": "concerns",
          "concerns_as": "parent_of"},
     ]
-    rc = _run(["migrate", "topic-to-principal", "varya"])  # dry default
+    rc = _run(["migrate", "topic-to-principal", "child"])  # dry default
     assert rc == 0
     # nothing changed
-    assert any(n["id"] == "varya"
+    assert any(n["id"] == "child"
                for n in store[graph_admin.TOPICS_KEY]["nodes"])
 
 
@@ -254,26 +362,26 @@ def test_topic_to_principal_apply_atomic(fake_store):
         {"id": "member_a", "type": "principal"},
     ]
     store[graph_admin.TOPICS_KEY]["nodes"] = [
-        {"id": "varya", "type": "topic", "kind": "person", "aliases": ["alias_a"]}
+        {"id": "child", "type": "topic", "kind": "person", "aliases": ["alias_a"]}
     ]
     store[graph_admin.TOPICS_KEY]["edges"] = [
-        {"from": "varya", "to": "owner", "rel": "concerns",
+        {"from": "child", "to": "owner", "rel": "concerns",
          "concerns_as": "parent_of"},
-        {"from": "varya", "to": "member_a", "rel": "concerns",
+        {"from": "child", "to": "member_a", "rel": "concerns",
          "concerns_as": "parent_of"},
     ]
-    rc = _run(["migrate", "topic-to-principal", "varya", "--apply"])
+    rc = _run(["migrate", "topic-to-principal", "child", "--apply"])
     assert rc == 0
     family_ids = [n["id"] for n in store[graph_admin.FAMILY_KEY]["nodes"]]
-    assert "varya" in family_ids
+    assert "child" in family_ids
     family_edges = store[graph_admin.FAMILY_KEY]["edges"]
     rels = sorted(
         (e["from"], e["rel"], e["to"]) for e in family_edges
     )
-    assert ("member_a", "parent_of", "varya") in rels
-    assert ("owner", "parent_of", "varya") in rels
+    assert ("member_a", "parent_of", "child") in rels
+    assert ("owner", "parent_of", "child") in rels
     # topic gone
-    assert all(n["id"] != "varya"
+    assert all(n["id"] != "child"
                for n in store[graph_admin.TOPICS_KEY]["nodes"])
 
 

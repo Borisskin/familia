@@ -17,10 +17,20 @@ style questions.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from loguru import logger
+from nanobot.agent.tools.base import Tool, tool_parameters
+from nanobot.agent.tools.schema import (
+    ArraySchema,
+    IntegerSchema,
+    ObjectSchema,
+    StringSchema,
+    tool_parameters_schema,
+)
+from nanobot.bus.events import InboundMessage, OutboundMessage
 
 from familia import audit, pending_asks
 from familia.pending_asks import PendingAsk
@@ -32,16 +42,6 @@ from familia.principals import (
     get_registry,
     resolve_identity,
 )
-from nanobot.agent.tools.base import Tool, tool_parameters
-from nanobot.agent.tools.schema import (
-    ArraySchema,
-    IntegerSchema,
-    ObjectSchema,
-    StringSchema,
-    tool_parameters_schema,
-)
-from nanobot.bus.events import InboundMessage, OutboundMessage
-
 
 _BUTTON_SCHEMA = ObjectSchema(
     label=StringSchema("Button caption shown to the asked principal"),
@@ -231,7 +231,8 @@ class AskPrincipalTool(Tool):
         if gate.kind == "allow":
             try:
                 await self._publish_outbound(out)
-            except Exception as e:
+            # Channel publishers are extension callbacks with no narrower contract.
+            except Exception as e:  # noqa: BLE001
                 pending_asks.pop(correlation_id)
                 return f"Error sending question to {actor}: {e}"
             # Question is in front of the target — start the timeout

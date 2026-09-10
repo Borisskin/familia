@@ -1,0 +1,128 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/providers/openai_codex_provider.py b/nanobot/nanobot/providers/openai_codex_provider.py
+index 44cb247..a7f1eb4 100644
+--- a/nanobot/nanobot/providers/openai_codex_provider.py
++++ b/nanobot/nanobot/providers/openai_codex_provider.py
+@@ -22,6 +22,13 @@ from nanobot.providers.openai_responses import (
+ DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
+ DEFAULT_ORIGINATOR = "nanobot"
+ 
++# Hard upper bound on a single Codex request lifetime. The streaming
++# endpoint can stall mid-response (server-side timeout, dead TCP keep-alive
++# in CLOSE_WAIT, etc.) and httpx's per-chunk read timeout alone has been
++# observed to miss those cases — so we cap the entire call here.
++_REQUEST_HARD_TIMEOUT = 600.0  # seconds; aborts a stuck request and returns an error
++_HTTP_TIMEOUTS = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0)
++
+ 
+ class OpenAICodexProvider(LLMProvider):
+     """Use Codex OAuth to call the Responses API."""
+@@ -79,9 +86,67 @@ class OpenAICodexProvider(LLMProvider):
+                 )
+             return LLMResponse(content=content, tool_calls=tool_calls, finish_reason=finish_reason)
+         except Exception as e:
++            # Build a structured error response so ``_run_with_retry``
++            # in base.py can decide retry/no-retry deterministically
++            # (without resorting to fuzzy text-marker scans on the
++            # final ``content``). Four categories:
++            #
++            #  * ``_CodexHTTPError`` — server response with a status
++            #    code; status drives retry policy in base._is_transient.
++            #  * ``asyncio.TimeoutError`` — our hard-cap fired, treat
++            #    as transient (kind=timeout).
++            #  * ``httpx`` connection / read errors — network blip,
++            #    treat as transient (kind=connection).
++            #  * everything else — surface to the user as final, but
++            #    still attempt the ``standard`` retry budget (one or
++            #    two passes won't hurt for a flaky transient).
+             msg = f"Error calling Codex: {e}"
+             retry_after = getattr(e, "retry_after", None) or self._extract_retry_after(msg)
+-            return LLMResponse(content=msg, finish_reason="error", retry_after=retry_after)
++            status_code: int | None = None
++            should_retry: bool | None = None
++            kind: str | None = None
++            if isinstance(e, _CodexHTTPError):
++                # ``_CodexHTTPError`` carries the friendly message and,
++                # for HTTP failures, the source status code. We re-extract
++                # the status from the message because ``_friendly_error``
++                # already formatted it as ``HTTP <code>: …`` for non-429
++                # paths; for 429 the message is plain English so we set
++                # the code explicitly via the marker check.
++                if "HTTP " in msg:
++                    head = msg.split("HTTP ", 1)[1]
++                    digits = ""
++                    for ch in head:
++                        if ch.isdigit():
++                            digits += ch
++                        else:
++                            break
++                    if digits:
++                        try:
++                            status_code = int(digits)
++                        except ValueError:
++                            status_code = None
++                if status_code is None and "rate limit" in msg.lower():
++                    status_code = 429
++                if status_code is None and "timed out" in msg.lower():
++                    kind = "timeout"
++                    should_retry = True
++            elif isinstance(e, asyncio.TimeoutError):
++                kind = "timeout"
++                should_retry = True
++            elif isinstance(e, httpx.HTTPError):
++                # Catch-all for httpx connection / read / pool errors
++                # below the response level (no status code available).
++                kind = "connection"
++                should_retry = True
++            return LLMResponse(
++                content=msg,
++                finish_reason="error",
++                retry_after=retry_after,
++                error_status_code=status_code,
++                error_should_retry=should_retry,
++                error_kind=kind,
++                error_retry_after_s=retry_after,
++            )
+ 
+     async def chat(
+         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
+@@ -135,16 +200,27 @@ async def _request_codex(
+     verify: bool,
+     on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+ ) -> tuple[str, list[ToolCallRequest], str]:
+-    async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
+-        async with client.stream("POST", url, headers=headers, json=body) as response:
+-            if response.status_code != 200:
+-                text = await response.aread()
+-                retry_after = LLMProvider._extract_retry_after_from_headers(response.headers)
+-                raise _CodexHTTPError(
+-                    _friendly_error(response.status_code, text.decode("utf-8", "ignore")),
+-                    retry_after=retry_after,
+-                )
+-            return await consume_sse(response, on_content_delta)
++    async def _do() -> tuple[str, list[ToolCallRequest], str]:
++        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUTS, verify=verify) as client:
++            async with client.stream("POST", url, headers=headers, json=body) as response:
++                if response.status_code != 200:
++                    text = await response.aread()
++                    retry_after = LLMProvider._extract_retry_after_from_headers(response.headers)
++                    raise _CodexHTTPError(
++                        _friendly_error(response.status_code, text.decode("utf-8", "ignore")),
++                        retry_after=retry_after,
++                    )
++                return await consume_sse(response, on_content_delta)
++
++    try:
++        return await asyncio.wait_for(_do(), timeout=_REQUEST_HARD_TIMEOUT)
++    except asyncio.TimeoutError as e:
++        logger.warning(
++            "Codex request exceeded hard timeout {}s; aborting", _REQUEST_HARD_TIMEOUT
++        )
++        raise _CodexHTTPError(
++            f"Codex request timed out after {_REQUEST_HARD_TIMEOUT:.0f}s"
++        ) from e
+ 
+ 
+ def _prompt_cache_key(messages: list[dict[str, Any]]) -> str:

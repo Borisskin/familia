@@ -7,6 +7,7 @@ from nanobot.utils.document import (
     _is_text_extension,
     extract_text,
 )
+import nanobot.utils.document as document_module
 
 
 class TestSupportedExtensions:
@@ -151,6 +152,36 @@ class TestExtractText:
         result = extract_text(xlsx_file)
         # Empty sheets should return empty string or header only
         assert result == "--- Sheet: EmptySheet ---" or result == ""
+
+    def test_extract_text_xlsx_closes_workbook_on_iteration_error(self, monkeypatch, tmp_path: Path):
+        """Workbook handles must close even when sheet iteration fails."""
+
+        class BrokenSheet:
+            def iter_rows(self, values_only=True):
+                raise RuntimeError("boom")
+
+        class BrokenWorkbook:
+            sheetnames = ["Broken"]
+
+            def __init__(self):
+                self.closed = False
+
+            def __getitem__(self, name):
+                return BrokenSheet()
+
+            def close(self):
+                self.closed = True
+
+        workbook = BrokenWorkbook()
+        monkeypatch.setattr(document_module, "load_workbook", lambda *args, **kwargs: workbook)
+
+        xlsx_file = tmp_path / "broken.xlsx"
+        xlsx_file.write_bytes(b"not relevant")
+
+        result = extract_text(xlsx_file)
+
+        assert "[error: failed to extract XLSX:" in result
+        assert workbook.closed is True
 
     def test_extract_text_docx(self, tmp_path: Path):
         """Test extracting text from a .docx file."""

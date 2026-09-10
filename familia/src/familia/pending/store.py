@@ -66,7 +66,7 @@ class _State:
         }
 
     @classmethod
-    def from_disk(cls, raw: Any) -> "_State":
+    def from_disk(cls, raw: Any) -> _State:
         if not isinstance(raw, dict) or raw.get(SCHEMA_KEY) is not True:
             return cls()
         entries: list[PendingEntry] = []

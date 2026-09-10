@@ -1,0 +1,69 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/channels/matrix.py b/nanobot/nanobot/channels/matrix.py
+index 85a167a..d434710 100644
+--- a/nanobot/nanobot/channels/matrix.py
++++ b/nanobot/nanobot/channels/matrix.py
+@@ -29,10 +29,11 @@ try:
+         RoomMessageMedia,
+         RoomMessageText,
+         RoomSendError,
++        RoomSendResponse,
+         RoomTypingError,
+         SyncError,
+-        UploadError, RoomSendResponse,
+-)
++        UploadError,
++    )
+     from nio.crypto.attachments import decrypt_attachment
+     from nio.exceptions import EncryptionError
+ except ImportError as e:
+@@ -534,7 +535,7 @@ class MatrixChannel(BaseChannel):
+                 return
+ 
+             await self._stop_typing_keepalive(chat_id, clear_typing=True)
+-            
++
+             content = _build_matrix_text_content(
+                 buf.text,
+                 buf.event_id,
+@@ -548,7 +549,7 @@ class MatrixChannel(BaseChannel):
+             buf = _StreamBuf()
+             self._stream_bufs[chat_id] = buf
+         buf.text += delta
+-    
++
+         if not buf.text.strip():
+             return
+ 
+@@ -666,9 +667,9 @@ class MatrixChannel(BaseChannel):
+             return True
+         return bool(self.config.allow_room_mentions and mentions.get("room") is True)
+ 
+-    def _should_process_message(self, room: MatrixRoom, event: RoomMessage) -> bool:
++    async def _should_process_message(self, room: MatrixRoom, event: RoomMessage) -> bool:
+         """Apply sender and room policy checks."""
+-        if not self.is_allowed(event.sender):
++        if await self.should_drop_inbound(event.sender):
+             return False
+         if self._is_direct_room(room):
+             return True
+@@ -850,7 +851,7 @@ class MatrixChannel(BaseChannel):
+         return meta
+ 
+     async def _on_message(self, room: MatrixRoom, event: RoomMessageText) -> None:
+-        if event.sender == self.config.user_id or not self._should_process_message(room, event):
++        if event.sender == self.config.user_id or not await self._should_process_message(room, event):
+             return
+         await self._start_typing_keepalive(room.room_id)
+         try:
+@@ -863,7 +864,7 @@ class MatrixChannel(BaseChannel):
+             raise
+ 
+     async def _on_media_message(self, room: MatrixRoom, event: MatrixMediaEvent) -> None:
+-        if event.sender == self.config.user_id or not self._should_process_message(room, event):
++        if event.sender == self.config.user_id or not await self._should_process_message(room, event):
+             return
+         attachment, marker = await self._fetch_media_attachment(room, event)
+         parts: list[str] = []

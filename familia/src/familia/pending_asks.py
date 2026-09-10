@@ -24,14 +24,14 @@ The store is process-local; a single gateway process owns all asks.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Awaitable, Callable
 
 from loguru import logger
+from nanobot.bus.events import InboundMessage
 
 from familia import audit
 from familia.principals import actor_display
-from nanobot.bus.events import InboundMessage
 
 
 @dataclass
@@ -129,7 +129,8 @@ async def _watchdog_coro(correlation_id: str, wait_s: int) -> None:
     )
     try:
         await ask.publish_inbound(msg)
-    except Exception:
+    # A caller-provided publisher must not crash the watchdog task.
+    except Exception:  # noqa: BLE001
         logger.exception("pending_asks: failed to inject timeout inbound")
 
 

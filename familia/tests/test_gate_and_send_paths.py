@@ -21,7 +21,8 @@ from unittest.mock import patch
 
 import pytest
 
-from familia.policy import Decision, GateResult, evaluate_outbound_send, gate_outbound_send
+from familia import bootstrap as familia_bootstrap
+from familia.policy import Decision, evaluate_outbound_send, gate_outbound_send
 from familia.policy.engine import reload_engine
 from familia.policy.pending import get_pending_store
 from familia.principals import (
@@ -296,7 +297,10 @@ class TestGateOutboundSend:
 async def _invoke_publish_reply(bus_publish, inbound, outbound):
     """Call ``AgentLoop._publish_reply_with_policy`` without constructing
     the whole loop — it only ever reaches into ``self.bus.publish_outbound``."""
-    fake_self = SimpleNamespace(bus=SimpleNamespace(publish_outbound=bus_publish))
+    fake_self = SimpleNamespace(
+        bus=SimpleNamespace(publish_outbound=bus_publish),
+        _outbound_guard=familia_bootstrap.make_outbound_guard(),
+    )
     await AgentLoop._publish_reply_with_policy(fake_self, inbound, outbound)
 
 
@@ -354,7 +358,10 @@ class TestDirectReplyPath:
 
 class TestMessageTool:
     def _tool(self, sink, chat_id: str = MEMBER_A_CHAT) -> MessageTool:
-        t = MessageTool(send_callback=sink.publish)
+        t = MessageTool(
+            send_callback=sink.publish,
+            outbound_guard=familia_bootstrap.make_outbound_guard(),
+        )
         t.set_context("vk", chat_id)
         return t
 

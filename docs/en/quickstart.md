@@ -101,6 +101,10 @@ To force your own mirror manually, set `APT_MIRROR=`, `PIP_INDEX_URL=`, or `NPM_
 
 Previously you had to download things manually. Not anymore.
 
+Admin records the new version only after the memory transition fully
+completes; backup and restore are documented in
+[`operations.md`](operations.md).
+
 When a new version is released, download the new `FamiliaAdmin-vX.Y.Z.exe` and run it. On the next connection to the VM, the admin app compares its embedded backend version with the version deployed on the server and shows one of three states:
 
 - **admin newer than VM** — "Update VM?" modal. The button builds the new image from the embedded source pack on the VM (~3-5 minutes).

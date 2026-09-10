@@ -128,6 +128,21 @@ class PolicyDecision:
         return list(self.rule.approver) if self.rule else []
 
 
+def is_explicit_deny(decision: PolicyDecision) -> bool:
+    """Return True for a matched deny rule, not the unmatched fallback.
+
+    Some routes have already passed a stricter dynamic capability gate (for
+    example, exact pair endpoints plus the live family graph). Older deployed
+    policies may not contain the corresponding coarse allow rule, so those
+    callers may tolerate ``__default_deny__`` while still honoring every
+    operator-authored deny rule. A malformed deny without a rule fails closed.
+    """
+
+    return decision.decision is Decision.DENY and (
+        decision.rule is None or decision.rule.name != "__default_deny__"
+    )
+
+
 def _match_any(patterns: list[str], value: str | None) -> bool:
     """True iff `value` matches at least one pattern.
 
@@ -219,7 +234,7 @@ def _match_actor(patterns: list[str], actor: str | None) -> bool:
         elif kind == "peer_of":
             hit = is_peer(actor, arg)
         elif kind == "family_of":
-            from familia.acl.peers import is_family_member  # noqa: PLC0415
+            from familia.acl.peers import is_family_member
             hit = is_family_member(actor, arg)
         elif kind == "principal":
             if not actor:

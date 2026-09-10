@@ -36,7 +36,7 @@ def test_graph_node_from_dict_minimal():
 
 def test_graph_node_aliases_tuple():
     n = GraphNode.from_dict(
-        {"id": "varya", "type": "topic", "kind": "person",
+        {"id": "child", "type": "topic", "kind": "person",
          "aliases": ["alias_a", "alias_b"]}
     )
     assert isinstance(n.aliases, tuple)
@@ -96,10 +96,10 @@ def test_graph_node_lookup():
     g = Graph.from_dict({
         "nodes": [
             {"id": "owner", "type": "principal"},
-            {"id": "varya", "type": "topic", "kind": "person"},
+            {"id": "child", "type": "topic", "kind": "person"},
         ],
         "edges": [],
     })
     assert g.node("owner").id == "owner"
-    assert g.node("varya").kind == "person"
+    assert g.node("child").kind == "person"
     assert g.node("nope") is None

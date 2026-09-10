@@ -1,0 +1,200 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/channels/manager.py b/nanobot/nanobot/channels/manager.py
+index f8f2c1d..b295b9f 100644
+--- a/nanobot/nanobot/channels/manager.py
++++ b/nanobot/nanobot/channels/manager.py
+@@ -11,6 +11,7 @@ from loguru import logger
+ from nanobot.bus.events import OutboundMessage
+ from nanobot.bus.queue import MessageBus
+ from nanobot.channels.base import BaseChannel
++from nanobot.channels.inbound import InboundEnricher
+ from nanobot.config.schema import Config
+ from nanobot.utils.restart import consume_restart_notice_from_env, format_restart_completed_message
+ 
+@@ -47,10 +48,14 @@ class ChannelManager:
+         bus: MessageBus,
+         *,
+         session_manager: "SessionManager | None" = None,
++        inbound_enrichers: list[InboundEnricher] | None = None,
++        channel_classes: dict[str, type[BaseChannel]] | None = None,
+     ):
+         self.config = config
+         self.bus = bus
+         self._session_manager = session_manager
++        self._inbound_enrichers = list(inbound_enrichers or [])
++        self._channel_classes = dict(channel_classes or {})
+         self.channels: dict[str, BaseChannel] = {}
+         self._dispatch_task: asyncio.Task | None = None
+ 
+@@ -60,11 +65,14 @@ class ChannelManager:
+         """Initialize channels discovered via pkgutil scan + entry_points plugins."""
+         from nanobot.channels.registry import discover_all
+ 
+-        transcription_provider = self.config.channels.transcription_provider
+-        transcription_key = self._resolve_transcription_key(transcription_provider)
+-        transcription_base = self._resolve_transcription_base(transcription_provider)
++        global_provider = self.config.channels.transcription_provider
+ 
+-        for name, cls in discover_all().items():
++        discovered = discover_all()
++        # Runtime adapters can provide domain-owned channels without putting
++        # their modules back under nanobot.channels.
++        discovered.update(getattr(self, "_channel_classes", {}))
++
++        for name, cls in discovered.items():
+             section = getattr(self.config.channels, name, None)
+             if section is None:
+                 continue
+@@ -85,21 +93,71 @@ class ChannelManager:
+                     if static_path is not None:
+                         kwargs["static_dist_path"] = static_path
+                 channel = cls(section, self.bus, **kwargs)
+-                channel.transcription_provider = transcription_provider
+-                channel.transcription_api_key = transcription_key
+-                channel.transcription_api_base = transcription_base
++                channel.set_inbound_enrichers(getattr(self, "_inbound_enrichers", []))
++                # Per-channel transcription override:
++                #   - section.transcription_provider == "off" → skip STT entirely
++                #     (api_key="" makes BaseChannel.transcribe_audio short-circuit).
++                #   - section.transcription_provider in {groq, openai, yandex} →
++                #     use that provider's creds from config.providers.<name>.
++                #   - missing / empty / "inherit" → fall back to the global default.
++                section_provider = self._section_transcription_provider(section)
++                effective = section_provider or global_provider
++                if effective == "off":
++                    channel.transcription_provider = "off"
++                    channel.transcription_api_key = ""
++                    channel.transcription_api_base = ""
++                    channel.transcription_folder_id = ""
++                else:
++                    channel.transcription_provider = effective
++                    channel.transcription_api_key = self._resolve_transcription_key(effective)
++                    channel.transcription_api_base = self._resolve_transcription_base(effective)
++                    channel.transcription_folder_id = self._resolve_transcription_folder_id(effective)
++                # Shared per-turn STT seconds budget. Channels that
++                # don't expose forward/reply re-processing simply
++                # ignore this attribute.
++                channel.audio_budget_s = int(
++                    getattr(self.config.channels, "transcription_audio_budget_s", 300)
++                    or 300
++                )
++                # Optional global STT language hint (empty = provider
++                # default).
++                channel.transcription_lang = (
++                    getattr(self.config.channels, "transcription_lang", "") or ""
++                )
+                 self.channels[name] = channel
+-                logger.info("{} channel enabled", cls.display_name)
++                logger.info(
++                    "{} channel enabled (stt={})",
++                    cls.display_name, channel.transcription_provider,
++                )
+             except Exception as e:
+                 logger.warning("{} channel not available: {}", name, e)
+ 
+         self._validate_allow_from()
+ 
++    @staticmethod
++    def _section_transcription_provider(section: Any) -> str:
++        """Read ``transcription_provider`` from a channel section without
++        crashing on either dict-shape or pydantic-shape configs.
++
++        Returns "" when the field is unset / "inherit" — caller treats that
++        as "use the global default".
++        """
++        if isinstance(section, dict):
++            raw = section.get("transcription_provider", "")
++        else:
++            raw = getattr(section, "transcription_provider", "") or ""
++        raw = (raw or "").strip().lower()
++        if raw in ("", "inherit", "default"):
++            return ""
++        return raw
++
+     def _resolve_transcription_key(self, provider: str) -> str:
+         """Pick the API key for the configured transcription provider."""
+         try:
+             if provider == "openai":
+                 return self.config.providers.openai.api_key
++            if provider == "yandex":
++                return self.config.providers.yandex.api_key or ""
+             return self.config.providers.groq.api_key
+         except AttributeError:
+             return ""
+@@ -109,10 +167,21 @@ class ChannelManager:
+         try:
+             if provider == "openai":
+                 return self.config.providers.openai.api_base or ""
++            if provider == "yandex":
++                return self.config.providers.yandex.api_base or ""
+             return self.config.providers.groq.api_base or ""
+         except AttributeError:
+             return ""
+ 
++    def _resolve_transcription_folder_id(self, provider: str) -> str:
++        """Pick the folder id (yandex-only) for the configured transcription provider."""
++        if provider != "yandex":
++            return ""
++        try:
++            return self.config.providers.yandex.folder_id or ""
++        except AttributeError:
++            return ""
++
+     def _validate_allow_from(self) -> None:
+         for name, ch in self.channels.items():
+             cfg = ch.config
+@@ -184,6 +253,7 @@ class ChannelManager:
+                 await self._dispatch_task
+             except asyncio.CancelledError:
+                 pass
++            self._dispatch_task = None
+ 
+         # Stop all channels
+         for name, channel in self.channels.items():
+@@ -192,6 +262,44 @@ class ChannelManager:
+                 logger.info("Stopped {} channel", name)
+             except Exception as e:
+                 logger.error("Error stopping {}: {}", name, e)
++        self.channels.clear()
++
++    async def reload_from_disk(self, new_config: Config) -> None:
++        """Hot-reload channels in-process to pick up a fresh ``config.json``.
++
++        Called by the SIGHUP handler on the gateway. Avoids a full
++        ``docker restart`` (~30 s of Python startup + agent init) by
++        keeping the long-running pieces of the gateway intact and only
++        recycling the channel adapters that actually changed.
++
++        Strategy: stop everything, swap in the new config, re-init all
++        channels, start_all again. We don't do a per-channel diff
++        because (a) the operations admin can do (add/remove/enable/
++        disable/edit-config) all touch the channel's state in
++        non-trivial ways — restarting the adapter is the safe baseline,
++        (b) ``stop_all`` + ``start_all`` together are still
++        sub-second per channel and the operator only triggers a
++        reload after a deliberate config edit.
++        """
++        logger.info("Channel reload: stopping running adapters")
++        await self.stop_all()
++        # Replace config and re-init. ``_init_channels`` honours
++        # ``enabled: false`` and skips stale entries, so a removed
++        # channel simply isn't re-created.
++        self.config = new_config
++        self._init_channels()
++        if not self.channels:
++            logger.info("Channel reload: no enabled channels in new config")
++            return
++        # Start in the background — ``start_all`` blocks on
++        # ``asyncio.gather(*tasks)`` (channels run forever), and we
++        # don't want the SIGHUP handler to wait for that.
++        asyncio.create_task(self.start_all())
++        logger.info(
++            "Channel reload: re-initialised {} channel(s): {}",
++            len(self.channels),
++            ", ".join(sorted(self.channels.keys())),
++        )
+ 
+     async def _dispatch_outbound(self) -> None:
+         """Dispatch outbound messages to the appropriate channel."""

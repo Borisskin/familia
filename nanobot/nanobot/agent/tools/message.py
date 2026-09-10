@@ -3,7 +3,7 @@
 from contextvars import ContextVar
 from typing import Any, Awaitable, Callable
 
-from familia.policy import gate_outbound_send
+from nanobot.agent.outbound import OutboundGuard, OutboundRequest, allow_outbound
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
 from nanobot.bus.events import OutboundMessage
@@ -30,8 +30,10 @@ class MessageTool(Tool):
         default_channel: str = "",
         default_chat_id: str = "",
         default_message_id: str | None = None,
+        outbound_guard: OutboundGuard | None = None,
     ):
         self._send_callback = send_callback
+        self._outbound_guard = outbound_guard or allow_outbound
         self._default_channel: ContextVar[str] = ContextVar("message_default_channel", default=default_channel)
         self._default_chat_id: ContextVar[str] = ContextVar("message_default_chat_id", default=default_chat_id)
         self._default_message_id: ContextVar[str | None] = ContextVar(
@@ -56,6 +58,10 @@ class MessageTool(Tool):
     def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
         """Set the callback for sending messages."""
         self._send_callback = callback
+
+    def set_outbound_guard(self, guard: OutboundGuard) -> None:
+        """Set the policy guard used before publishing messages."""
+        self._outbound_guard = guard
 
     def start_turn(self) -> None:
         """Reset per-turn send tracking.  Installs a fresh holder in the
@@ -126,12 +132,16 @@ class MessageTool(Tool):
             } if message_id else {},
         )
 
-        result = await gate_outbound_send(
-            action="message.send",
-            outbound=msg,
-            inbound_channel=default_channel or None,
-            inbound_chat_id=default_chat_id or None,
-            publish_outbound=self._send_callback,
+        # MessageTool stays policy-agnostic; deployments inject a guard that
+        # can deny, park, audit, or allow the outbound before it is published.
+        result = await self._outbound_guard(
+            OutboundRequest(
+                action="message.send",
+                outbound=msg,
+                inbound_channel=default_channel or None,
+                inbound_chat_id=default_chat_id or None,
+                publish_outbound=self._send_callback,
+            )
         )
         if result.kind == "deny":
             return f"Policy denied message.send to {channel}:{chat_id}: {result.reason}"
@@ -140,6 +150,9 @@ class MessageTool(Tool):
                 f"Отправлен запрос на подтверждение ({result.approvers_label}). "
                 "Жду ответа (до 15 минут)."
             )
+
+        if result.kind != "allow":
+            return f"Policy denied message.send to {channel}:{chat_id}: unsupported decision"
 
         try:
             await self._send_callback(msg)

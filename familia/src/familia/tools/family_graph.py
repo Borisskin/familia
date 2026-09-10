@@ -23,12 +23,11 @@ import json
 from typing import Any
 
 import httpx
-
-from familia.memx_client import memx_base_url
-from familia.principals import get_current_actor, get_registry
 from nanobot.agent.tools.base import Tool, tool_parameters
 from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
 
+from familia.memx_client import memx_base_url
+from familia.principals import get_current_actor, get_registry
 
 GRAPH_KEY = "shared:family.graph"
 TOPICS_KEY = "shared:topics.graph"

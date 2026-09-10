@@ -1,0 +1,2 @@
+# Generated patches preserve target bytes, including nested whitespace-only lines.
+*.patch -whitespace

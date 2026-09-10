@@ -23,11 +23,10 @@ from dataclasses import dataclass
 from familia.acl.reachable import reachable_persons, reachable_tag_ids
 from familia.acl.schema import Graph
 
-
 # In-memory per-actor cache. Tests can clear by importing _CACHE.clear().
 # Process-local — restart wipes. Acceptable for the small reachable sets
 # we have (~10-30 ids per actor).
-_CACHE: dict[str, "VocabularyCacheEntry"] = {}
+_CACHE: dict[str, VocabularyCacheEntry] = {}
 
 
 @dataclass(frozen=True)
@@ -39,7 +38,7 @@ class VocabularyEntry:
     display_name: str
     aliases: tuple[str, ...]
     # Free-form hint about how this id relates to the viewer ("твой муж",
-    # "общий питомец", "связан с varya"). Generated at build time so the
+    # "общий питомец", "связан с child"). Generated at build time so the
     # LLM doesn't need to traverse graphs itself.
     relation_hint: str
 

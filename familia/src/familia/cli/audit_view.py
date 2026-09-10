@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Audit log viewer for familia.
 
 Reads JSONL from $FAMILIA_AUDIT_FILE (default ``./audit.jsonl`` in cwd —
@@ -22,7 +21,7 @@ import os
 import sys
 import time
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 DEFAULT_PATH = Path(os.environ.get("FAMILIA_AUDIT_FILE", "audit.jsonl"))
@@ -40,8 +39,8 @@ COLOR = {
 def parse_since(s: str) -> datetime:
     units = {"m": 60, "h": 3600, "d": 86400}
     if s and s[-1] in units:
-        return datetime.now(timezone.utc) - timedelta(seconds=int(s[:-1]) * units[s[-1]])
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return datetime.now(UTC) - timedelta(seconds=int(s[:-1]) * units[s[-1]])
+    return datetime.fromisoformat(s)
 
 
 def entry_ts(e: dict) -> datetime | None:
@@ -49,7 +48,7 @@ def entry_ts(e: dict) -> datetime | None:
     if not ts:
         return None
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return datetime.fromisoformat(ts)
     except ValueError:
         return None
 

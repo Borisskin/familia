@@ -115,6 +115,7 @@ class LLMProvider(ABC):
         "connection",
         "server error",
         "temporarily unavailable",
+        "速率限制",
     )
     _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
     _TRANSIENT_ERROR_KINDS = frozenset({"timeout", "connection"})
@@ -161,6 +162,7 @@ class LLMProvider(ABC):
         "temporarily unavailable",
         "overloaded",
         "concurrency limit",
+        "速率限制",
     )
 
     _SENTINEL = object()

@@ -58,6 +58,17 @@ class TestHistoryWithCursor:
         data = json.loads(content)
         assert data["cursor"] == 1
 
+    def test_append_history_has_version_actor_and_provenance(self, store):
+        store.append_history("event 1", actor="actor_a")
+        data = json.loads(store.read_file(store.history_file))
+
+        assert data["schema_version"] == 1
+        assert data["actor"] == "actor_a"
+        assert data["provenance"] == {
+            "source": "runtime_history",
+            "idempotency_key": None,
+        }
+
     def test_cursor_persists_across_appends(self, store):
         store.append_history("event 1")
         store.append_history("event 2")

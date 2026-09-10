@@ -6,11 +6,13 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
-from familia.principals import resolve_actor
 from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.channels.inbound import InboundEnricher
+
+_ACTOR_UNRESOLVED = object()
 
 
 class BaseChannel(ABC):
@@ -49,6 +51,11 @@ class BaseChannel(ABC):
         self.config = config
         self.bus = bus
         self._running = False
+        self._inbound_enrichers: list[InboundEnricher] = []
+
+    def set_inbound_enrichers(self, enrichers: list[InboundEnricher]) -> None:
+        """Install channel-level enrichers owned by the runtime adapter."""
+        self._inbound_enrichers = list(enrichers)
 
     async def transcribe_audio(self, file_path: str | Path) -> str:
         """Transcribe an audio file via Whisper (OpenAI/Groq) or Yandex SpeechKit.
@@ -176,7 +183,12 @@ class BaseChannel(ABC):
         streaming = cfg.get("streaming", False) if isinstance(cfg, dict) else getattr(cfg, "streaming", False)
         return bool(streaming) and type(self).send_delta is not BaseChannel.send_delta
 
-    def should_drop_inbound(self, sender_id: str) -> bool:
+    async def should_drop_inbound(
+        self,
+        sender_id: str,
+        *,
+        actor: str | None | object = _ACTOR_UNRESOLVED,
+    ) -> bool:
         """Channel-level inbound filter for the pending-principal flow.
 
         Returns True iff the message should be silently dropped at the
@@ -196,7 +208,18 @@ class BaseChannel(ABC):
         directly, otherwise unknown senders are silently denied at
         the channel layer and never reach the pending flow.
         """
-        actor = resolve_actor(self.name, str(sender_id))
+        if actor is _ACTOR_UNRESOLVED:
+            msg = InboundMessage(
+                channel=self.name,
+                sender_id=str(sender_id),
+                chat_id=str(sender_id),
+                content="",
+            )
+            # Adapters that pre-filter before _handle_message still need the
+            # same actor resolution boundary as the main inbound path.
+            for enrich_inbound in self._inbound_enrichers:
+                await enrich_inbound(msg)
+            actor = msg.actor
         return actor is not None and not self.is_allowed(sender_id)
 
     def is_allowed(self, sender_id: str) -> bool:
@@ -229,26 +252,15 @@ class BaseChannel(ABC):
 
         Forwards to the bus unless the sender is a known principal that
         the operator has explicitly removed from ``allow_from``. Truly
-        unknown senders (``resolve_actor`` returns ``None``) are
+        unknown senders (no enrichment sets ``actor``) are
         forwarded with ``actor=None`` so the agent loop's pending-
         approval hook can register them and send the templated reply —
         the channel-layer ``allow_from`` check is no longer the gate
         for newcomers.
         """
-        if self.should_drop_inbound(sender_id):
-            logger.warning(
-                "Access denied at channel level for {} on channel {} "
-                "(known principal removed from allow_from); "
-                "delete the identity in principals.json to fully revoke.",
-                sender_id, self.name,
-            )
-            return
-
         meta = metadata or {}
         if self.supports_streaming:
             meta = {**meta, "_wants_stream": True}
-
-        actor = resolve_actor(self.name, str(sender_id))
 
         msg = InboundMessage(
             channel=self.name,
@@ -258,8 +270,21 @@ class BaseChannel(ABC):
             media=media or [],
             metadata=meta,
             session_key_override=session_key,
-            actor=actor,
         )
+
+        # Runtime adapters can resolve actors or attach metadata before the
+        # channel decides whether a known principal was removed from allow_from.
+        for enrich_inbound in self._inbound_enrichers:
+            await enrich_inbound(msg)
+
+        if await self.should_drop_inbound(sender_id, actor=msg.actor):
+            logger.warning(
+                "Access denied at channel level for {} on channel {} "
+                "(known principal removed from allow_from); "
+                "delete the identity in the runtime registry to fully revoke.",
+                sender_id, self.name,
+            )
+            return
 
         await self.bus.publish_inbound(msg)
 

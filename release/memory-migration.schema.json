@@ -1,0 +1,506 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://familia.invalid/schemas/memory-migration-2.0.0.json",
+  "title": "Familia legacy history transition result 2.0.0",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/plan"
+    },
+    {
+      "$ref": "#/$defs/apply"
+    }
+  ],
+  "$defs": {
+    "principalId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "flatAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "component",
+        "source",
+        "destination",
+        "actor",
+        "candidate_actor",
+        "disposition",
+        "reason"
+      ],
+      "properties": {
+        "phase": {
+          "const": "files"
+        },
+        "component": {
+          "enum": [
+            "user_profile",
+            "memory"
+          ]
+        },
+        "source": {
+          "enum": [
+            "USER.md",
+            "MEMORY.md",
+            "memory/MEMORY.md"
+          ]
+        },
+        "destination": {
+          "type": "null"
+        },
+        "actor": {
+          "type": "null"
+        },
+        "candidate_actor": {
+          "type": "null"
+        },
+        "disposition": {
+          "const": "erase_without_read"
+        },
+        "reason": {
+          "const": "flat_memory_retired"
+        }
+      },
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "source": {
+                  "const": "USER.md"
+                },
+                "component": {
+                  "const": "user_profile"
+                }
+              }
+            },
+            {
+              "properties": {
+                "source": {
+                  "const": "MEMORY.md"
+                },
+                "component": {
+                  "const": "memory"
+                }
+              }
+            },
+            {
+              "properties": {
+                "source": {
+                  "const": "memory/MEMORY.md"
+                },
+                "component": {
+                  "const": "memory"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "llmHistoryAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "component",
+        "source",
+        "source_sha256",
+        "actor",
+        "fact_id",
+        "source_actors",
+        "cursors",
+        "record_count",
+        "destination",
+        "disposition",
+        "reason"
+      ],
+      "properties": {
+        "phase": {
+          "const": "history"
+        },
+        "component": {
+          "const": "history"
+        },
+        "source": {
+          "const": "memory/history.jsonl"
+        },
+        "source_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "actor": {
+          "$ref": "#/$defs/principalId"
+        },
+        "fact_id": {
+          "const": "legacy-history"
+        },
+        "source_actors": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/principalId"
+          }
+        },
+        "cursors": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "integer"
+          }
+        },
+        "record_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "destination": {
+          "type": "string",
+          "pattern": "^private:[A-Za-z0-9][A-Za-z0-9._-]{0,127}:memory:legacy-history$"
+        },
+        "disposition": {
+          "const": "llm_required"
+        },
+        "reason": {
+          "const": "history_requires_consolidation"
+        }
+      }
+    },
+    "discardedHistoryAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "component",
+        "source",
+        "source_sha256",
+        "source_line",
+        "actor",
+        "source_actor",
+        "cursor",
+        "destination",
+        "disposition",
+        "reason"
+      ],
+      "properties": {
+        "phase": {
+          "const": "history"
+        },
+        "component": {
+          "const": "history"
+        },
+        "source": {
+          "const": "memory/history.jsonl"
+        },
+        "source_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "actor": {
+          "type": "null"
+        },
+        "source_actor": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/principalId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cursor": {
+          "oneOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "destination": {
+          "type": "null"
+        },
+        "disposition": {
+          "const": "discarded_unknown"
+        },
+        "reason": {
+          "enum": [
+            "history_malformed_or_unknown_schema",
+            "history_actorless",
+            "history_actor_unknown"
+          ]
+        }
+      }
+    },
+    "action": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/flatAction"
+        },
+        {
+          "$ref": "#/$defs/llmHistoryAction"
+        },
+        {
+          "$ref": "#/$defs/discardedHistoryAction"
+        }
+      ]
+    },
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "migration_kind",
+        "source_contract_version",
+        "target_contract_version",
+        "workspace",
+        "known_actors",
+        "dry_run",
+        "status",
+        "actions",
+        "summary"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "2.0.0"
+        },
+        "migration_kind": {
+          "const": "legacy_upgrade"
+        },
+        "source_contract_version": {
+          "const": "1.0.0"
+        },
+        "target_contract_version": {
+          "const": "2.0.0"
+        },
+        "workspace": {
+          "type": "string",
+          "minLength": 1
+        },
+        "known_actors": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/principalId"
+          }
+        },
+        "dry_run": {
+          "const": true
+        },
+        "status": {
+          "const": "ready"
+        },
+        "actions": {
+          "type": "array",
+          "minItems": 3,
+          "items": {
+            "$ref": "#/$defs/action"
+          },
+          "allOf": [
+            {
+              "contains": {
+                "type": "object",
+                "required": [
+                  "source"
+                ],
+                "properties": {
+                  "source": {
+                    "const": "USER.md"
+                  }
+                }
+              },
+              "minContains": 1,
+              "maxContains": 1
+            },
+            {
+              "contains": {
+                "type": "object",
+                "required": [
+                  "source"
+                ],
+                "properties": {
+                  "source": {
+                    "const": "MEMORY.md"
+                  }
+                }
+              },
+              "minContains": 1,
+              "maxContains": 1
+            },
+            {
+              "contains": {
+                "type": "object",
+                "required": [
+                  "source"
+                ],
+                "properties": {
+                  "source": {
+                    "const": "memory/MEMORY.md"
+                  }
+                }
+              },
+              "minContains": 1,
+              "maxContains": 1
+            }
+          ]
+        },
+        "summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "erase_without_read"
+          ],
+          "properties": {
+            "erase_without_read": {
+              "const": 3
+            },
+            "llm_required": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "discarded_unknown": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      }
+    },
+    "apply": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "applied_actions",
+        "written_keys",
+        "failed_actors",
+        "failed_actions",
+        "fatal_failure",
+        "dream_cursor_updated"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "complete",
+            "partial",
+            "failed"
+          ]
+        },
+        "applied_actions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "written_keys": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^private:[A-Za-z0-9][A-Za-z0-9._-]{0,127}:memory:legacy-history$"
+          }
+        },
+        "failed_actors": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/principalId"
+          }
+        },
+        "failed_actions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "fatal_failure": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dream_cursor_updated": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "status": {
+                  "const": "complete"
+                },
+                "failed_actors": {
+                  "maxItems": 0
+                },
+                "failed_actions": {
+                  "maxItems": 0
+                },
+                "fatal_failure": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "status": {
+                  "const": "partial"
+                },
+                "applied_actions": {
+                  "minimum": 1
+                },
+                "failed_actions": {
+                  "minItems": 1
+                },
+                "fatal_failure": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "dream_cursor_updated": {
+                  "const": false
+                }
+              }
+            },
+            {
+              "properties": {
+                "status": {
+                  "const": "failed"
+                },
+                "applied_actions": {
+                  "const": 0
+                },
+                "written_keys": {
+                  "maxItems": 0
+                },
+                "failed_actions": {
+                  "minItems": 1
+                },
+                "fatal_failure": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "dream_cursor_updated": {
+                  "const": false
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

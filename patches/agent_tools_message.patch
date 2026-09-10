@@ -1,16 +1,29 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
 diff --git a/nanobot/nanobot/agent/tools/message.py b/nanobot/nanobot/agent/tools/message.py
-index ee81eff..6ffbb81 100644
+index ee81eff..b58b02f 100644
 --- a/nanobot/nanobot/agent/tools/message.py
 +++ b/nanobot/nanobot/agent/tools/message.py
 @@ -3,6 +3,7 @@
  from contextvars import ContextVar
  from typing import Any, Awaitable, Callable
  
-+from familia.policy import gate_outbound_send
++from nanobot.agent.outbound import OutboundGuard, OutboundRequest, allow_outbound
  from nanobot.agent.tools.base import Tool, tool_parameters
  from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
  from nanobot.bus.events import OutboundMessage
-@@ -37,7 +38,14 @@ class MessageTool(Tool):
+@@ -29,15 +30,24 @@ class MessageTool(Tool):
+         default_channel: str = "",
+         default_chat_id: str = "",
+         default_message_id: str | None = None,
++        outbound_guard: OutboundGuard | None = None,
+     ):
+         self._send_callback = send_callback
++        self._outbound_guard = outbound_guard or allow_outbound
+         self._default_channel: ContextVar[str] = ContextVar("message_default_channel", default=default_channel)
+         self._default_chat_id: ContextVar[str] = ContextVar("message_default_chat_id", default=default_chat_id)
+         self._default_message_id: ContextVar[str | None] = ContextVar(
              "message_default_message_id",
              default=default_message_id,
          )
@@ -26,9 +39,14 @@ index ee81eff..6ffbb81 100644
  
      def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
          """Set the current message context."""
-@@ -50,16 +58,17 @@ class MessageTool(Tool):
+@@ -49,17 +59,22 @@ class MessageTool(Tool):
+         """Set the callback for sending messages."""
          self._send_callback = callback
  
++    def set_outbound_guard(self, guard: OutboundGuard) -> None:
++        """Set the policy guard used before publishing messages."""
++        self._outbound_guard = guard
++
      def start_turn(self) -> None:
 -        """Reset per-turn send tracking."""
 -        self._sent_in_turn = False
@@ -48,16 +66,20 @@ index ee81eff..6ffbb81 100644
  
      @property
      def name(self) -> str:
-@@ -117,6 +126,21 @@ class MessageTool(Tool):
+@@ -117,6 +132,28 @@ class MessageTool(Tool):
              } if message_id else {},
          )
  
-+        result = await gate_outbound_send(
-+            action="message.send",
-+            outbound=msg,
-+            inbound_channel=default_channel or None,
-+            inbound_chat_id=default_chat_id or None,
-+            publish_outbound=self._send_callback,
++        # MessageTool stays policy-agnostic; deployments inject a guard that
++        # can deny, park, audit, or allow the outbound before it is published.
++        result = await self._outbound_guard(
++            OutboundRequest(
++                action="message.send",
++                outbound=msg,
++                inbound_channel=default_channel or None,
++                inbound_chat_id=default_chat_id or None,
++                publish_outbound=self._send_callback,
++            )
 +        )
 +        if result.kind == "deny":
 +            return f"Policy denied message.send to {channel}:{chat_id}: {result.reason}"
@@ -67,10 +89,13 @@ index ee81eff..6ffbb81 100644
 +                "Жду ответа (до 15 минут)."
 +            )
 +
++        if result.kind != "allow":
++            return f"Policy denied message.send to {channel}:{chat_id}: unsupported decision"
++
          try:
              await self._send_callback(msg)
              if channel == default_channel and chat_id == default_chat_id:
-@@ -125,3 +149,13 @@ class MessageTool(Tool):
+@@ -125,3 +162,13 @@ class MessageTool(Tool):
              return f"Message sent to {channel}:{chat_id}{media_info}"
          except Exception as e:
              return f"Error sending message: {str(e)}"

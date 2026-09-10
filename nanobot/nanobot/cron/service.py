@@ -92,12 +92,12 @@ class CronService:
 
     def _load_jobs(self) -> tuple[list[CronJob], int]:
         jobs = []
-        version = 1
+        version = CronStore().version
         if self.store_path.exists():
             try:
                 data = json.loads(self.store_path.read_text(encoding="utf-8"))
                 jobs = []
-                version = data.get("version", 1)
+                version = max(data.get("version", 1), CronStore().version)
                 for j in data.get("jobs", []):
                     jobs.append(CronJob(
                         id=j["id"],
@@ -118,6 +118,10 @@ class CronService:
                             to=j["payload"].get("to"),
                             created_by=j["payload"].get("createdBy"),
                             tags=list(j["payload"].get("tags") or []),
+                            creator_actor=j["payload"].get(
+                                "creatorActor", j["payload"].get("createdBy")
+                            ),
+                            target_actor=j["payload"].get("targetActor"),
                         ),
                         state=CronJobState(
                             next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
@@ -221,6 +225,8 @@ class CronService:
                         "to": j.payload.to,
                         "createdBy": j.payload.created_by,
                         "tags": list(j.payload.tags or []),
+                        "creatorActor": j.payload.creator_actor,
+                        "targetActor": j.payload.target_actor,
                     },
                     "state": {
                         "nextRunAtMs": j.state.next_run_at_ms,
@@ -392,21 +398,23 @@ class CronService:
         delete_after_run: bool = False,
         created_by: str | None = None,
         tags: list[str] | None = None,
+        creator_actor: str | None = None,
+        target_actor: str | None = None,
     ) -> CronJob:
-        """Add a new job (idempotent on schedule + recipient + payload).
+        """Add a new job (idempotent on full delivery payload).
 
         If an enabled job already exists with the same schedule
         signature (cron expression / interval / one-shot timestamp +
-        timezone), the same delivery target (channel + to), and the
-        same message body, return that existing job instead of
-        creating a duplicate. Without this guard the LLM agent —
-        especially when re-prompted by the heartbeat tick reading
-        ``HEARTBEAT.md`` — happily creates a fresh cron with each
-        invocation, and one ``0 12 6-10 5 *`` reminder ends up firing
-        five times in parallel.
+        timezone), delivery target, message body, delivery mode,
+        lifecycle flag, creator, and visibility tags, return that
+        existing job instead of creating a duplicate. Without this
+        guard the agent can create a fresh cron for the same reminder
+        when it sees the same persisted instruction on later turns.
         """
         _validate_schedule_for_add(schedule)
         now = _now_ms()
+        effective_creator_actor = creator_actor if creator_actor is not None else created_by
+        legacy_created_by = created_by if created_by is not None else effective_creator_actor
 
         store = self._load_store() if self._running else None
         if store is not None:
@@ -416,6 +424,17 @@ class CronService:
                 schedule.every_ms,
                 schedule.at_ms,
                 schedule.tz,
+            )
+            payload_sig = (
+                message,
+                deliver,
+                channel or "",
+                to or "",
+                delete_after_run,
+                legacy_created_by or "",
+                tuple(sorted(tags or [])),
+                effective_creator_actor or "",
+                target_actor or "",
             )
             for existing in store.jobs:
                 if not existing.enabled:
@@ -429,11 +448,18 @@ class CronService:
                 ) != sched_sig:
                     continue
                 ep = existing.payload
-                if (
-                    ep.message == message
-                    and (ep.channel or "") == (channel or "")
-                    and (ep.to or "") == (to or "")
-                ):
+                existing_sig = (
+                    ep.message,
+                    ep.deliver,
+                    ep.channel or "",
+                    ep.to or "",
+                    existing.delete_after_run,
+                    ep.created_by or "",
+                    tuple(sorted(ep.tags or [])),
+                    ep.creator_actor or "",
+                    ep.target_actor or "",
+                )
+                if existing_sig == payload_sig:
                     logger.info(
                         "Cron: dedupe hit on add — returning existing job '{}' ({}) "
                         "instead of creating a duplicate",
@@ -452,8 +478,10 @@ class CronService:
                 deliver=deliver,
                 channel=channel,
                 to=to,
-                created_by=created_by,
+                created_by=legacy_created_by,
                 tags=list(tags or []),
+                creator_actor=effective_creator_actor,
+                target_actor=target_actor,
             ),
             state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
             created_at_ms=now,

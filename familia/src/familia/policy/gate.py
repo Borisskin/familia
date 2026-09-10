@@ -25,12 +25,12 @@ Two helpers:
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Awaitable, Callable, Literal
+from typing import TYPE_CHECKING, Literal
 
 from familia import audit
 from familia.policy.approval import request_approval
-from familia.policy.pending import get_pending_store
 from familia.policy.engine import (
     Decision,
     PolicyContext,
@@ -38,6 +38,7 @@ from familia.policy.engine import (
     PolicyRule,
     get_engine,
 )
+from familia.policy.pending import get_pending_store
 from familia.principals import get_current_actor, get_current_channel
 
 if TYPE_CHECKING:
@@ -106,10 +107,10 @@ class GateResult:
 async def gate_outbound_send(
     *,
     action: str,
-    outbound: "OutboundMessage",
+    outbound: OutboundMessage,
     inbound_channel: str | None,
     inbound_chat_id: str | None,
-    publish_outbound: Callable[["OutboundMessage"], Awaitable[None]],
+    publish_outbound: Callable[[OutboundMessage], Awaitable[None]],
 ) -> GateResult:
     """Evaluate the policy and, on ASK, park the outbound + notify approvers.
 

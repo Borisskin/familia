@@ -28,7 +28,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -103,7 +103,7 @@ def set_current_tz(name: str) -> ZoneInfo:
 
 def now_utc() -> datetime:
     """Aware UTC ``datetime``. Use instead of ``datetime.now()``."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def to_user_tz(dt: datetime) -> datetime:
@@ -157,7 +157,7 @@ def _check_not_in_dst_gap(local_dt: datetime) -> None:
     tz = local_dt.tzinfo
     if tz is None:
         raise ValueError("local_dt must be timezone-aware")
-    back = local_dt.astimezone(timezone.utc).astimezone(tz)
+    back = local_dt.astimezone(UTC).astimezone(tz)
     if back.replace(tzinfo=None) != local_dt.replace(tzinfo=None):
         raise ValueError(
             f"Local time {local_dt.strftime('%Y-%m-%d %H:%M')} does not exist "
@@ -202,12 +202,12 @@ def parse_user_datetime(raw: str, *, _now: datetime | None = None) -> datetime:
     # not reinterpreted in the global TZ. Order is load-bearing.
     if _has_explicit_offset(s):
         try:
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(s)
         except ValueError as e:
             raise ValueError(f"Unparseable datetime: {s!r}") from e
         if dt.tzinfo is None:
             raise ValueError(f"Datetime has no offset: {s!r}")
-        return dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        return dt.astimezone(UTC).replace(second=0, microsecond=0)
 
     tz = get_current_tz()
     now = _now if _now is not None else now_utc()
@@ -222,7 +222,7 @@ def parse_user_datetime(raw: str, *, _now: datetime | None = None) -> datetime:
         now_local = now.astimezone(tz)
         target = now_local.date()
         candidate = datetime(target.year, target.month, target.day, hh, mm, tzinfo=tz)
-        if candidate.astimezone(timezone.utc) <= now:
+        if candidate.astimezone(UTC) <= now:
             target = target + timedelta(days=1)
             candidate = datetime(
                 target.year, target.month, target.day, hh, mm, tzinfo=tz
@@ -233,7 +233,7 @@ def parse_user_datetime(raw: str, *, _now: datetime | None = None) -> datetime:
             raise ValueError(
                 f"{e} — try a time after the clock jumps forward"
             ) from e
-        return candidate.astimezone(timezone.utc)
+        return candidate.astimezone(UTC)
 
     m = _FULL_RE.match(s)
     if m:
@@ -243,6 +243,6 @@ def parse_user_datetime(raw: str, *, _now: datetime | None = None) -> datetime:
         except ValueError as e:
             raise ValueError(f"Bad date components in {s!r}: {e}") from e
         _check_not_in_dst_gap(local)
-        return local.astimezone(timezone.utc)
+        return local.astimezone(UTC)
 
     raise ValueError(f"Unrecognized datetime format: {s!r}")

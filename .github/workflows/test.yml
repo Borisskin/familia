@@ -2,23 +2,79 @@ name: tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, build/test]
+    tags: ["v*"]
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   familia:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out Familia
+        uses: actions/checkout@v6
+
+      - name: Check out declared nanobot upstream
+        uses: actions/checkout@v6
+        with:
+          repository: HKUDS/nanobot
+          ref: 950dddec499fbbe0353e997158c99808f0bb41e1
+          path: upstream-nanobot
+
+      - name: Expose upstream checkout at the patch-tool path
+        run: ln -s "$GITHUB_WORKSPACE/upstream-nanobot" "$GITHUB_WORKSPACE/../nanobot"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install nanobot + familia (editable)
+
+      - name: Install nanobot and Familia
         run: |
           python -m pip install --upgrade pip
           pip install -e ./nanobot -e ./familia pytest pytest-asyncio ruff
-      - name: Ruff (familia)
+
+      - name: Ruff Familia
         run: ruff check familia/src
-      - name: Pytest (familia)
+
+      - name: Validate release identity
+        run: |
+          backend_version="$(python -c 'import json; print(json.load(open("release/release-identity.json", encoding="utf-8"))["backend_version"])')"
+          release_tag="$(python -c 'import json; print(json.load(open("release/release-identity.json", encoding="utf-8"))["release_tag"])')"
+          python scripts/check_release_identity.py \
+            --backend-version "$backend_version" \
+            --tag "$release_tag"
+
+      - name: Test Familia logic
         run: pytest familia/tests -q
+
+      - name: Test Familia integration points in nanobot
+        run: |
+          pytest -q \
+            nanobot/tests/agent/test_auto_compact.py \
+            nanobot/tests/agent/test_context_prompt_cache.py \
+            nanobot/tests/agent/test_consolidator.py \
+            nanobot/tests/agent/test_dream.py \
+            nanobot/tests/agent/test_loop_consolidation_tokens.py \
+            nanobot/tests/agent/test_loop_cron_timezone.py \
+            nanobot/tests/agent/test_loop_save_turn.py \
+            nanobot/tests/agent/test_memory_store.py \
+            nanobot/tests/agent/test_memory_store_durability.py \
+            nanobot/tests/agent/test_consolidate_offset.py \
+            nanobot/tests/cli/test_commands.py \
+            nanobot/tests/cli/test_extension_boundaries.py \
+            nanobot/tests/cron/test_cron_tool_list.py \
+            nanobot/tests/cron/test_cron_tool_schema_contract.py \
+            nanobot/tests/cron/test_cron_tool_to_override.py \
+            nanobot/tests/cron/test_cron_tool_visibility.py
+
+      - name: Verify exact nanobot patch reconstruction
+        run: python patches/test_check_exact_reconstruction.py -v
+
+      - name: Verify patch header normalization
+        run: pytest -q patches/test_regenerate_headers.py

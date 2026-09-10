@@ -46,6 +46,13 @@ async def test_chat_with_retry_retries_transient_error_then_succeeds(monkeypatch
     assert delays == [1]
 
 
+def test_transient_error_recognizes_chinese_rate_limit_marker() -> None:
+    assert LLMProvider._is_transient_error("速率限制")
+    assert LLMProvider._is_retryable_429_response(
+        LLMResponse(content="请求触发速率限制", finish_reason="error", error_status_code=429)
+    )
+
+
 @pytest.mark.asyncio
 async def test_chat_with_retry_does_not_retry_non_transient_error(monkeypatch) -> None:
     provider = ScriptedProvider([

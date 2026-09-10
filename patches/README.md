@@ -1,53 +1,72 @@
-# Upstream patches
+# Nanobot patches
 
-Diffs of every nanobot upstream file that familia touches, against the
-subtree merge commit `328a386` (nanobot@0806ac02c).
+This directory contains generated deltas from the pinned upstream nanobot
+baseline to the current vendored nanobot tree in this repository.
 
-Regenerate after any in-place edit to an upstream file:
+Baseline:
+
+- upstream version: `0.1.5.post2`;
+- upstream repo: sibling `../nanobot` next to this repository by default;
+- upstream commit: `950dddec499fbbe0353e997158c99808f0bb41e1`.
+
+The upstream package layout is `nanobot/...`. This repository vendors the
+package under `nanobot/nanobot/...`, so patch paths are normalized to the
+vendored layout.
+
+## Regenerate
 
 ```bash
-UPSTREAM=328a386
-for f in nanobot/nanobot/agent/loop.py \
-         nanobot/nanobot/agent/context.py \
-         nanobot/nanobot/agent/memory.py \
-         nanobot/nanobot/agent/tools/message.py \
-         nanobot/nanobot/channels/base.py \
-         nanobot/nanobot/channels/vk.py \
-         nanobot/nanobot/cli/commands.py \
-         nanobot/nanobot/command/builtin.py; do
-    name=$(echo "$f" | sed 's|nanobot/nanobot/||;s|/|_|g;s|\.py$|.patch|')
-    git diff $UPSTREAM -- "$f" > patches/"$name"
-done
-git diff $UPSTREAM -- nanobot/pyproject.toml > patches/pyproject.patch
+bash patches/regenerate.sh
 ```
 
-## Why they exist
+Optional overrides:
 
-Familia is a subtree merge of upstream nanobot; the long-term plan is to
-keep patches minimal so subtree pulls stay painless. Patches split into
-two groups:
+```bash
+UPSTREAM_REPO=../nanobot \
+UPSTREAM=950dddec499fbbe0353e997158c99808f0bb41e1 \
+UPSTREAM_VERSION=0.1.5.post2 \
+bash patches/regenerate.sh
+```
 
-**Thin (import rewrites only)** — cheap to regenerate after any upstream
-move:
+Validate metadata, applicability, ownership closure, and exact reconstruction:
 
-| file | LOC changed | nature |
-|------|------------:|--------|
-| `agent_context.patch`       |  2 | import |
-| `channels_base.patch`       |  2 | import |
-| `cli_commands.patch`        |  4 | imports |
-| `command_builtin.patch`     |  2 | import |
-| `agent_tools_message.patch` |  4 | imports |
-| `pyproject.patch`           |  1 | pypdf pin bump (CVE fixes) |
+```bash
+bash patches/validate_baseline.sh
+```
 
-**Thick (real familia logic integrated inline)** — when upstream conflicts
-land here, re-apply by hand:
+## Scope
 
-| file | LOC changed | nature |
-|------|------------:|--------|
-| `agent_loop.patch`    |  ~30 | tool registration → `familia.bootstrap.install_tools`; per-turn setup → `familia.bootstrap.on_inbound` |
-| `agent_memory.patch`  | ~170 | Dream consolidation integrated with `dream_memory_set` + per-scope routing |
-| `channels_vk.patch`   | ~590 | VK polling loop — verbose error logging; keyboard + callback metadata |
+Patch files are generated for runtime nanobot package deltas and
+`nanobot/pyproject.toml`; `nanobot/README.md` is also inside the declared
+comparison scope and currently matches the pinned baseline. The checker proves
+that the sorted patch set reconstructs the current non-ignored worktree scope
+with the exact path set, blob bytes, and Git modes. Patch applicability alone is
+reported separately and is not accepted as equality.
 
-`channels/vk.py` was kept in nanobot (per project decision — VK is a
-nanobot channel, not a familia concept), so its patch covers VK-side
-edits only.
+`ownership.yaml` is JSON-compatible YAML with one row per current delta path.
+Every patch hunk has a category (`familia-invariant`, `upstream-alignment`,
+`generated-noise`, or `unknown`) and an explicit release decision owner. The
+checker rejects missing/stale paths, missing hunk coverage, filename drift, and
+direct imports of Familia from nanobot core.
+
+Phase 10 must still do hunk-by-hunk review:
+
+- keep neutral extension points that upstream lacks;
+- delete hunks already absorbed by upstream;
+- keep product-specific channel implementations and prompts outside nanobot core;
+- do not use old patch names as proof that a behavior is still live.
+
+## Notable baseline deltas
+
+| Patch area | Meaning against `0.1.5.post2` |
+| --- | --- |
+| `command___init__.patch` | Disables package-level slash-command re-exports while keeping upstream command implementation modules physically present. |
+| `runtime_adapters.patch` | Current familia tree adds neutral runtime adapter discovery for optional product wiring. |
+| `agent_outbound.patch`, `channels_inbound.patch`, `bus_callbacks.patch` | Current familia tree adds neutral extension point modules that are absent in upstream `0.1.5.post2`. |
+| `agent_context.patch`, `agent_loop.patch`, `agent_memory.patch`, `agent_tools_message.patch`, `channels_base.patch`, `cli_commands.patch` | Core behavioral deltas that need Phase 10 hunk-by-hunk audit. |
+| `pyproject.patch` | Fork/version/dependency delta against upstream `0.1.5.post2`; audit before changing package metadata. |
+
+`command_builtin.patch` records the synchronized `/new` archive-and-clear flow,
+save rollback, and the injected Dream restore policy in
+`nanobot/nanobot/command/builtin.py`. These are Familia-owned behavioral
+invariants in `ownership.yaml`.

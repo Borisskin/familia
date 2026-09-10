@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 import time
-from pathlib import Path
 
 import pytest
 
@@ -24,19 +23,19 @@ def pending_file(tmp_path, monkeypatch):
 def test_record_creates_row(pending_file):
     e = pending_store.record(
         channel="vk", sender_id="42",
-        display_name="Boris", message_preview="hi",
+        display_name="Person A", message_preview="hi",
     )
     assert e is not None
     assert e.channel == "vk" and e.sender_id == "42"
-    assert e.display_name == "Boris"
+    assert e.display_name == "Person A"
     assert e.msg_count == 1
 
 
 def test_record_updates_existing_row(pending_file):
     pending_store.record(channel="vk", sender_id="42",
-                         display_name="Boris", message_preview="hi")
+                         display_name="Person A", message_preview="hi")
     e = pending_store.record(channel="vk", sender_id="42",
-                             display_name="Boris", message_preview="again")
+                             display_name="Person A", message_preview="again")
     assert e.msg_count == 2
     assert e.last_message_preview == "again"
     # File contains exactly one row.

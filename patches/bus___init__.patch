@@ -1,0 +1,24 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/bus/__init__.py b/nanobot/nanobot/bus/__init__.py
+index c7b282d..d8804a2 100644
+--- a/nanobot/nanobot/bus/__init__.py
++++ b/nanobot/nanobot/bus/__init__.py
+@@ -1,6 +1,14 @@
+ """Message bus module for decoupled channel-agent communication."""
+ 
+-from nanobot.bus.events import InboundMessage, OutboundMessage
++from nanobot.bus.callbacks import CallbackDispatcher, CallbackHandler
++from nanobot.bus.events import CallbackEvent, InboundMessage, OutboundMessage
+ from nanobot.bus.queue import MessageBus
+ 
+-__all__ = ["MessageBus", "InboundMessage", "OutboundMessage"]
++__all__ = [
++    "CallbackDispatcher",
++    "CallbackEvent",
++    "CallbackHandler",
++    "MessageBus",
++    "InboundMessage",
++    "OutboundMessage",
++]

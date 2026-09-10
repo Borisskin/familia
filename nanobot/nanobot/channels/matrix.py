@@ -667,9 +667,9 @@ class MatrixChannel(BaseChannel):
             return True
         return bool(self.config.allow_room_mentions and mentions.get("room") is True)
 
-    def _should_process_message(self, room: MatrixRoom, event: RoomMessage) -> bool:
+    async def _should_process_message(self, room: MatrixRoom, event: RoomMessage) -> bool:
         """Apply sender and room policy checks."""
-        if self.should_drop_inbound(event.sender):
+        if await self.should_drop_inbound(event.sender):
             return False
         if self._is_direct_room(room):
             return True
@@ -851,7 +851,7 @@ class MatrixChannel(BaseChannel):
         return meta
 
     async def _on_message(self, room: MatrixRoom, event: RoomMessageText) -> None:
-        if event.sender == self.config.user_id or not self._should_process_message(room, event):
+        if event.sender == self.config.user_id or not await self._should_process_message(room, event):
             return
         await self._start_typing_keepalive(room.room_id)
         try:
@@ -864,7 +864,7 @@ class MatrixChannel(BaseChannel):
             raise
 
     async def _on_media_message(self, room: MatrixRoom, event: MatrixMediaEvent) -> None:
-        if event.sender == self.config.user_id or not self._should_process_message(room, event):
+        if event.sender == self.config.user_id or not await self._should_process_message(room, event):
             return
         attachment, marker = await self._fetch_media_attachment(room, event)
         parts: list[str] = []

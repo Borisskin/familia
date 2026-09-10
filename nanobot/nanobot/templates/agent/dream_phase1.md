@@ -7,22 +7,22 @@ principal whose turn produced the summary. `(untagged)` means the entry is
 from before per-scope tagging or from a system/mixed source.
 
 Output one line per finding:
-[FILE] atomic fact (not already in memory)               # MEMORY/USER/SOUL — family-wide
+[FILE] atomic fact (not already in memory)               # MEMORY/USER/SOUL — shared scope
 [FILE-REMOVE] reason for removal
 [PRIVATE:<actor>] atomic fact private to <actor>         # goes to memX private:<actor>:*
 [PAIR:<a>,<b>] atomic fact shared by <a> and <b> only    # goes to memX pair:<a>_<b>:*
 [SKILL] kebab-case-name: one-line description of the reusable pattern
 
 Scope routing — CRITICAL to prevent leaks between principals:
-- [FILE]  — only facts the whole family knows or needs (shared logistics, pet names,
+- [FILE]  — only facts all intended participants know or need (shared logistics,
             common routines). NEVER put here something only one principal said in
             private (medical details, work secrets, personal feelings towards
             another principal).
 - [PRIVATE:<actor>] — a fact mentioned by one principal that should NOT leak to
             others when the agent talks to them. Example:
-            [PRIVATE:alex] concerned about work deadline next week
-- [PAIR:<a>,<b>] — a fact relevant only to a specific pair (e.g. spouses
-            planning a gift for a third person). Sort actor ids alphabetically.
+            [PRIVATE:principal_a] concerned about work deadline next week
+- [PAIR:<a>,<b>] — a fact relevant only to a specific pair (e.g. two principals
+            planning a gift for a third principal). Sort actor ids alphabetically.
 - When in doubt — prefer PRIVATE over FILE. Over-sharing is the worse failure mode.
 
 Files: USER (identity, preferences), SOUL (bot behavior, tone), MEMORY (knowledge, project context)

@@ -143,6 +143,30 @@ class TestReadPdf:
 
 
 # ---------------------------------------------------------------------------
+# Office document support
+# ---------------------------------------------------------------------------
+
+class TestReadOfficeDocuments:
+
+    @pytest.fixture()
+    def tool(self, tmp_path):
+        return ReadFileTool(workspace=tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_docx_returns_extracted_text(self, tool, tmp_path):
+        docx = pytest.importorskip("docx")
+        docx_path = tmp_path / "report.docx"
+        doc = docx.Document()
+        doc.add_paragraph("Quarterly office report")
+        doc.save(docx_path)
+
+        result = await tool.execute(path=str(docx_path))
+
+        assert "Quarterly office report" in result
+        assert "Cannot read binary file" not in result
+
+
+# ---------------------------------------------------------------------------
 # Device path blacklist
 # ---------------------------------------------------------------------------
 

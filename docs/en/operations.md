@@ -5,55 +5,45 @@ key rotation, troubleshooting.
 
 ## Backup
 
-Through the admin app:
+Only the Admin v2 flow is supported: **Maintenance** → **Backup** → choose a
+destination folder. Admin:
 
-- **Maintenance** → **Backup** → choose destination folder.
-- Produces `familia-backup-<host>-<timestamp>.tar.gz` containing
-  `principals.json`, `policy.yaml`, `memx-config/acl.json`, the
-  full memX volume contents, and `audit.jsonl`.
-- The backup includes secrets — store it as carefully as `.env`.
+1. stops writer processes;
+2. runs Redis `SAVE`;
+3. captures five state parts: the workspace including `SOUL.md`, `.env`, the
+   `memx-config` directory, Redis data, and OAuth data;
+4. adds `familia-backup-manifest.json`;
+5. resumes writer processes.
 
-Manual:
+The archive contains secrets. Protect it at least as carefully as `.env`.
+Manually archiving live directories is not a supported backup.
 
-```bash
-# On the VM:
-cd /opt/familia
-docker compose down               # quiesce writers
-tar czf familia-backup-$(date +%F).tar.gz \
-    principals.json policy.yaml \
-    memx-config/acl.json .env audit.jsonl \
-    workspace/    # docker volume mount path; depends on your driver
-docker compose up -d
-```
+## Restore
 
-Backups happen offline (containers down) intentionally. Live snapshots
-of memX/Redis can race with active writes; this project doesn't try
-to support consistent live backups.
+Only the Admin v2 flow is supported:
 
-## Restore (universal)
-
-Restore is built to be **independent of the source VM** — UID/GID,
-volume names and paths on the source don't matter.
-
-Through the admin app:
-
-- **Install** → **Restore from backup** → pick the tarball and a
-  fresh target VM.
-- The app uploads, untars into a temp dir, resolves real volume
-  paths via `docker inspect`, and chowns content to the target
-  container's UID. It never assumes the source VM was identical.
-
-Manual:
+1. while the old installation stays live, Admin validates the manifest and
+   archive contents;
+2. it stages all five parts in a temporary area;
+3. stops writers and preserves the old state;
+4. atomically publishes the workspace, `.env`, `memx-config`, Redis data, and
+   OAuth data;
+5. starts services and checks their health;
+6. runs the one-shot memory transition:
 
 ```bash
-# On a fresh VM with familia stack pulled but stopped:
-cd /opt/familia
-docker compose down
-tar xzf familia-backup-*.tar.gz -C ./
-# Adjust ownership inside docker volumes:
-docker run --rm -v memx_data:/data alpine chown -R 1000:1000 /data
-docker compose up -d
+familia migrate hybrid-storage --apply --json
 ```
+
+The command returns `complete`, `partial`, or `failed`. Only `complete`
+commits the transition and permits old-data cleanup. `partial` and `failed`
+roll back all five parts, including restoring the prior absence of any part.
+Restore is retryable after rollback.
+
+The transition imports only history records with a known actor. Actorless,
+unknown-actor, and malformed records are discarded. After confirmed history
+writes, `USER.md`, `MEMORY.md`, and `memory/MEMORY.md` are erased without
+being read. `history.jsonl` and `SOUL.md` are preserved.
 
 ## Logs
 
@@ -107,26 +97,11 @@ docker compose restart familia-gateway
 docker compose logs --tail=50 familia-gateway | grep -i actor
 ```
 
-### Dream consolidator key
+### Memory compaction
 
-Rotation needs the same dance plus an extra step: the dream
-consolidator key is named separately in `acl.json` (not bound to a
-principal). Its leak is the most catastrophic — a holder can
-overwrite any principal's private memory. Treat it as a root-equivalent
-secret.
-
-## Bring up / down
-
-```bash
-# Stop everything:
-cd /opt/familia
-docker compose down
-docker compose -f docker-compose.memx.yml down
-
-# Start in correct order (memX first):
-docker compose -f docker-compose.memx.yml up -d
-docker compose up -d
-```
+Compaction has no universal key and no permission to write for everyone. It
+runs as the current principal and may change only that principal's exact facts
+by `fact_id` and expected `ts`.
 
 ## Diagnostics
 
@@ -154,10 +129,10 @@ the message metadata in container logs.
 ## Common problems
 
 | Symptom | Likely cause |
-|---------|--------------|
+| --- | --- |
 | `unknown principal: telegram/12345` | Telegram chat not bound to a principal in `principals.json` |
 | Replies are generic, ignore your context | LLM key wrong / quota; `OPENAI_API_KEY` env not loaded into gateway |
-| `acl deny: scope=private:X:value:Y` | Cross-principal read without peer-edge — by design, see [`policy.md`](policy.md) |
+| A foreign fact read is denied | No matching verified topic tag — by design, see [`policy.md`](policy.md) |
 | memX returns 401 | `acl.json` and `principals.json` out of sync (different memX keys) |
 | Telegram bot silent | webhook URL not set, or container can't reach `api.telegram.org` |
 | VK media missing | VK CDN blocks non-RU IPs; set `VK_PROXY` in `.env` to a SOCKS5 you trust |
@@ -176,7 +151,7 @@ The baked-in lists (intentionally short — one well-trusted mirror per
 region):
 
 | Resource | Auto-fallback chain |
-|----------|---------------------|
+| --- | --- |
 | PyPI | `pypi.tuna.tsinghua.edu.cn`, `mirrors.aliyun.com/pypi` |
 | Debian apt | `mirror.yandex.ru/debian`, `mirrors.tuna.tsinghua.edu.cn/debian` |
 | npm | `registry.npmmirror.com`, `mirrors.huaweicloud.com/repository/npm` |
@@ -188,7 +163,7 @@ mirror you'd rather use), set any of these env vars before bootstrap
 runs and they win unconditionally:
 
 | Env var | What it overrides | Example value |
-|---------|-------------------|---------------|
+| --- | --- | --- |
 | `APT_MIRROR` | `deb.debian.org` / `security.debian.org` inside the image | `https://mirror.yandex.ru/debian` |
 | `PIP_INDEX_URL` | PyPI index used by `pip` and `uv` inside the image | `https://pypi.tuna.tsinghua.edu.cn/simple` (or a self-hosted devpi) |
 | `NPM_REGISTRY` | npm registry used when building the WhatsApp bridge | `https://registry.npmmirror.com` |

@@ -1,6 +1,6 @@
 """Reachability tests covering SR-2 (child asymmetry), SR-10 (fail-closed).
 
-Test ids stay neutral (owner/member_a/member_b/varya/syava/nanny) — the
+Test ids stay neutral (owner/member_a/member_b/child/syava/nanny) — the
 pre-commit hook scans for personal data, and these are the placeholders
 documented in policy.example.yaml.
 """
@@ -25,29 +25,29 @@ def family_basic() -> Graph:
 
     Edges:
         owner — spouse_of — member_a
-        owner — parent_of — varya       (varya has role: child)
-        member_a — parent_of — varya
-        nanny — caregiver_of — varya
+        owner — parent_of — child       (child has role: child)
+        member_a — parent_of — child
+        nanny — caregiver_of — child
     """
     return Graph.from_dict({
         "nodes": [
             {"id": "owner", "type": "principal"},
             {"id": "member_a", "type": "principal"},
-            {"id": "varya", "type": "principal"},
+            {"id": "child", "type": "principal"},
             {"id": "nanny", "type": "principal"},
         ],
         "edges": [
             {"from": "owner", "to": "member_a", "rel": "spouse_of"},
-            {"from": "owner", "to": "varya", "rel": "parent_of"},
-            {"from": "member_a", "to": "varya", "rel": "parent_of"},
-            {"from": "nanny", "to": "varya", "rel": "caregiver_of"},
+            {"from": "owner", "to": "child", "rel": "parent_of"},
+            {"from": "member_a", "to": "child", "rel": "parent_of"},
+            {"from": "nanny", "to": "child", "rel": "caregiver_of"},
         ],
     })
 
 
 @pytest.fixture
 def topics_basic() -> Graph:
-    """Two topics: school (concerns varya), finance (concerns adults)."""
+    """Two topics: school (concerns child), finance (concerns adults)."""
     return Graph.from_dict({
         "nodes": [
             {"id": "school", "type": "topic", "kind": "abstract"},
@@ -55,7 +55,7 @@ def topics_basic() -> Graph:
             {"id": "orphan_topic", "type": "topic", "kind": "abstract"},
         ],
         "edges": [
-            {"from": "school", "to": "varya", "rel": "concerns",
+            {"from": "school", "to": "child", "rel": "concerns",
              "concerns_as": "guardian_of"},
             {"from": "finance", "to": "owner", "rel": "concerns",
              "concerns_as": "guardian_of"},
@@ -67,7 +67,7 @@ def topics_basic() -> Graph:
 
 @pytest.fixture
 def child_roles() -> dict[str, frozenset[str]]:
-    return {"varya": frozenset({"child"})}
+    return {"child": frozenset({"child"})}
 
 
 # --- reachable_persons baseline (no role asymmetry) -------------------------
@@ -85,27 +85,27 @@ def test_spouse_symmetric(family_basic):
 def test_parent_sees_child(family_basic, child_roles):
     """Forward parent_of always reaches the child."""
     persons = reachable_persons(family_basic, "owner", child_roles)
-    assert "varya" in persons
+    assert "child" in persons
     persons_b = reachable_persons(family_basic, "member_a", child_roles)
-    assert "varya" in persons_b
+    assert "child" in persons_b
 
 
 # --- SR-2 — child asymmetry -------------------------------------------------
 
 def test_child_does_not_reach_parents(family_basic, child_roles):
     """Critical: SR-2 — child must NOT see her parents through reverse parent_of."""
-    persons = reachable_persons(family_basic, "varya", child_roles)
+    persons = reachable_persons(family_basic, "child", child_roles)
     assert "owner" not in persons, "child must not reach owner via reverse parent_of"
     assert "member_a" not in persons, "child must not reach member_a via reverse parent_of"
     # She still reaches herself, and the caregiver via direct caregiver_of.
-    assert "varya" in persons
+    assert "child" in persons
     assert "nanny" in persons
 
 
 def test_child_without_role_set_falls_back_to_symmetric(family_basic):
     """If no roles configured (legacy / standalone), the resolver works
     bidirectionally — keeps backwards compatibility."""
-    persons = reachable_persons(family_basic, "varya")  # no roles
+    persons = reachable_persons(family_basic, "child")  # no roles
     assert "owner" in persons
     assert "member_a" in persons
 
@@ -114,9 +114,9 @@ def test_caregiver_bidirectional(family_basic, child_roles):
     """caregiver_of is access-granting both ways for non-child relations,
     even when the target is a child (the asymmetry is on parent_of only)."""
     nanny_view = reachable_persons(family_basic, "nanny", child_roles)
-    assert "varya" in nanny_view
-    varya_view = reachable_persons(family_basic, "varya", child_roles)
-    assert "nanny" in varya_view
+    assert "child" in nanny_view
+    child_view = reachable_persons(family_basic, "child", child_roles)
+    assert "nanny" in child_view
 
 
 # --- reachable_topics_for ---------------------------------------------------
@@ -124,13 +124,13 @@ def test_caregiver_bidirectional(family_basic, child_roles):
 def test_topic_reached_via_connected_person(family_basic, topics_basic, child_roles):
     persons = reachable_persons(family_basic, "owner", child_roles)
     topics = reachable_topics_for(topics_basic, persons)
-    assert "school" in topics  # owner is connected to varya, school concerns varya
+    assert "school" in topics  # owner is connected to child, school concerns child
     assert "finance" in topics  # finance directly concerns owner
 
 
 def test_topic_with_no_path_is_not_reached(family_basic, topics_basic, child_roles):
     """Child reaches her own topic (school) but NOT finance (parent-only)."""
-    persons = reachable_persons(family_basic, "varya", child_roles)
+    persons = reachable_persons(family_basic, "child", child_roles)
     topics = reachable_topics_for(topics_basic, persons)
     assert "school" in topics
     assert "finance" not in topics
@@ -150,26 +150,26 @@ def test_combined_includes_self_persons_and_topics(family_basic, topics_basic, c
     ids = reachable_tag_ids(family_basic, topics_basic, "owner", child_roles)
     assert "owner" in ids
     assert "member_a" in ids
-    assert "varya" in ids
+    assert "child" in ids
     assert "school" in ids
     assert "finance" in ids
 
 
 def test_combined_for_child_blocks_finance(family_basic, topics_basic, child_roles):
     """End-to-end: child sees only her own scope + caregiver + school topic."""
-    ids = reachable_tag_ids(family_basic, topics_basic, "varya", child_roles)
-    assert ids == {"varya", "nanny", "school"}
+    ids = reachable_tag_ids(family_basic, topics_basic, "child", child_roles)
+    assert ids == {"child", "nanny", "school"}
 
 
-def test_combined_for_nanny_only_sees_varya_scope(family_basic, topics_basic, child_roles):
+def test_combined_for_nanny_only_sees_child_scope(family_basic, topics_basic, child_roles):
     ids = reachable_tag_ids(family_basic, topics_basic, "nanny", child_roles)
-    # nanny ↔ varya, varya ↔ school (concerns-edge), nanny + varya themselves.
+    # nanny ↔ child, child ↔ school (concerns-edge), nanny + child themselves.
     # No reach to owner/member_a/finance.
     assert "owner" not in ids
     assert "member_a" not in ids
     assert "finance" not in ids
     assert "nanny" in ids
-    assert "varya" in ids
+    assert "child" in ids
     assert "school" in ids
 
 

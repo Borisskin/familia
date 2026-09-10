@@ -24,12 +24,11 @@ from __future__ import annotations
 import json
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
-
 
 _lock = threading.Lock()
 
@@ -152,7 +151,7 @@ def log_event(kind: str, **fields: Any) -> None:
     """Append one JSONL record; never raises."""
     try:
         rec: dict[str, Any] = {
-            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "ts": datetime.now(UTC).isoformat(timespec="seconds"),
             "kind": kind,
         }
         rec.update({k: _clip(v) for k, v in fields.items()})
@@ -163,5 +162,6 @@ def log_event(kind: str, **fields: Any) -> None:
             with path.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
             _ensure_secure_mode(path)
-    except Exception as e:
+    # Auditing is an observability boundary and must never break the caller.
+    except Exception as e:  # noqa: BLE001
         _report_write_error(kind, e)

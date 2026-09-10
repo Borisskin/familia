@@ -361,7 +361,7 @@ class DiscordChannel(BaseChannel):
         channel_id = self._channel_key(message.channel)
         content = message.content or ""
 
-        if not self._should_accept_inbound(message, sender_id, content):
+        if not await self._should_accept_inbound(message, sender_id, content):
             return
 
         media_paths, attachment_markers = await self._download_attachments(message.attachments)
@@ -445,14 +445,14 @@ class DiscordChannel(BaseChannel):
         await self._stop_typing(chat_id)
         await self._clear_reactions(chat_id)
 
-    def _should_accept_inbound(
+    async def _should_accept_inbound(
         self,
         message: discord.Message,
         sender_id: str,
         content: str,
     ) -> bool:
         """Check if inbound Discord message should be processed."""
-        if self.should_drop_inbound(sender_id):
+        if await self.should_drop_inbound(sender_id):
             return False
         # Channel-based filtering: only respond in allowed channels
         allow_channels = self.config.allow_channels

@@ -19,16 +19,16 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Mapping
 from contextvars import ContextVar
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 
 import httpx
 from loguru import logger
 
 from familia.memx_client import memx_base_url
 from familia.principals import get_registry
-
 
 ADMIN_GRANTS_KEY = "shared:roles.admin_grants"
 

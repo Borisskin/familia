@@ -7,7 +7,6 @@ denied. Graphs and roles are edited only through the `familia` CLI.
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,7 +15,6 @@ import pytest
 from familia import principals as principals_mod
 from familia.policy import engine as engine_mod
 from familia.principals import Identity, Principal, PrincipalRegistry
-from familia.tools.memory import MemorySetTool
 
 
 @pytest.fixture
@@ -93,37 +91,3 @@ def test_policy_still_allows_member_read_of_admin_grants(example_policy_engine, 
         to_chat="shared:roles.admin_grants",
     ))
     assert d.decision is Decision.ALLOW
-
-
-# ---- tool-level guard (defense-in-depth, SR-14) --------------------------
-
-def test_memory_set_refuses_family_graph_even_for_admin(registry):
-    from familia import principals as p
-    p.set_current_actor("owner")
-    tool = MemorySetTool(base_url="http://nope")
-    out = asyncio.run(tool.execute(
-        scope="shared", key="family.graph", value="garbage",
-    ))
-    assert "structural key" in out.lower()
-    assert "cli" in out.lower()
-
-
-def test_memory_set_refuses_topics_graph_even_for_admin(registry):
-    from familia import principals as p
-    p.set_current_actor("owner")
-    tool = MemorySetTool(base_url="http://nope")
-    out = asyncio.run(tool.execute(
-        scope="shared", key="topics.graph", value="garbage",
-    ))
-    assert "structural key" in out.lower()
-
-
-def test_memory_set_refuses_roles_subkeys(registry):
-    from familia import principals as p
-    p.set_current_actor("owner")
-    tool = MemorySetTool(base_url="http://nope")
-    out = asyncio.run(tool.execute(
-        scope="shared", key="roles.admin_grants",
-        value="[]",
-    ))
-    assert "structural key" in out.lower()

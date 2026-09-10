@@ -1,0 +1,16 @@
+# nanobot baseline: 0.1.5.post2
+# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+
+diff --git a/nanobot/nanobot/channels/msteams.py b/nanobot/nanobot/channels/msteams.py
+index 427b35f..0d43b3f 100644
+--- a/nanobot/nanobot/channels/msteams.py
++++ b/nanobot/nanobot/channels/msteams.py
+@@ -274,7 +274,7 @@ class MSTeamsChannel(BaseChannel):
+                 logger.debug("MSTeams ignoring empty message after Teams text sanitization")
+                 return
+ 
+-        if not self.is_allowed(sender_id):
++        if await self.should_drop_inbound(sender_id):
+             logger.warning(
+                 "Access denied for sender {} on channel {}. "
+                 "Add them to allowFrom list in config to grant access.",
