@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import re
-import socket
 import stat
 import subprocess
 import sys
@@ -37,6 +36,17 @@ LEGACY_TRANSITION_COMPLETION_MARKER = {
     "target_contract_version": "2.0.0",
 }
 _PRINCIPAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_DOCKER_SOCKET = "unix:///var/run/docker.sock"
+_DOCKER_ENV_BLOCKLIST = frozenset(
+    {
+        "DOCKER_HOST",
+        "DOCKER_CONTEXT",
+        "DOCKER_TLS",
+        "DOCKER_TLS_VERIFY",
+        "DOCKER_CERT_PATH",
+    }
+)
+_NAMESPACE_NAMES = ("net", "pid", "mnt")
 
 
 class MigrationError(RuntimeError):
@@ -857,17 +867,94 @@ def _target_config(config_path: Path, install_root: Path, workspace: Path, princ
     return config
 
 
-def _docker_inspect(kind: str, reference: str) -> dict[str, Any]:
-    """Inspect exactly one object through the selected local Docker daemon."""
+def _docker_command_env() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key not in _DOCKER_ENV_BLOCKLIST
+    }
 
-    env = {key: value for key, value in os.environ.items() if key not in {"DOCKER_HOST", "DOCKER_CONTEXT"}}
+
+def _namespace_payload(value: Any) -> dict[str, dict[str, int]]:
+    if not isinstance(value, dict) or set(value) != set(_NAMESPACE_NAMES):
+        raise MigrationPreflightError("Docker namespace evidence has an invalid shape")
+    result: dict[str, dict[str, int]] = {}
+    for name in _NAMESPACE_NAMES:
+        pair = value.get(name)
+        if not isinstance(pair, dict) or set(pair) != {"st_dev", "st_ino"}:
+            raise MigrationPreflightError("Docker namespace evidence has an invalid shape")
+        device = pair.get("st_dev")
+        inode = pair.get("st_ino")
+        if (
+            isinstance(device, bool)
+            or not isinstance(device, int)
+            or isinstance(inode, bool)
+            or not isinstance(inode, int)
+        ):
+            raise MigrationPreflightError("Docker namespace evidence has invalid stat values")
+        result[name] = {"st_dev": device, "st_ino": inode}
+    return result
+
+
+def _local_namespace_payload() -> dict[str, dict[str, int]]:
+    payload: dict[str, dict[str, int]] = {}
+    try:
+        for name in _NAMESPACE_NAMES:
+            info = os.stat(f"/proc/self/ns/{name}")
+            payload[name] = {"st_dev": info.st_dev, "st_ino": info.st_ino}
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        raise MigrationPreflightError("current namespace evidence is unavailable") from exc
+    return _namespace_payload(payload)
+
+
+def _docker_runner_namespace_proof(runner_id: str) -> None:
+    local = _local_namespace_payload()
+    script = (
+        "import json, os\n"
+        "namespaces = {}\n"
+        "for name in ('net', 'pid', 'mnt'):\n"
+        "    info = os.stat('/proc/self/ns/' + name)\n"
+        "    namespaces[name] = {'st_dev': info.st_dev, 'st_ino': info.st_ino}\n"
+        "print(json.dumps(namespaces))\n"
+    )
     try:
         completed = subprocess.run(
-            ["docker", "--context", "default", "inspect", "--type", kind, reference],
+            [
+                "docker",
+                "--host",
+                _DOCKER_SOCKET,
+                "exec",
+                runner_id,
+                "python3",
+                "-c",
+                script,
+            ],
             check=True,
             capture_output=True,
             text=True,
-            env=env,
+            env=_docker_command_env(),
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise MigrationPreflightError("Docker namespace proof unavailable") from exc
+    try:
+        remote = _namespace_payload(json.loads(completed.stdout))
+    except (TypeError, ValueError) as exc:
+        raise MigrationPreflightError("Docker namespace proof returned invalid JSON") from exc
+    if remote != local:
+        raise MigrationPreflightError("Docker runner namespace mismatch")
+
+
+def _docker_inspect(kind: str, reference: str) -> dict[str, Any]:
+    """Inspect exactly one object through the selected local Docker daemon."""
+
+    try:
+        completed = subprocess.run(
+            ["docker", "--host", _DOCKER_SOCKET, "inspect", "--type", kind, reference],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=_docker_command_env(),
             timeout=20,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -892,16 +979,6 @@ def _docker_verify_target(config: dict[str, Any]) -> None:
         for section in ("runner", "memx", "redis")
     }
     expected_ids = {config[section]["id"] for section in containers}
-    expected_hostname = config["runner"].get("hostname")
-    actual_hostname = (containers["runner"].get("Config") or {}).get("Hostname")
-    if expected_hostname is not None:
-        if actual_hostname != expected_hostname:
-            raise MigrationPreflightError("current container is not the configured runner")
-    else:
-        host_id = socket.gethostname().lower()
-        runner_id = config["runner"]["id"].lower()
-        if not (runner_id.startswith(host_id) or host_id.startswith(runner_id[:12])):
-            raise MigrationPreflightError("current container is not the configured runner")
 
     network_members: set[str] = set()
     for section, actual in containers.items():
@@ -971,6 +1048,11 @@ def _docker_verify_target(config: dict[str, Any]) -> None:
         for mount in redis.get("Mounts") or []
     ):
         raise MigrationPreflightError("Redis storage is not attached to the target")
+
+    runner_id = containers["runner"].get("Id")
+    if not isinstance(runner_id, str):
+        raise MigrationPreflightError("Docker runner identity is invalid")
+    _docker_runner_namespace_proof(runner_id)
 
     memx = config["memx"]
     parsed = urlparse(memx["base_url"])
@@ -1075,6 +1157,8 @@ def cli(argv: list[str] | None = None) -> int:
             resolved_parent = output.absolute().parent.resolve(strict=True)
             if not _within(resolved_parent, target_root):
                 raise MigrationPreflightError("manifest and journal must stay in isolated target")
+        if args.apply:
+            _docker_verify_target(target_config)
         known_actors = _load_known_actors(principals_path)
         plan = build_legacy_transition_plan(
             workspace=source_root,
@@ -1083,7 +1167,6 @@ def cli(argv: list[str] | None = None) -> int:
         _write_private_atomic(args.manifest, _canonical_bytes(plan) + b"\n")
         result: dict[str, Any] = {"status": "dry_run"}
         if args.apply:
-            _docker_verify_target(target_config)
             llm_required = any(
                 action.get("disposition") == "llm_required"
                 for action in plan["actions"]

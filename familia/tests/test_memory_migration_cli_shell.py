@@ -8,7 +8,7 @@ import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -137,6 +137,184 @@ def _docker_target_objects() -> dict[str, dict[str, object]]:
     return objects
 
 
+def _prepare_cli_target(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, Path, Path, tuple[Path, ...]]:
+    snapshot_root = tmp_path / "snapshot"
+    target_root = tmp_path / "isolated"
+    workspace = target_root / "state" / "files"
+    memory_dir = workspace / "memory"
+    snapshot_root.mkdir()
+    memory_dir.mkdir(parents=True)
+    target_root.chmod(0o700)
+    (target_root / ".familia-memory-migration-target.json").write_text(
+        json.dumps(
+            {
+                "marker_version": "1.0.0",
+                "purpose": "familia-memory-migration",
+                "target_id": "isolated-test",
+                "non_production": True,
+                "filesystem_root": str(target_root.resolve()),
+                "snapshot_id": "a" * 64,
+                "contract_version": memory_migration.MEMORY_CONTRACT_VERSION,
+            }
+        ),
+        encoding="utf-8",
+    )
+    principals_path = workspace / "principals.json"
+    principals_path.write_text(
+        json.dumps({"principals": [{"id": "alice", "memx_key": "alice-key"}]}),
+        encoding="utf-8",
+    )
+    target_config = _write_target_config(target_root, workspace, principals_path)
+    flat_paths = (
+        workspace / "USER.md",
+        workspace / "MEMORY.md",
+        memory_dir / "MEMORY.md",
+    )
+    for path in flat_paths:
+        path.write_text("legacy", encoding="utf-8")
+    (memory_dir / "history.jsonl").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "cursor": 1,
+                "timestamp": "2026-09-10 10:00",
+                "actor": "alice",
+                "content": "legacy fact",
+                "provenance": {"source": "synthetic", "idempotency_key": None},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return (
+        snapshot_root,
+        target_root,
+        workspace,
+        principals_path,
+        target_config,
+        flat_paths,
+    )
+
+
+def _patch_docker_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    objects: dict[str, dict[str, object]],
+    local_namespaces: dict[str, tuple[int, int]],
+    container_namespaces: dict[str, tuple[int, int]],
+) -> tuple[list[list[str]], list[dict[str, str]]]:
+    docker_commands: list[list[str]] = []
+    docker_envs: list[dict[str, str]] = []
+    original_stat = memory_migration.os.stat
+
+    def fake_stat(path: str, *args: object, **kwargs: object) -> object:
+        path_text = str(path)
+        namespace = path_text.rsplit("/", 1)[-1]
+        if path_text.startswith("/proc/self/ns/") and namespace in local_namespaces:
+            device, inode = local_namespaces[namespace]
+            return SimpleNamespace(st_dev=device, st_ino=inode)
+        return original_stat(path, *args, **kwargs)
+
+    def fake_docker_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        command = list(command)
+        docker_commands.append(command)
+        env = kwargs.get("env")
+        assert isinstance(env, dict)
+        docker_envs.append(dict(env))
+        assert command[:3] == [
+            "docker",
+            "--host",
+            "unix:///var/run/docker.sock",
+        ]
+        if command[3] == "inspect":
+            kind, reference = command[5], command[6]
+            return SimpleNamespace(
+                stdout=json.dumps([objects[f"{kind}:{reference}"]]),
+                stderr="",
+            )
+        if command[3] == "exec":
+            assert command[4] == objects["container:runner"]["Id"]
+            assert command[5] == "python3"
+            return SimpleNamespace(
+                stdout=json.dumps(
+                    {
+                        namespace: {"st_dev": device, "st_ino": inode}
+                        for namespace, (device, inode) in container_namespaces.items()
+                    }
+                ),
+                stderr="",
+            )
+        raise AssertionError(f"unexpected Docker command: {command}")
+
+    monkeypatch.setattr(memory_migration.os, "stat", fake_stat)
+    monkeypatch.setattr(memory_migration.subprocess, "run", fake_docker_run)
+    return docker_commands, docker_envs
+
+
+def _patch_target_http(monkeypatch: pytest.MonkeyPatch) -> tuple[list[Any], dict[str, Any]]:
+    import httpx
+
+    requests: list[Any] = []
+    client_type = httpx.AsyncClient
+    values: dict[str, str] = {}
+    versions: dict[str, int] = {}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        key = request.url.params.get("key")
+        if request.method == "GET":
+            if key not in values:
+                return httpx.Response(404, request=request)
+            return httpx.Response(
+                200,
+                json={"value": values[key], "ts": versions[key]},
+                request=request,
+            )
+        payload = json.loads(request.content.decode("utf-8"))
+        if request.url.path.endswith("/delete"):
+            values.pop(payload["key"], None)
+            versions.pop(payload["key"], None)
+            body = {
+                "ok": True,
+                "status": "deleted",
+                "committed": True,
+                "updated": True,
+                "retryable": False,
+                "version": None,
+            }
+        else:
+            values[payload["key"]] = payload["value"]
+            versions[payload["key"]] = versions.get(payload["key"], 0) + 1
+            body = {
+                "ok": True,
+                "status": "committed",
+                "committed": True,
+                "updated": True,
+                "retryable": False,
+                "version": versions[payload["key"]],
+            }
+        return httpx.Response(200, json=body, request=request)
+
+    async def handle_async(request: httpx.Request) -> httpx.Response:
+        return handle(request)
+
+    async_transport = httpx.MockTransport(handle_async)
+    monkeypatch.setattr(
+        "familia.principal_memory_ingestor.httpx.AsyncClient",
+        lambda **kwargs: client_type(transport=async_transport, **kwargs),
+    )
+
+    sync_transport = httpx.MockTransport(handle)
+
+    def get(url: str, **kwargs: Any) -> httpx.Response:
+        with httpx.Client(transport=sync_transport) as client:
+            return client.get(url, **kwargs)
+
+    monkeypatch.setattr(httpx, "get", get)
+    return requests, values
+
+
 def test_f2_registry_is_explicit_and_missing_registry_refuses(tmp_path: Path) -> None:
     install_root = tmp_path / "install"
     workspace = install_root / "workspace"
@@ -170,12 +348,400 @@ def test_f2_docker_proof_binds_runner_memx_redis_and_internal_storage(
         "_docker_inspect",
         lambda kind, reference: objects[f"{kind}:{reference}"],
     )
-    monkeypatch.setattr(memory_migration.socket, "gethostname", lambda: "a" * 12)
+    config["runner"]["hostname"] = "configured-runner"
+    objects["container:runner"]["Config"]["Hostname"] = "runtime-runner"
+    namespace_values = {
+        "net": (11, 101),
+        "pid": (12, 102),
+        "mnt": (13, 103),
+    }
+
+    original_stat = memory_migration.os.stat
+
+    def fake_stat(path: str, *args: object, **kwargs: object) -> object:
+        path_text = str(path)
+        namespace = path_text.rsplit("/", 1)[-1]
+        if path_text.startswith("/proc/self/ns/") and namespace in namespace_values:
+            device, inode = namespace_values[namespace]
+            return SimpleNamespace(st_dev=device, st_ino=inode)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(memory_migration.os, "stat", fake_stat)
+    monkeypatch.setattr(
+        memory_migration.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            stdout=json.dumps(
+                {
+                    namespace: {"st_dev": device, "st_ino": inode}
+                    for namespace, (device, inode) in namespace_values.items()
+                }
+            ),
+            stderr="",
+        ),
+    )
     memory_migration._docker_verify_target(config)
 
     objects["network:familia-internal"]["Internal"] = False
     with pytest.raises(memory_migration.MigrationPreflightError, match="internal"):
         memory_migration._docker_verify_target(config)
+
+
+def test_f2_docker_proof_rejects_namespace_mismatch_even_with_matching_hostname(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target_root = tmp_path / "isolated"
+    workspace = target_root / "state" / "files"
+    principals = workspace / "principals.json"
+    workspace.mkdir(parents=True)
+    config_path = _write_target_config(target_root, workspace, principals)
+    config = memory_migration._target_config(
+        config_path, target_root.resolve(), workspace.resolve(), principals.resolve()
+    )
+    objects = _docker_target_objects()
+    objects["container:runner"]["Config"]["Hostname"] = "configured-runner"
+    config["runner"]["hostname"] = "configured-runner"
+    monkeypatch.setattr(
+        memory_migration,
+        "_docker_inspect",
+        lambda kind, reference: objects[f"{kind}:{reference}"],
+    )
+    local_namespaces = {
+        "net": (21, 201),
+        "pid": (22, 202),
+        "mnt": (23, 203),
+    }
+    container_namespaces = {
+        "net": (31, 301),
+        "pid": (22, 202),
+        "mnt": (23, 203),
+    }
+
+    original_stat = memory_migration.os.stat
+
+    def fake_stat(path: str, *args: object, **kwargs: object) -> object:
+        path_text = str(path)
+        namespace = path_text.rsplit("/", 1)[-1]
+        if path_text.startswith("/proc/self/ns/") and namespace in local_namespaces:
+            device, inode = local_namespaces[namespace]
+            return SimpleNamespace(st_dev=device, st_ino=inode)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(memory_migration.os, "stat", fake_stat)
+    docker_exec = Mock(
+        return_value=SimpleNamespace(
+            stdout=json.dumps(
+                {
+                    namespace: {"st_dev": device, "st_ino": inode}
+                    for namespace, (device, inode) in container_namespaces.items()
+                }
+            ),
+            stderr="",
+        )
+    )
+    monkeypatch.setattr(memory_migration.subprocess, "run", docker_exec)
+    monkeypatch.setenv("DOCKER_HOST", "tcp://untrusted.example:2375")
+    monkeypatch.setenv("DOCKER_CONTEXT", "untrusted")
+    monkeypatch.setenv("DOCKER_TLS_VERIFY", "1")
+    monkeypatch.setenv("DOCKER_CERT_PATH", "C:/untrusted-certs")
+
+    with pytest.raises(memory_migration.MigrationPreflightError, match="namespace"):
+        memory_migration._docker_verify_target(config)
+
+    command = docker_exec.call_args.args[0]
+    assert command[:3] == ["docker", "--host", "unix:///var/run/docker.sock"]
+    assert command[command.index("exec") + 1] == config["runner"]["id"]
+    assert command[command.index("exec") + 2] == "python3"
+    assert "DOCKER_HOST" not in docker_exec.call_args.kwargs["env"]
+    assert "DOCKER_CONTEXT" not in docker_exec.call_args.kwargs["env"]
+    assert "DOCKER_TLS_VERIFY" not in docker_exec.call_args.kwargs["env"]
+    assert "DOCKER_CERT_PATH" not in docker_exec.call_args.kwargs["env"]
+
+
+def test_f2_docker_proof_rejects_invalid_namespace_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target_root = tmp_path / "isolated"
+    workspace = target_root / "state" / "files"
+    principals = workspace / "principals.json"
+    workspace.mkdir(parents=True)
+    config_path = _write_target_config(target_root, workspace, principals)
+    config = memory_migration._target_config(
+        config_path, target_root.resolve(), workspace.resolve(), principals.resolve()
+    )
+    objects = _docker_target_objects()
+    monkeypatch.setattr(
+        memory_migration,
+        "_docker_inspect",
+        lambda kind, reference: objects[f"{kind}:{reference}"],
+    )
+    original_stat = memory_migration.os.stat
+
+    def fake_stat(path: str, *args: object, **kwargs: object) -> object:
+        if str(path).startswith("/proc/self/ns/"):
+            return SimpleNamespace(st_dev=41, st_ino=401)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(memory_migration.os, "stat", fake_stat)
+    monkeypatch.setattr(
+        memory_migration.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout="not-json", stderr=""),
+    )
+
+    with pytest.raises(memory_migration.MigrationPreflightError, match="namespace"):
+        memory_migration._docker_verify_target(config)
+
+
+def test_apply_namespace_refusal_happens_before_manifest_write_or_target_io(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        snapshot_root,
+        target_root,
+        workspace,
+        principals_path,
+        target_config,
+        flat_paths,
+    ) = _prepare_cli_target(tmp_path)
+    flat_before = {path: path.read_bytes() for path in flat_paths}
+    manifest = target_root / "migration-plan.json"
+    writes: list[tuple[Path, bytes]] = []
+    objects = _docker_target_objects()
+    local_namespaces = {
+        "net": (51, 501),
+        "pid": (52, 502),
+        "mnt": (53, 503),
+    }
+    container_namespaces = {
+        "net": (61, 601),
+        "pid": (52, 502),
+        "mnt": (53, 503),
+    }
+    docker_commands, docker_envs = _patch_docker_cli(
+        monkeypatch,
+        objects,
+        local_namespaces,
+        container_namespaces,
+    )
+    monkeypatch.setattr("socket.gethostname", lambda: "a" * 12)
+    monkeypatch.setenv("DOCKER_HOST", "tcp://untrusted.example:2375")
+    monkeypatch.setenv("DOCKER_CONTEXT", "untrusted")
+    monkeypatch.setenv("DOCKER_TLS_VERIFY", "1")
+    monkeypatch.setenv("DOCKER_CERT_PATH", "C:/untrusted-certs")
+
+    def record_write(path: Path, data: bytes) -> None:
+        writes.append((path, data))
+
+    with (
+        patch(
+            "scripts.compare_memory_state.load_and_validate_manifest",
+            return_value={
+                "schema_version": memory_migration.SNAPSHOT_SCHEMA_VERSION,
+                "snapshot_format_version": memory_migration.SNAPSHOT_FORMAT_VERSION,
+                "status": "complete",
+                "state_role": "source",
+                "snapshot_id": "a" * 64,
+                "versions": {
+                    "snapshot_schema": memory_migration.SNAPSHOT_SCHEMA_VERSION,
+                },
+            },
+        ),
+        patch.object(
+            memory_migration,
+            "build_legacy_transition_plan",
+            return_value={"status": "ready", "actions": [], "summary": {}},
+        ),
+        patch.object(
+            memory_migration,
+            "_write_private_atomic",
+            side_effect=record_write,
+        ),
+        patch.object(
+            memory_migration,
+            "_target_get_raw",
+            side_effect=AssertionError("target HTTP must not be configured"),
+        ) as target_get_raw,
+        patch(
+            "familia.principal_memory_ingestor.PrincipalMemoryIngestor",
+            side_effect=AssertionError("ingestor must not be configured"),
+        ) as ingestor_type,
+    ):
+        exit_code = memory_migration.cli(
+            [
+                "--snapshot",
+                str(snapshot_root),
+                "--install-root",
+                str(target_root),
+                "--workspace",
+                str(workspace),
+                "--principals",
+                str(principals_path),
+                "--target-config",
+                str(target_config),
+                "--manifest",
+                str(manifest),
+                "--journal",
+                str(target_root / "migration-journal.jsonl"),
+                "--apply",
+            ]
+        )
+
+    assert exit_code == 2
+    target_get_raw.assert_not_called()
+    ingestor_type.assert_not_called()
+    assert writes == []
+    assert not manifest.exists()
+    assert {path: path.read_bytes() for path in flat_paths} == flat_before
+    assert len(docker_commands) == 7
+    assert sum(command[3] == "inspect" for command in docker_commands) == 6
+    assert sum(command[3] == "exec" for command in docker_commands) == 1
+    assert all(
+        command[:3] == ["docker", "--host", "unix:///var/run/docker.sock"]
+        for command in docker_commands
+    )
+    assert all("DOCKER_HOST" not in env for env in docker_envs)
+    assert all("DOCKER_CONTEXT" not in env for env in docker_envs)
+    assert all("DOCKER_TLS_VERIFY" not in env for env in docker_envs)
+    assert all("DOCKER_CERT_PATH" not in env for env in docker_envs)
+    exec_command = next(command for command in docker_commands if command[3] == "exec")
+    assert exec_command[4] == objects["container:runner"]["Id"]
+
+
+def test_apply_namespace_proof_allows_matching_namespaces_and_repeat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        snapshot_root,
+        target_root,
+        workspace,
+        principals_path,
+        target_config,
+        flat_paths,
+    ) = _prepare_cli_target(tmp_path)
+    config = json.loads(target_config.read_text(encoding="utf-8"))
+    config["runner"]["hostname"] = "custom-runner"
+    target_config.write_text(json.dumps(config), encoding="utf-8")
+    history_path = workspace / "memory" / "history.jsonl"
+    history_before = history_path.read_bytes()
+
+    objects = _docker_target_objects()
+    objects["container:runner"]["Config"]["Hostname"] = "runtime-does-not-matter"
+    namespaces = {
+        "net": (71, 701),
+        "pid": (72, 702),
+        "mnt": (73, 703),
+    }
+    docker_commands, docker_envs = _patch_docker_cli(
+        monkeypatch,
+        objects,
+        namespaces,
+        namespaces,
+    )
+    monkeypatch.setattr("socket.gethostname", lambda: "host-does-not-matter")
+    monkeypatch.setenv("DOCKER_HOST", "tcp://untrusted.example:2375")
+    monkeypatch.setenv("DOCKER_CONTEXT", "untrusted")
+    monkeypatch.setenv("DOCKER_TLS_VERIFY", "1")
+    monkeypatch.setenv("DOCKER_CERT_PATH", "C:/untrusted-certs")
+    requests, values = _patch_target_http(monkeypatch)
+    manifest = target_root / "migration-plan.json"
+
+    async def consolidate(
+        _actor: str,
+        _records: list[dict[str, Any]],
+        _existing: str,
+    ) -> str:
+        return "consolidated legacy history"
+
+    snapshot = {
+        "schema_version": memory_migration.SNAPSHOT_SCHEMA_VERSION,
+        "snapshot_format_version": memory_migration.SNAPSHOT_FORMAT_VERSION,
+        "status": "complete",
+        "state_role": "source",
+        "snapshot_id": "a" * 64,
+        "versions": {"snapshot_schema": memory_migration.SNAPSHOT_SCHEMA_VERSION},
+    }
+    argv = [
+        "--snapshot",
+        str(snapshot_root),
+        "--install-root",
+        str(target_root),
+        "--workspace",
+        str(workspace),
+        "--principals",
+        str(principals_path),
+        "--target-config",
+        str(target_config),
+        "--manifest",
+        str(manifest),
+        "--journal",
+        str(target_root / "migration-journal.jsonl"),
+        "--apply",
+        "--json",
+    ]
+    with (
+        patch(
+            "scripts.compare_memory_state.load_and_validate_manifest",
+            return_value=snapshot,
+        ),
+        patch.object(
+            memory_migration,
+            "make_configured_history_consolidator",
+            return_value=consolidate,
+        ) as consolidator_factory,
+    ):
+        first_output = io.StringIO()
+        with redirect_stdout(first_output):
+            first_exit = memory_migration.cli(argv)
+        second_output = io.StringIO()
+        with redirect_stdout(second_output):
+            second_exit = memory_migration.cli(argv)
+
+    assert first_exit == 0
+    assert second_exit == 0
+    assert json.loads(first_output.getvalue())["status"] == "complete"
+    assert json.loads(second_output.getvalue())["status"] == "complete"
+    consolidator_factory.assert_called()
+    assert values["private:alice:memory:legacy-history"] == "consolidated legacy history"
+    assert all(path.read_bytes() == b"" for path in flat_paths)
+    assert history_path.read_bytes() == history_before
+    assert manifest.exists()
+    assert [request.method for request in requests] == [
+        "GET",
+        "GET",
+        "POST",
+        "GET",
+        "GET",
+        "POST",
+    ]
+    assert [request.url.path for request in requests] == [
+        "/get",
+        "/get",
+        "/set",
+        "/get",
+        "/get",
+        "/set",
+    ]
+    assert len(docker_commands) == 14
+    assert sum(command[3] == "inspect" for command in docker_commands) == 12
+    assert sum(command[3] == "exec" for command in docker_commands) == 2
+    assert all(
+        command[:3] == ["docker", "--host", "unix:///var/run/docker.sock"]
+        for command in docker_commands
+    )
+    assert all("DOCKER_HOST" not in env for env in docker_envs)
+    assert all("DOCKER_CONTEXT" not in env for env in docker_envs)
+    assert all("DOCKER_TLS_VERIFY" not in env for env in docker_envs)
+    assert all("DOCKER_CERT_PATH" not in env for env in docker_envs)
+    assert all(
+        command[4] == objects["container:runner"]["Id"]
+        for command in docker_commands
+        if command[3] == "exec"
+    )
 
 
 def test_obsolete_isolated_migration_api_is_absent() -> None:
