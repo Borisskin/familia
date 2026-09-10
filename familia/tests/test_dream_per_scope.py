@@ -218,7 +218,7 @@ async def test_dream_memory_set_policy_denial_precedes_ingestor(
 
     result = await tool.execute(kind=kind, fact_id=fact_id, value=value)
 
-    assert result.startswith("Policy denied memory.write")
+    assert result.startswith("Error: Policy denied memory.write")
     assert "secret" not in result
     denied.evaluate.assert_called_once()
     context = denied.evaluate.call_args.args[0]

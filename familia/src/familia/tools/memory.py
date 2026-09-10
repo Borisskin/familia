@@ -439,7 +439,7 @@ def _check_memory_write_policy(*, actor: str, full_key: str) -> str | None:
     if decision.decision is Decision.ALLOW:
         return None
     reason = decision.reason or f"policy decision {decision.decision.value}"
-    return f"Policy denied memory.write на '{full_key}': {reason}"
+    return f"Error: Policy denied memory.write на '{full_key}': {reason}"
 
 
 _ACTOR_PARAM_DESC = (

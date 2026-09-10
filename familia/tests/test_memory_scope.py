@@ -215,7 +215,7 @@ def test_memory_set_policy_denial_precedes_topic_and_memx_write(
         )
     )
 
-    assert result.startswith("Policy denied memory.write")
+    assert result.startswith("Error: Policy denied memory.write")
     assert "secret fact" not in result
     denied.evaluate.assert_called_once()
     context = denied.evaluate.call_args.args[0]

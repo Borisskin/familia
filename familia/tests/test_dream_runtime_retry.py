@@ -13,7 +13,9 @@ import pytest
 from familia import principals as principals_mod
 from familia.bootstrap import make_dream_turn_context
 from familia.nanobot_extension.cron import make_dream_tool_installers
+from familia.policy import Decision, PolicyEngine, PolicyRule
 from familia.principals import Identity, Principal, PrincipalRegistry, set_current_actor
+from familia.private_session_owner import PrivateSessionOwnerResolver
 from familia.tools import dream_memory as dream_memory_mod
 from nanobot.agent.memory import Consolidator, Dream, MemoryStore
 from nanobot.providers.base import LLMResponse, ToolCallRequest
@@ -27,14 +29,14 @@ def registry(monkeypatch: pytest.MonkeyPatch) -> PrincipalRegistry:
             Principal(
                 id="actor_alpha",
                 display_name="Actor Alpha",
-                identities=[Identity(channel="test", sender_id="alpha")],
+                identities=[Identity(channel="telegram", sender_id="private-chat")],
                 memx_key="alpha-key",
                 roles=[],
             ),
             Principal(
                 id="actor_beta",
                 display_name="Actor Beta",
-                identities=[Identity(channel="test", sender_id="beta")],
+                identities=[Identity(channel="telegram", sender_id="private-chat-beta")],
                 memx_key="beta-key",
                 roles=[],
             ),
@@ -85,6 +87,44 @@ def _call(call_id: str, **arguments: Any) -> ToolCallRequest:
         name="dream_memory_set",
         arguments=arguments,
     )
+
+
+def _mock_memx_transport(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    import httpx
+
+    requests: list[Any] = []
+    client_type = httpx.AsyncClient
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(404, request=request)
+        if request.url.path.endswith("/delete"):
+            payload = {
+                "ok": True,
+                "status": "deleted",
+                "committed": True,
+                "updated": True,
+                "retryable": False,
+                "version": None,
+            }
+        else:
+            payload = {
+                "ok": True,
+                "status": "committed",
+                "committed": True,
+                "updated": True,
+                "retryable": False,
+                "version": 1,
+            }
+        return httpx.Response(200, json=payload, request=request)
+
+    transport = httpx.MockTransport(handle)
+    monkeypatch.setattr(
+        "familia.principal_memory_ingestor.httpx.AsyncClient",
+        lambda **kwargs: client_type(transport=transport, **kwargs),
+    )
+    return requests
 
 
 def _dream(
@@ -154,6 +194,212 @@ async def test_private_archive_rejects_denied_invalid_required_memory(
             "actor_alpha",
             [{"role": "user", "content": "Я перестал работать"}],
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("analysis", "operation", "decision"),
+    [
+        (
+            "[PROFILE] kind=profile value=обновлённый профиль",
+            {"kind": "profile", "fact_id": None, "value": "обновлённый профиль"},
+            Decision.DENY,
+        ),
+        (
+            "[MEMORY] kind=memory fact_id=fact-17 value=секретный факт",
+            {"kind": "memory", "fact_id": "fact-17", "value": "секретный факт"},
+            Decision.ASK,
+        ),
+        (
+            "[DELETE] kind=delete fact_id=fact-17",
+            {"kind": "delete", "fact_id": "fact-17", "value": None},
+            Decision.DENY,
+        ),
+    ],
+)
+async def test_policy_refusal_preserves_session_history_and_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    registry: PrincipalRegistry,
+    analysis: str,
+    operation: dict[str, Any],
+    decision: Decision,
+) -> None:
+    from familia.tools import memory as memory_mod
+
+    kind = operation["kind"]
+    policy_key = (
+        "private:actor_alpha:value:user_profile"
+        if kind == "profile"
+        else f"private:actor_alpha:memory:{operation['fact_id']}"
+    )
+    policy = PolicyEngine(
+        [
+            PolicyRule(
+                name="deny automatic writes",
+                action=["memory.write"],
+                actor=["dream_consolidator"],
+                to_chat=[policy_key],
+                decision=decision,
+                reason="blocked",
+            )
+        ]
+    )
+    monkeypatch.setattr(memory_mod, "get_engine", lambda: policy)
+    requests = _mock_memx_transport(monkeypatch)
+    from familia.principal_memory_ingestor import PrincipalMemoryIngestor
+
+    ingestor = PrincipalMemoryIngestor(
+        base_url="http://memx.test",
+        api_key="synthetic-key",
+    )
+    provider = _ScriptedProvider(analysis, [_call("operation", **operation)])
+    dream, store = _dream(
+        tmp_path,
+        provider,
+        ingestor=ingestor,
+        server_principal_getter=lambda: "actor_alpha",
+    )
+    session = Session(key="telegram:private-chat")
+    session.add_message("user", "old user message")
+    session.add_message("assistant", "old assistant message")
+    session.add_message("user", "current user message")
+    session.add_message("assistant", "current assistant message")
+    expected_messages = [dict(message) for message in session.messages]
+    expected_last_consolidated = session.last_consolidated
+    sessions = Mock()
+    sessions.get_or_create.return_value = session
+    consolidator = Consolidator(
+        store=store,
+        provider=provider,
+        model="test-model",
+        sessions=sessions,
+        context_window_tokens=100,
+        build_messages=Mock(return_value=[]),
+        get_tool_definitions=Mock(return_value=[]),
+        max_completion_tokens=0,
+        archive_sink=dream.archive_private,
+        private_session_owner_resolver=PrivateSessionOwnerResolver(
+            lambda: registry
+        ),
+    )
+    consolidator._SAFETY_BUFFER = 0
+    consolidator.estimate_session_prompt_tokens = Mock(
+        side_effect=[(1000, "test"), (0, "test")]
+    )
+    consolidator.pick_consolidation_boundary = Mock(return_value=(2, 500))
+
+    with pytest.raises(RuntimeError):
+        await consolidator.maybe_consolidate_by_tokens(session)
+
+    assert session.messages == expected_messages
+    assert session.last_consolidated == expected_last_consolidated
+    sessions.save.assert_not_called()
+    assert requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", [Decision.DENY, Decision.ASK])
+async def test_partial_policy_refusal_preserves_prior_commit_and_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    registry: PrincipalRegistry,
+    decision: Decision,
+) -> None:
+    from familia.tools import memory as memory_mod
+
+    first_key = "private:actor_alpha:memory:first-fact"
+    second_key = "private:actor_alpha:memory:second-fact"
+    policy = PolicyEngine(
+        [
+            PolicyRule(
+                name="allow first automatic write",
+                action=["memory.write"],
+                actor=["dream_consolidator"],
+                to_chat=[first_key],
+                decision=Decision.ALLOW,
+            ),
+            PolicyRule(
+                name="refuse second automatic write",
+                action=["memory.write"],
+                actor=["dream_consolidator"],
+                to_chat=[second_key],
+                decision=decision,
+                reason="blocked",
+            ),
+        ]
+    )
+    monkeypatch.setattr(memory_mod, "get_engine", lambda: policy)
+    requests = _mock_memx_transport(monkeypatch)
+    from familia.principal_memory_ingestor import PrincipalMemoryIngestor
+
+    ingestor = PrincipalMemoryIngestor(
+        base_url="http://memx.test",
+        api_key="synthetic-key",
+    )
+    provider = _ScriptedProvider(
+        (
+            "[MEMORY] kind=memory fact_id=first-fact value=первый факт\n"
+            "[MEMORY] kind=memory fact_id=second-fact value=второй факт"
+        ),
+        [
+            _call(
+                "first",
+                kind="memory",
+                fact_id="first-fact",
+                value="первый факт",
+            ),
+            _call(
+                "second",
+                kind="memory",
+                fact_id="second-fact",
+                value="второй факт",
+            ),
+        ],
+    )
+    dream, store = _dream(
+        tmp_path,
+        provider,
+        ingestor=ingestor,
+        server_principal_getter=lambda: "actor_alpha",
+    )
+    session = Session(key="telegram:private-chat")
+    session.add_message("user", "old user message")
+    session.add_message("assistant", "old assistant message")
+    session.add_message("user", "current user message")
+    session.add_message("assistant", "current assistant message")
+    expected_messages = [dict(message) for message in session.messages]
+    expected_last_consolidated = session.last_consolidated
+    sessions = Mock()
+    sessions.get_or_create.return_value = session
+    consolidator = Consolidator(
+        store=store,
+        provider=provider,
+        model="test-model",
+        sessions=sessions,
+        context_window_tokens=100,
+        build_messages=Mock(return_value=[]),
+        get_tool_definitions=Mock(return_value=[]),
+        max_completion_tokens=0,
+        archive_sink=dream.archive_private,
+        private_session_owner_resolver=PrivateSessionOwnerResolver(
+            lambda: registry
+        ),
+    )
+    consolidator._SAFETY_BUFFER = 0
+    consolidator.estimate_session_prompt_tokens = Mock(
+        side_effect=[(1000, "test"), (0, "test")]
+    )
+    consolidator.pick_consolidation_boundary = Mock(return_value=(2, 500))
+
+    with pytest.raises(RuntimeError):
+        await consolidator.maybe_consolidate_by_tokens(session)
+
+    assert session.messages == expected_messages
+    assert session.last_consolidated == expected_last_consolidated
+    sessions.save.assert_not_called()
+    assert [request.method for request in requests] == ["GET", "POST"]
+    assert requests[1].url.path == "/set"
 
 
 @pytest.mark.asyncio
