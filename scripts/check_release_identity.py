@@ -13,8 +13,8 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NANOBOT_VERSION = "0.1.5.post2"
-NANOBOT_BASELINE = "950dddec499fbbe0353e997158c99808f0bb41e1"
+NANOBOT_VERSION = "0.3.0"
+NANOBOT_BASELINE = "3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec"
 
 
 def _toml(relative: str) -> dict[str, Any]:

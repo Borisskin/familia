@@ -7,13 +7,11 @@ All requests route to a single persistent API session.
 from __future__ import annotations
 
 import asyncio
-import base64
+import contextlib
+import hmac
 import json as _json
-import mimetypes
-import re
 import time
 import uuid
-from pathlib import Path
 from typing import Any
 
 from aiohttp import web
@@ -21,18 +19,48 @@ from loguru import logger
 
 from nanobot.config.paths import get_media_dir
 from nanobot.utils.helpers import safe_filename
+from nanobot.utils.media_decode import (
+    MAX_FILE_SIZE,
+)
+from nanobot.utils.media_decode import (
+    FileSizeExceeded as _FileSizeExceeded,
+)
+from nanobot.utils.media_decode import (
+    save_base64_data_url as _save_base64_data_url,
+)
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
-_DATA_URL_RE = re.compile(r"^data:([^;]+);base64,(.+)$", re.DOTALL)
-
-
-class _FileSizeExceeded(Exception):
-    """Raised when an uploaded file exceeds the size limit."""
+__all__ = (
+    "MAX_FILE_SIZE",
+    "_FileSizeExceeded",
+    "_save_base64_data_url",
+    "create_app",
+    "handle_chat_completions",
+)
 
 
 API_SESSION_KEY = "api:default"
 API_CHAT_ID = "default"
+_AGENT_LOOP_KEY = web.AppKey[Any]("agent_loop")
+_MODEL_NAME_KEY = web.AppKey[str]("model_name")
+_REQUEST_TIMEOUT_KEY = web.AppKey[float]("request_timeout")
+_SESSION_LOCKS_KEY = web.AppKey[dict]("session_locks")
+_MISSING = object()
+
+
+def _app_value(
+    app: Any,
+    key: web.AppKey[Any],
+    legacy_key: str,
+    default: Any = _MISSING,
+) -> Any:
+    """Read typed aiohttp state while accepting lightweight dict test doubles."""
+    try:
+        return app[key]
+    except KeyError:
+        if default is _MISSING:
+            return app[legacy_key]
+        return app.get(legacy_key, default)
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +75,14 @@ def _error_json(status: int, message: str, err_type: str = "invalid_request_erro
     )
 
 
-def _chat_completion_response(content: str, model: str) -> dict[str, Any]:
+def _chat_completion_response(
+    content: str,
+    model: str,
+    usage: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    prompt = (usage or {}).get("prompt_tokens", 0)
+    completion = (usage or {}).get("completion_tokens", 0)
+    total = (usage or {}).get("total_tokens", 0) or prompt + completion
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object": "chat.completion",
@@ -60,7 +95,11 @@ def _chat_completion_response(content: str, model: str) -> dict[str, Any]:
                 "finish_reason": "stop",
             }
         ],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total,
+        },
     }
 
 
@@ -100,25 +139,6 @@ _SSE_DONE = b"data: [DONE]\n\n"
 # ---------------------------------------------------------------------------
 # Upload helpers
 # ---------------------------------------------------------------------------
-
-
-def _save_base64_data_url(data_url: str, media_dir: Path) -> str | None:
-    """Decode a data:...;base64,... URL and save to disk."""
-    m = _DATA_URL_RE.match(data_url)
-    if not m:
-        return None
-    mime_type, b64_payload = m.group(1), m.group(2)
-    try:
-        raw = base64.b64decode(b64_payload)
-    except Exception:
-        return None
-    if len(raw) > MAX_FILE_SIZE:
-        raise _FileSizeExceeded(f"File exceeds {MAX_FILE_SIZE // (1024 * 1024)}MB limit")
-    ext = mimetypes.guess_extension(mime_type) or ".bin"
-    filename = f"{uuid.uuid4().hex[:12]}{ext}"
-    dest = media_dir / safe_filename(filename)
-    dest.write_bytes(raw)
-    return str(dest)
 
 
 def _parse_json_content(body: dict) -> tuple[str, list[str]]:
@@ -209,9 +229,14 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     if not isinstance(content_type, str):
         content_type = ""
 
-    agent_loop = request.app["agent_loop"]
-    timeout_s: float = request.app.get("request_timeout", 120.0)
-    model_name: str = request.app.get("model_name", "nanobot")
+    agent_loop = _app_value(request.app, _AGENT_LOOP_KEY, "agent_loop")
+    timeout_s: float = _app_value(
+        request.app,
+        _REQUEST_TIMEOUT_KEY,
+        "request_timeout",
+        120.0,
+    )
+    model_name: str = _app_value(request.app, _MODEL_NAME_KEY, "model_name", "nanobot")
 
     stream = False
     try:
@@ -238,7 +263,11 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         return _error_json(400, f"Only configured model '{model_name}' is available")
 
     session_key = f"api:{session_id}" if session_id else API_SESSION_KEY
-    session_locks: dict[str, asyncio.Lock] = request.app["session_locks"]
+    session_locks: dict[str, asyncio.Lock] = _app_value(
+        request.app,
+        _SESSION_LOCKS_KEY,
+        "session_locks",
+    )
     session_lock = session_locks.setdefault(session_key, asyncio.Lock())
 
     logger.info(
@@ -251,24 +280,30 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         resp.content_type = "text/event-stream"
         resp.headers["Cache-Control"] = "no-cache"
         resp.headers["Connection"] = "keep-alive"
-        resp.enable_compression()
         await resp.prepare(request)
 
         chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         queue: asyncio.Queue[str | None] = asyncio.Queue()
         stream_failed = False
+        emitted_content = False
 
         async def _on_stream(token: str) -> None:
+            nonlocal emitted_content
+            if token:
+                emitted_content = True
             await queue.put(token)
 
         async def _on_stream_end(*_a: Any, **_kw: Any) -> None:
-            await queue.put(None)
+            # Agent stream-end callbacks mark generation segment boundaries.
+            # Tool-backed requests may continue after a segment ends, so the
+            # HTTP SSE stream is closed only when process_direct returns.
+            return None
 
         async def _run() -> None:
             nonlocal stream_failed
             try:
                 async with session_lock:
-                    await asyncio.wait_for(
+                    response = await asyncio.wait_for(
                         agent_loop.process_direct(
                             content=text,
                             media=media_paths if media_paths else None,
@@ -280,9 +315,14 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                         ),
                         timeout=timeout_s,
                     )
+                    if not emitted_content:
+                        response_text = _response_text(response)
+                        if response_text.strip():
+                            await queue.put(response_text)
             except Exception:
                 stream_failed = True
                 logger.exception("Streaming error for session {}", session_key)
+            finally:
                 await queue.put(None)
 
         task = asyncio.create_task(_run())
@@ -293,7 +333,10 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                     break
                 await resp.write(_sse_chunk(token, model_name, chunk_id))
         finally:
-            task.cancel()
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
         if not stream_failed:
             await resp.write(_sse_chunk("", model_name, chunk_id, finish_reason="stop"))
@@ -301,8 +344,6 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         return resp
 
     # -- non-streaming path (original logic) --
-    _FALLBACK = EMPTY_FINAL_RESPONSE_MESSAGE
-
     try:
         async with session_lock:
             try:
@@ -317,23 +358,9 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                     timeout=timeout_s,
                 )
                 response_text = _response_text(response)
-
                 if not response_text or not response_text.strip():
-                    logger.warning("Empty response for session {}, retrying", session_key)
-                    retry_response = await asyncio.wait_for(
-                        agent_loop.process_direct(
-                            content=text,
-                            media=media_paths if media_paths else None,
-                            session_key=session_key,
-                            channel="api",
-                            chat_id=API_CHAT_ID,
-                        ),
-                        timeout=timeout_s,
-                    )
-                    response_text = _response_text(retry_response)
-                    if not response_text or not response_text.strip():
-                        logger.warning("Empty response after retry, using fallback")
-                        response_text = _FALLBACK
+                    logger.warning("Empty response for session {}, using fallback", session_key)
+                    response_text = EMPTY_FINAL_RESPONSE_MESSAGE
 
             except asyncio.TimeoutError:
                 return _error_json(504, f"Request timed out after {timeout_s}s")
@@ -344,12 +371,14 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         logger.exception("Unexpected API lock error for session {}", session_key)
         return _error_json(500, "Internal server error", err_type="server_error")
 
-    return web.json_response(_chat_completion_response(response_text, model_name))
+    return web.json_response(
+        _chat_completion_response(response_text, model_name, getattr(agent_loop, "_last_usage", None))
+    )
 
 
 async def handle_models(request: web.Request) -> web.Response:
     """GET /v1/models"""
-    model_name = request.app.get("model_name", "nanobot")
+    model_name = _app_value(request.app, _MODEL_NAME_KEY, "model_name", "nanobot")
     return web.json_response(
         {
             "object": "list",
@@ -376,7 +405,10 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 def create_app(
-    agent_loop, model_name: str = "nanobot", request_timeout: float = 120.0
+    agent_loop,
+    model_name: str = "nanobot",
+    request_timeout: float = 120.0,
+    api_key: str = "",
 ) -> web.Application:
     """Create the aiohttp application.
 
@@ -384,12 +416,29 @@ def create_app(
         agent_loop: An initialized AgentLoop instance.
         model_name: Model name reported in responses.
         request_timeout: Per-request timeout in seconds.
+        api_key: Optional API key for Bearer-token authentication on API routes.
     """
     app = web.Application(client_max_size=20 * 1024 * 1024)  # 20MB for base64 images
-    app["agent_loop"] = agent_loop
-    app["model_name"] = model_name
-    app["request_timeout"] = request_timeout
-    app["session_locks"] = {}  # per-user locks, keyed by session_key
+    app[_AGENT_LOOP_KEY] = agent_loop
+    app[_MODEL_NAME_KEY] = model_name
+    app[_REQUEST_TIMEOUT_KEY] = request_timeout
+    app[_SESSION_LOCKS_KEY] = {}  # per-user locks, keyed by session_key
+
+    @web.middleware
+    async def auth_middleware(request: web.Request, handler) -> web.StreamResponse:
+        # Allow unauthenticated health checks.
+        if request.path == "/health":
+            return await handler(request)
+        if not api_key:
+            return await handler(request)
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return _error_json(401, "Missing Authorization header. Use: Bearer <api_key>")
+        if not hmac.compare_digest(auth[len("Bearer "):], api_key):
+            return _error_json(401, "Invalid API key")
+        return await handler(request)
+
+    app.middlewares.append(auth_middleware)
 
     app.router.add_post("/v1/chat/completions", handle_chat_completions)
     app.router.add_get("/v1/models", handle_models)

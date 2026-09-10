@@ -1,0 +1,108 @@
+# nanobot baseline: 0.3.0
+# upstream commit: 3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec
+
+diff --git aa/nanobot/nanobot/agent/turn_delivery.py bb/nanobot/nanobot/agent/turn_delivery.py
+index 2eeb5aa..044db2c 100644
+--- aa/nanobot/nanobot/agent/turn_delivery.py
++++ bb/nanobot/nanobot/agent/turn_delivery.py
+@@ -8,6 +8,8 @@ from collections.abc import Awaitable, Callable
+ from dataclasses import dataclass, field
+ from typing import Any
+ 
++from nanobot.agent.outbound import RUNTIME_REQUEST_CONTEXT_KEY
++from nanobot.agent.tools.context import RequestContext
+ from nanobot.bus.events import InboundMessage, OutboundMessage
+ from nanobot.bus.outbound_events import (
+     RetryWaitEvent,
+@@ -128,11 +130,31 @@ class TurnDelivery:
+     _stream_segment: int = field(init=False, default=0)
+ 
+     def __post_init__(self) -> None:
++        route_metadata = dict(self.route.metadata)
++        for key in (
++            RUNTIME_REQUEST_CONTEXT_KEY,
++            "_runtime_actor",
++            "_runtime_action",
++            "_runtime_inbound_channel",
++            "_runtime_inbound_chat_id",
++        ):
++            route_metadata.pop(key, None)
++        if self.input_message.actor:
++            route_metadata[RUNTIME_REQUEST_CONTEXT_KEY] = RequestContext(
++                channel=self.input_message.channel,
++                chat_id=self.input_message.chat_id,
++                message_id=(self.input_message.metadata or {}).get("message_id"),
++                session_key=self.session_key,
++                original_user_text=self.input_message.content,
++                metadata={"actor": self.input_message.actor},
++                sender_id=self.input_message.sender_id,
++                actor=self.input_message.actor,
++            )
+         self.delivery_message = dataclasses.replace(
+             self.input_message,
+             channel=self.route.channel,
+             chat_id=self.route.chat_id,
+-            metadata=dict(self.route.metadata),
++            metadata=route_metadata,
+         )
+         self.lifecycle_message = (
+             self.delivery_message if self.route.publish_lifecycle else self.input_message
+@@ -164,7 +186,8 @@ class TurnDelivery:
+                     chat_id=self.delivery_message.chat_id,
+                     event=RetryWaitEvent(content=content),
+                     metadata=self.delivery_message.metadata,
+-                )
++                ),
++                action="message.send",
+             )
+ 
+         return _on_retry_wait
+@@ -226,7 +249,7 @@ class TurnDelivery:
+         completed_channel = self.lifecycle_message.channel
+         completed_chat_id = self.lifecycle_message.chat_id
+         if response is not None:
+-            await self.bus.publish_outbound(response)
++            await self.bus.publish_outbound(response, action="message.send")
+             completed_channel = response.channel
+             completed_chat_id = response.chat_id
+         elif self.lifecycle_message.channel == "cli":
+@@ -236,7 +259,8 @@ class TurnDelivery:
+                     chat_id=self.lifecycle_message.chat_id,
+                     content="",
+                     metadata=dict(self.lifecycle_message.metadata or {}),
+-                )
++                ),
++                action="message.send",
+             )
+         if publish_completion:
+             await self.runtime_event_publisher.turn_completed(
+@@ -253,7 +277,8 @@ class TurnDelivery:
+                 chat_id=self.lifecycle_message.chat_id,
+                 content="Sorry, I encountered an error.",
+                 metadata=dict(self.lifecycle_message.metadata or {}),
+-            )
++            ),
++            action="message.send",
+         )
+         if publish_completion:
+             await self.runtime_event_publisher.turn_completed(
+@@ -282,7 +307,8 @@ class TurnDelivery:
+                 chat_id=self.delivery_message.chat_id,
+                 event=StreamDeltaEvent(content=delta, stream_id=self._stream_id()),
+                 metadata=self.delivery_message.metadata,
+-            )
++            ),
++            action="message.send",
+         )
+ 
+     async def _publish_stream_end(self, *, resuming: bool = False) -> None:
+@@ -295,6 +321,7 @@ class TurnDelivery:
+                     resuming=resuming,
+                 ),
+                 metadata=self.delivery_message.metadata,
+-            )
++            ),
++            action="message.send",
+         )
+         self._stream_segment += 1
+

@@ -28,6 +28,7 @@ import json
 import mimetypes
 import os
 import random
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -794,9 +795,14 @@ class VKChannel(BaseChannel):
                 try:
                     r = await client.get(url, follow_redirects=True)
                     r.raise_for_status()
-                    path = media_dir / filename
-                    path.write_bytes(r.content)
-                    return str(path)
+                    safe_name = Path(filename.replace("\\", "/")).name
+                    suffix = Path(safe_name).suffix
+                    if not suffix or not suffix[1:].replace(".", "").replace("-", "").replace("_", "").isalnum():
+                        suffix = ""
+                    fd, path = tempfile.mkstemp(prefix="vk_", suffix=suffix, dir=media_dir)
+                    with os.fdopen(fd, "wb") as output:
+                        output.write(r.content)
+                    return path
                 except (httpx.TimeoutException, httpx.TransportError) as e:
                     last_err = e
                     if attempt < 2:

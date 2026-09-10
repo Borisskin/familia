@@ -46,7 +46,7 @@ def _write_target_config(
             "install_mount": {
                 "name": "runner-volume",
                 "id": "runner-volume",
-                "destination": "/work",
+                "destination": str(target_root.resolve()),
             },
         },
         "memx": {
@@ -81,7 +81,10 @@ def _write_target_config(
     return config_path
 
 
-def _docker_target_objects() -> dict[str, dict[str, object]]:
+def _docker_target_objects(
+    *,
+    runner_destination: str = "/work",
+) -> dict[str, dict[str, object]]:
     labels = {"familia.target": "synthetic-target"}
     network_id = "d" * 64
     ids = {"runner": "a" * 64, "memx": "b" * 64, "redis": "c" * 64}
@@ -93,7 +96,14 @@ def _docker_target_objects() -> dict[str, dict[str, object]]:
     ):
         env = ["REDIS_URL=redis://redis:6379/0"] if section == "memx" else []
         mounts = (
-            [{"Type": "volume", "Name": "runner-volume", "Destination": "/work", "RW": True}]
+            [
+                {
+                    "Type": "volume",
+                    "Name": "runner-volume",
+                    "Destination": runner_destination,
+                    "RW": True,
+                }
+            ]
             if section == "runner"
             else (
                 [{"Type": "volume", "Name": "redis-volume", "Destination": "/data", "RW": True}]
@@ -342,7 +352,9 @@ def test_f2_docker_proof_binds_runner_memx_redis_and_internal_storage(
     config = memory_migration._target_config(
         config_path, target_root.resolve(), workspace.resolve(), principals.resolve()
     )
-    objects = _docker_target_objects()
+    objects = _docker_target_objects(
+        runner_destination=config["runner"]["install_mount"]["destination"],
+    )
     monkeypatch.setattr(
         memory_migration,
         "_docker_inspect",
@@ -382,6 +394,28 @@ def test_f2_docker_proof_binds_runner_memx_redis_and_internal_storage(
     )
     memory_migration._docker_verify_target(config)
 
+    config["install_root"] = "/other"
+    with pytest.raises(
+        memory_migration.MigrationPreflightError,
+        match="install root is not on",
+    ):
+        memory_migration._docker_verify_target(config)
+
+    config["install_root"] = str(target_root.resolve())
+    foreign_mount = {
+        "Type": "bind",
+        "Source": "/other",
+        "Destination": f"{config['install_root']}/nested",
+        "RW": True,
+    }
+    objects["container:runner"]["Mounts"].append(foreign_mount)
+    with pytest.raises(
+        memory_migration.MigrationPreflightError,
+        match="overlapped",
+    ):
+        memory_migration._docker_verify_target(config)
+    objects["container:runner"]["Mounts"].remove(foreign_mount)
+
     objects["network:familia-internal"]["Internal"] = False
     with pytest.raises(memory_migration.MigrationPreflightError, match="internal"):
         memory_migration._docker_verify_target(config)
@@ -399,7 +433,9 @@ def test_f2_docker_proof_rejects_namespace_mismatch_even_with_matching_hostname(
     config = memory_migration._target_config(
         config_path, target_root.resolve(), workspace.resolve(), principals.resolve()
     )
-    objects = _docker_target_objects()
+    objects = _docker_target_objects(
+        runner_destination=config["runner"]["install_mount"]["destination"],
+    )
     objects["container:runner"]["Config"]["Hostname"] = "configured-runner"
     config["runner"]["hostname"] = "configured-runner"
     monkeypatch.setattr(
@@ -471,7 +507,9 @@ def test_f2_docker_proof_rejects_invalid_namespace_evidence(
     config = memory_migration._target_config(
         config_path, target_root.resolve(), workspace.resolve(), principals.resolve()
     )
-    objects = _docker_target_objects()
+    objects = _docker_target_objects(
+        runner_destination=config["runner"]["install_mount"]["destination"],
+    )
     monkeypatch.setattr(
         memory_migration,
         "_docker_inspect",
@@ -510,7 +548,9 @@ def test_apply_namespace_refusal_happens_before_manifest_write_or_target_io(
     flat_before = {path: path.read_bytes() for path in flat_paths}
     manifest = target_root / "migration-plan.json"
     writes: list[tuple[Path, bytes]] = []
-    objects = _docker_target_objects()
+    objects = _docker_target_objects(
+        runner_destination=str(target_root.resolve()),
+    )
     local_namespaces = {
         "net": (51, 501),
         "pid": (52, 502),
@@ -629,7 +669,9 @@ def test_apply_namespace_proof_allows_matching_namespaces_and_repeat(
     history_path = workspace / "memory" / "history.jsonl"
     history_before = history_path.read_bytes()
 
-    objects = _docker_target_objects()
+    objects = _docker_target_objects(
+        runner_destination=str(target_root.resolve()),
+    )
     objects["container:runner"]["Config"]["Hostname"] = "runtime-does-not-matter"
     namespaces = {
         "net": (71, 701),

@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CHECKER = ROOT / "patches" / "check_exact_reconstruction.py"
 UPSTREAM_REPO = ROOT.parent / "nanobot"
-UPSTREAM_COMMIT = "950dddec499fbbe0353e997158c99808f0bb41e1"
+UPSTREAM_COMMIT = "3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec"
 
 
 class ExactReconstructionAcceptanceTest(unittest.TestCase):

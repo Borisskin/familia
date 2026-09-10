@@ -447,7 +447,7 @@ class PrincipalMemoryClient:
             raise GraphIOError("principal profile read returned non-JSON data") from exc
         if payload is None:
             return {"value": None, "version": None}
-        if not isinstance(payload, dict) or set(payload) < {"value", "ts"}:
+        if not isinstance(payload, dict) or not {"value", "ts"}.issubset(payload):
             raise GraphIOError("principal profile read returned an invalid record")
         value = payload.get("value")
         version = payload.get("ts")

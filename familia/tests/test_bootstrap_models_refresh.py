@@ -12,6 +12,10 @@ class _ToolRegistry:
     def register(self, tool) -> None:
         self.registered.append(tool)
 
+    @property
+    def tool_names(self) -> tuple[str, ...]:
+        return tuple(tool.name for tool in self.registered)
+
 
 class _Bus:
     async def publish_outbound(self, message) -> None:

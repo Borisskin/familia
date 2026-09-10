@@ -1,0 +1,127 @@
+# nanobot baseline: 0.3.0
+# upstream commit: 3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec
+
+diff --git aa/nanobot/nanobot/audio/transcription.py bb/nanobot/nanobot/audio/transcription.py
+index 539f90b..43b1038 100644
+--- aa/nanobot/nanobot/audio/transcription.py
++++ bb/nanobot/nanobot/audio/transcription.py
+@@ -28,6 +28,7 @@ from nanobot.utils.media_decode import FileSizeExceeded, save_base64_data_url
+ TranscriptionProviderName = str
+ 
+ _DEFAULT_PROVIDER: TranscriptionProviderName = "groq"
++_DEFAULT_YANDEX_API_BASE = "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize"
+ _MAX_AUDIO_BYTES_FALLBACK = 25 * 1024 * 1024
+ _AUDIO_MIME_ALLOWED: frozenset[str] = frozenset({
+     "audio/aac",
+@@ -53,10 +54,13 @@ class EffectiveTranscriptionConfig:
+     api_base: str
+     max_duration_sec: int
+     max_upload_mb: int
++    folder_id: str = field(default="", repr=False)
+ 
+     @property
+     def configured(self) -> bool:
+-        return bool(self.api_key)
++        if not self.api_key or get_transcription_provider(self.provider) is None:
++            return False
++        return self.provider != "yandex" or bool(self.folder_id)
+ 
+ 
+ class TranscriptionIngressError(Exception):
+@@ -69,8 +73,10 @@ class TranscriptionIngressError(Exception):
+ 
+ 
+ def _as_provider(value: Any) -> TranscriptionProviderName | None:
++    if not isinstance(value, str) or not value.strip():
++        return None
+     spec = resolve_transcription_provider(value)
+-    return spec.name if spec else None
++    return spec.name if spec else value.strip().lower()
+ 
+ 
+ def _provider_config(config: Any, provider: str) -> Any:
+@@ -78,6 +84,8 @@ def _provider_config(config: Any, provider: str) -> Any:
+ 
+ 
+ def _provider_default_api_base(provider: str) -> str | None:
++    if provider == "yandex":
++        return _DEFAULT_YANDEX_API_BASE
+     spec = find_by_name(provider)
+     return spec.default_api_base if spec else None
+ 
+@@ -92,6 +100,10 @@ def _resolve_transcription_api_key(provider: str, provider_cfg: Any) -> str:
+         env_key = os.environ.get("SILICONFLOW_API_KEY")
+         if env_key:
+             return env_key
++    if provider == "yandex":
++        env_key = os.environ.get("YANDEX_API_KEY")
++        if env_key:
++            return env_key
+ 
+     env_key = spec.env_key if spec else ""
+     return os.environ.get(env_key) if env_key else ""
+@@ -101,6 +113,8 @@ def _resolve_transcription_api_base(provider: str, provider_cfg: Any) -> str:
+     api_base = resolve_env_refs(getattr(provider_cfg, "api_base", None) or "") if provider_cfg else ""
+     if api_base:
+         return api_base
++    if provider == "yandex":
++        return os.environ.get("YANDEX_STT_URL") or _DEFAULT_YANDEX_API_BASE
+     return _provider_default_api_base(provider) or ""
+ 
+ 
+@@ -115,18 +129,18 @@ def resolve_transcription_config(config: Any) -> EffectiveTranscriptionConfig:
+     """Resolve top-level transcription settings with legacy channel fallback."""
+     top = getattr(config, "transcription", None)
+     channels = getattr(config, "channels", None)
+-    provider = (
+-        _as_provider(getattr(top, "provider", None))
+-        or _as_provider(getattr(channels, "transcription_provider", None))
+-        or _DEFAULT_PROVIDER
+-    )
++    provider = _as_provider(getattr(top, "provider", None))
++    if provider is None:
++        provider = _as_provider(getattr(channels, "transcription_provider", None)) or _DEFAULT_PROVIDER
+     spec = get_transcription_provider(provider)
+     if spec is None:
+-        logger.warning("Unknown transcription provider {}; falling back to {}", provider, _DEFAULT_PROVIDER)
+-        provider = _DEFAULT_PROVIDER
+-        spec = get_transcription_provider(provider)
++        logger.warning("Unknown transcription provider {}; refusing transcription", provider)
+     default_model = spec.default_model if spec else ""
+     provider_cfg = _provider_config(config, provider)
++    folder_id = ""
++    if provider == "yandex":
++        folder_id = resolve_env_refs(getattr(provider_cfg, "folder_id", None) or "") if provider_cfg else ""
++        folder_id = folder_id or os.environ.get("YC_FOLDER_ID", "")
+     return EffectiveTranscriptionConfig(
+         enabled=bool(getattr(top, "enabled", True)),
+         provider=provider,
+@@ -136,6 +150,7 @@ def resolve_transcription_config(config: Any) -> EffectiveTranscriptionConfig:
+         api_base=_resolve_transcription_api_base(provider, provider_cfg),
+         max_duration_sec=int(getattr(top, "max_duration_sec", 120)),
+         max_upload_mb=int(getattr(top, "max_upload_mb", 25)),
++        folder_id=folder_id,
+     )
+ 
+ 
+@@ -199,10 +214,15 @@ async def transcribe_audio_file(
+     if spec is None:
+         logger.warning("Unknown transcription provider: {}", config.provider)
+         return ""
++    provider_kwargs: dict[str, Any] = {
++        "api_key": config.api_key,
++        "api_base": config.api_base or None,
++        "language": config.language,
++        "model": config.model,
++    }
++    if config.provider == "yandex":
++        provider_kwargs["folder_id"] = config.folder_id
+     provider = spec.load_adapter()(
+-        api_key=config.api_key,
+-        api_base=config.api_base or None,
+-        language=config.language,
+-        model=config.model,
++        **provider_kwargs,
+     )
+     return await provider.transcribe(file_path)
+

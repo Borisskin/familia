@@ -47,6 +47,11 @@ RUN apt-get update && \
 ENV PIP_INDEX_URL=${PIP_INDEX_URL:+$PIP_INDEX_URL}
 ENV UV_INDEX_URL=${PIP_INDEX_URL:+$PIP_INDEX_URL}
 ENV NPM_CONFIG_REGISTRY=${NPM_REGISTRY:+$NPM_REGISTRY}
+# This Familia image intentionally ships Python only; the target WebUI stays
+# deferred and must not trigger bun/npm during metadata or source installs.
+ENV NANOBOT_SKIP_WEBUI_BUILD=1
+# Select the packaged Familia adapter before nanobot constructs runtime state.
+ENV NANOBOT_RUNTIME_ADAPTERS=familia
 
 WORKDIR /app
 
@@ -58,7 +63,7 @@ WORKDIR /app
 # lock we fall back to range-resolving from the pyprojects, which
 # still respects the upper bounds we set there but lets transitive
 # deps drift.
-COPY nanobot/pyproject.toml nanobot/README.md nanobot/LICENSE /app/nanobot/
+COPY nanobot/pyproject.toml nanobot/README.md nanobot/LICENSE nanobot/hatch_build.py /app/nanobot/
 COPY familia/pyproject.toml familia/README.md /app/familia/
 # COPY with a glob means "copy if exists, no-op otherwise" — but
 # Dockerfile globs require at least one match. Workaround: COPY a known-
@@ -81,6 +86,7 @@ RUN mkdir -p /app/nanobot/nanobot /app/nanobot/bridge /app/familia/src/familia &
 
 # Copy full sources and reinstall the two editable packages without
 # touching their (already-installed) dependency tree.
+COPY nanobot/hatch_build.py /app/nanobot/hatch_build.py
 COPY nanobot/nanobot/ /app/nanobot/nanobot/
 COPY nanobot/bridge/  /app/nanobot/bridge/
 COPY familia/src/     /app/familia/src/
@@ -112,7 +118,7 @@ RUN groupadd -g ${NANOBOT_GID} nanobot 2>/dev/null \
     mkdir -p /home/nanobot/.nanobot && \
     chown -R nanobot:nanobot /home/nanobot /app
 
-COPY nanobot/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY nanobot/entrypoint-familia.sh /usr/local/bin/entrypoint.sh
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
 USER nanobot

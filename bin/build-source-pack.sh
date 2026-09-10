@@ -21,8 +21,9 @@
 # compose's COPY directives Just Work):
 #
 #   familia/                  — our package source
-#   nanobot/{nanobot,bridge,pyproject.toml,LICENSE,README.md}
-#                              — forked nanobot subtree (patched)
+#   nanobot/{nanobot,bridge,pyproject.toml,hatch_build.py,LICENSE,README.md,
+#            entrypoint.sh,entrypoint-familia.sh}
+#                              — target nanobot subtree plus Familia adapter
 #   memx/                     — vendored memX subtree
 #   memx-config/acl.example.json
 #                              — copied to acl.json by bootstrap
@@ -102,9 +103,12 @@ ROOT_FILES=(
 # nanobot is a forked subtree — we keep upstream attribution
 # (LICENSE, COMMUNICATION.md, SECURITY.md, CONTRIBUTING.md, README) but
 # drop case/ (31 MB of demo gifs), tests/, webui/, docs/, images/. The
-# Dockerfile only COPYs nanobot/{pyproject.toml,README.md,LICENSE,nanobot/,bridge/,entrypoint.sh}.
+# Dockerfile only COPYs nanobot/{pyproject.toml,README.md,LICENSE,hatch_build.py,nanobot/,bridge/}
+# and installs entrypoint-familia.sh under the image entrypoint name; both
+# entrypoint files remain available for source inspection and future work.
 NANOBOT_INCLUDES=(
     nanobot/pyproject.toml
+    nanobot/hatch_build.py
     nanobot/README.md
     nanobot/LICENSE
     nanobot/COMMUNICATION.md
@@ -112,6 +116,7 @@ NANOBOT_INCLUDES=(
     nanobot/CONTRIBUTING.md
     nanobot/THIRD_PARTY_NOTICES.md
     nanobot/entrypoint.sh
+    nanobot/entrypoint-familia.sh
     nanobot/nanobot
     nanobot/bridge
 )

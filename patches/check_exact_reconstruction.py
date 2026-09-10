@@ -23,8 +23,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Sequence
 
 
-DEFAULT_UPSTREAM = "950dddec499fbbe0353e997158c99808f0bb41e1"
-DEFAULT_VERSION = "0.1.5.post2"
+DEFAULT_UPSTREAM = "3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec"
+DEFAULT_VERSION = "0.3.0"
 VALID_CATEGORIES = {
     "familia-invariant",
     "upstream-alignment",

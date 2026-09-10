@@ -1,18 +1,80 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { preloadMarkdownText } from "@/components/MarkdownText";
 import { ThreadShell } from "@/components/thread/ThreadShell";
+import { CLI_APPS_CHANGED_EVENT } from "@/lib/cli-app-events";
 import { ClientProvider } from "@/providers/ClientProvider";
+import type { CliAppsPayload, SettingsPayload, UIMessage } from "@/lib/types";
+
+const HERO_GREETING_PATTERN =
+  /What should we work on\?|Where should we start\?|What are we building today\?|What should we tackle together\?/;
 
 function makeClient() {
+  const errorHandlers = new Set<(err: { kind: string }) => void>();
+  const chatHandlers = new Map<string, Set<(ev: import("@/lib/types").InboundEvent) => void>>();
+  const runtimeModelHandlers = new Set<
+    (modelName: string | null, modelPreset?: string | null) => void
+  >();
+  const sessionUpdateHandlers = new Set<(chatId: string, scope?: string) => void>();
+  const goalStateByChatId = new Map<string, import("@/lib/types").GoalStateWsPayload>();
   return {
     status: "open" as const,
     defaultChatId: null as string | null,
     onStatus: () => () => {},
-    onChat: () => () => {},
+    onRuntimeModelUpdate: (
+      handler: (modelName: string | null, modelPreset?: string | null) => void,
+    ) => {
+      runtimeModelHandlers.add(handler);
+      return () => {
+        runtimeModelHandlers.delete(handler);
+      };
+    },
+    getRunStartedAt: () => null,
+    getGoalState: (chatId: string) => goalStateByChatId.get(chatId),
+    onChat: (chatId: string, handler: (ev: import("@/lib/types").InboundEvent) => void) => {
+      let handlers = chatHandlers.get(chatId);
+      if (!handlers) {
+        handlers = new Set();
+        chatHandlers.set(chatId, handlers);
+      }
+      handlers.add(handler);
+      return () => {
+        handlers?.delete(handler);
+      };
+    },
+    onError: (handler: (err: { kind: string }) => void) => {
+      errorHandlers.add(handler);
+      return () => {
+        errorHandlers.delete(handler);
+      };
+    },
+    onSessionUpdate: (handler: (chatId: string, scope?: string) => void) => {
+      sessionUpdateHandlers.add(handler);
+      return () => {
+        sessionUpdateHandlers.delete(handler);
+      };
+    },
+    _emitError(err: { kind: string }) {
+      for (const h of errorHandlers) h(err);
+    },
+    _emitChat(chatId: string, ev: import("@/lib/types").InboundEvent) {
+      if (ev.event === "goal_state") {
+        goalStateByChatId.set(chatId, ev.goal_state);
+      }
+      for (const h of chatHandlers.get(chatId) ?? []) h(ev);
+    },
+    _emitRuntimeModelUpdate(modelName: string | null, modelPreset?: string | null) {
+      for (const h of runtimeModelHandlers) h(modelName, modelPreset);
+    },
+    _emitSessionUpdate(chatId: string, scope?: string) {
+      for (const h of sessionUpdateHandlers) h(chatId, scope);
+    },
     sendMessage: vi.fn(),
+    sendSystemCommand: vi.fn().mockResolvedValue(undefined),
     newChat: vi.fn(),
+    forkChat: vi.fn(),
     attach: vi.fn(),
     connect: vi.fn(),
     close: vi.fn(),
@@ -20,18 +82,33 @@ function makeClient() {
   };
 }
 
-function wrap(client: ReturnType<typeof makeClient>, children: ReactNode) {
+function wrap(client: ReturnType<typeof makeClient>, children: ReactNode, modelName?: string | null) {
   return (
     <ClientProvider
       client={client as unknown as import("@/lib/nanobot-client").NanobotClient}
       token="tok"
+      modelName={modelName ?? null}
     >
       {children}
     </ClientProvider>
   );
 }
 
-function session(chatId: string) {
+function expectSendMessageWithTurn(
+  client: ReturnType<typeof makeClient>,
+  chatId: string,
+  content: string,
+  options: unknown = undefined,
+) {
+  expect(client.sendMessage).toHaveBeenCalledWith(
+    chatId,
+    content,
+    options,
+    expect.objectContaining({ turnId: expect.any(String) }),
+  );
+}
+
+function session(chatId: string, modelPreset?: string | null) {
   return {
     key: `websocket:${chatId}`,
     channel: "websocket" as const,
@@ -39,6 +116,21 @@ function session(chatId: string) {
     createdAt: null,
     updatedAt: null,
     preview: "",
+    modelPreset,
+  };
+}
+
+function transcriptFromSimpleMessages(
+  rows: Array<{ role: "user" | "assistant"; content: string }>,
+): { schemaVersion: number; messages: UIMessage[] } {
+  return {
+    schemaVersion: 3,
+    messages: rows.map((m, i) => ({
+      id: `m-${i}`,
+      role: m.role,
+      content: m.content,
+      createdAt: 1000 + i,
+    })),
   };
 }
 
@@ -48,6 +140,115 @@ function httpJson(body: unknown) {
     status: 200,
     json: async () => body,
   };
+}
+
+function modelSettings(model: string, provider: string): SettingsPayload {
+  return {
+    agent: {
+      model,
+      provider,
+      resolved_provider: provider,
+      has_api_key: true,
+      model_preset: "default",
+      max_tokens: 4096,
+      context_window_tokens: 65536,
+      temperature: 0.7,
+      reasoning_effort: null,
+      timezone: "UTC",
+      bot_name: "nanobot",
+      bot_icon: "",
+      tool_hint_max_length: 40,
+    },
+    model_presets: [{
+      name: "default",
+      label: "Default",
+      active: true,
+      is_default: true,
+      model,
+      provider,
+      max_tokens: 4096,
+      context_window_tokens: 65536,
+      temperature: 0.7,
+      reasoning_effort: null,
+    }],
+    model_call_order: [],
+    model_call_order_editable: false,
+    providers: [
+      { name: "deepseek", label: "DeepSeek", configured: true },
+      { name: "openai_codex", label: "OpenAI Codex", configured: true },
+    ],
+    web_search: {
+      provider: "duckduckgo",
+      api_key_hint: null,
+      base_url: null,
+      max_results: 5,
+      timeout: 30,
+      providers: [],
+    },
+    web: {
+      enable: true,
+      proxy: null,
+      user_agent: null,
+      search: { max_results: 5, timeout: 30 },
+      fetch: { use_jina_reader: true },
+    },
+    image_generation: {
+      enabled: false,
+      provider: "openrouter",
+      provider_configured: false,
+      model: "openai/gpt-5.4-image-2",
+      default_aspect_ratio: "1:1",
+      default_image_size: "1K",
+      max_images_per_turn: 4,
+      save_dir: "generated",
+      providers: [],
+    },
+    runtime: {
+      config_path: "/tmp/config.json",
+      workspace_path: "/tmp/workspace",
+      gateway_host: "127.0.0.1",
+      gateway_port: 18790,
+      heartbeat: {
+        enabled: true,
+        interval_s: 1800,
+        keep_recent_messages: 8,
+      },
+      dream: {
+        schedule: "every 2h",
+        max_batch_size: 20,
+        max_iterations: 15,
+        annotate_line_ages: true,
+      },
+      unified_session: false,
+    },
+    advanced: {
+      restrict_to_workspace: false,
+      webui_allow_local_service_access: true,
+      webui_default_access_mode: "default",
+      private_service_protection_enabled: true,
+      ssrf_whitelist_count: 0,
+      mcp_server_count: 0,
+      exec_enabled: true,
+      exec_sandbox: null,
+      exec_path_prepend_set: false,
+      exec_path_append_set: false,
+    },
+    requires_restart: false,
+  };
+}
+
+function settingsWithFastPreset(): SettingsPayload {
+  const settings = modelSettings("deepseek-v4-pro", "deepseek");
+  settings.model_presets.push({
+    ...settings.model_presets[0]!,
+    name: "fast",
+    label: "Fast",
+    active: false,
+    is_default: false,
+    model: "openai-codex/gpt-5.5",
+    provider: "openai_codex",
+  });
+  return settings;
 }
 
 describe("ThreadShell", () => {
@@ -60,6 +261,382 @@ describe("ThreadShell", () => {
         json: async () => ({}),
       }),
     );
+  });
+
+  it("keeps inferred file paths non-interactive when the availability probe fails", async () => {
+    await preloadMarkdownText();
+    const client = makeClient();
+    let resolveProbe!: (value: Response) => void;
+    const probe = new Promise<Response>((resolve) => {
+      resolveProbe = resolve;
+    });
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("websocket%3Apreview-error/webui-thread")) {
+        return Promise.resolve(httpJson(transcriptFromSimpleMessages([
+          { role: "assistant", content: "Unreadable file: `prompts/dream.md`" },
+        ])));
+      }
+      if (url.includes("websocket%3Apreview-error/file-preview?")) return probe;
+      return Promise.resolve({
+        ok: false,
+        status: 404,
+        json: async () => ({}),
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(wrap(
+      client,
+      <ThreadShell
+        session={session("preview-error")}
+        title="Preview error"
+        onToggleSidebar={() => {}}
+      />,
+    ));
+
+    const reference = await screen.findByTestId("inline-file-path");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("file-preview?path=prompts%2Fdream.md&probe=1"),
+      expect.anything(),
+    ));
+    await act(async () => {
+      resolveProbe({
+        ok: false,
+        status: 500,
+        text: async () => "failed to read file",
+        json: async () => ({}),
+      } as Response);
+      await probe;
+      await Promise.resolve();
+    });
+
+    expect(reference).not.toHaveAttribute("role");
+    expect(reference).not.toHaveAttribute("tabindex");
+    fireEvent.click(reference);
+    expect(screen.queryByText("failed to read file")).not.toBeInTheDocument();
+  });
+
+  it("does not navigate away when clicking the chat title", async () => {
+    const client = makeClient();
+    const onGoHome = vi.fn();
+    render(wrap(
+      client,
+      <ThreadShell
+        session={session("chat-title")}
+        title="Important conversation"
+        onToggleSidebar={() => {}}
+        onGoHome={onGoHome}
+        onNewChat={() => {}}
+      />,
+    ));
+
+    await waitFor(() => expect(screen.getByText("Important conversation")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Important conversation"));
+
+    expect(onGoHome).not.toHaveBeenCalled();
+  });
+
+  it("updates the composer model logo when settings snapshot changes", async () => {
+    const client = makeClient();
+    const { rerender } = render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("model-logo")}
+          title="Model logo"
+          onToggleSidebar={() => {}}
+          settingsSnapshot={modelSettings("deepseek-v4-pro", "deepseek")}
+        />,
+        "deepseek-v4-pro",
+      ),
+    );
+
+    expect(await screen.findByTestId("composer-model-logo-deepseek")).toBeInTheDocument();
+
+    await act(async () => {
+      rerender(
+        wrap(
+          client,
+          <ThreadShell
+            session={session("model-logo")}
+            title="Model logo"
+            onToggleSidebar={() => {}}
+            settingsSnapshot={modelSettings("openai-codex/gpt-5.5", "openai_codex")}
+          />,
+          "openai-codex/gpt-5.5",
+        ),
+      );
+    });
+
+    expect(await screen.findByTestId("composer-model-logo-openai_codex")).toBeInTheDocument();
+  });
+
+  it("keeps the composer model name and provider on the same settings snapshot", async () => {
+    const client = makeClient();
+    render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("model-settings-sync")}
+          title="Model settings sync"
+          onToggleSidebar={() => {}}
+          settingsSnapshot={modelSettings("openai-codex/gpt-5.5", "openai_codex")}
+        />,
+        "ling/ling-3.0-flash",
+      ),
+    );
+
+    expect(await screen.findByTestId("composer-model-logo-openai_codex")).toBeInTheDocument();
+    expect(screen.getByText("Default")).toBeInTheDocument();
+    expect(screen.queryByText("ling-3.0-flash")).not.toBeInTheDocument();
+  });
+
+  it("resolves the composer model from the active session preset", async () => {
+    const client = makeClient();
+    render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("chat-fast", "fast")}
+          title="Fast session"
+          onToggleSidebar={() => {}}
+          settingsSnapshot={settingsWithFastPreset()}
+        />,
+        "deepseek-v4-pro",
+      ),
+    );
+
+    expect(await screen.findByTitle("Fast · gpt-5.5 · OpenAI Codex")).toBeInTheDocument();
+    expect(screen.queryByTitle("Default · deepseek-v4-pro · DeepSeek")).not.toBeInTheDocument();
+  });
+
+  it("switches through every named preset while preserving call-order priority", async () => {
+    const client = makeClient();
+    const settings = settingsWithFastPreset();
+    settings.model_presets.push({
+      ...settings.model_presets.at(-1)!,
+      name: "extra",
+      label: "Extra",
+      model: "deepseek/extra",
+      provider: "deepseek",
+      active: false,
+      is_default: false,
+    });
+    settings.model_call_order = ["fast"];
+
+    const view = (preset: string) => wrap(client, (
+      <ThreadShell
+        session={session("preset-order", preset)}
+        title="Preset order"
+        onToggleSidebar={() => {}}
+        settingsSnapshot={settings}
+      />
+    ));
+    const { rerender } = render(view("default"));
+
+    const badge = await screen.findByRole("spinbutton", { name: "Default" });
+    expect(badge).toHaveTextContent("Default");
+    fireEvent.keyDown(badge, { key: "ArrowDown" });
+
+    expect(client.sendSystemCommand).toHaveBeenCalledWith(
+      "preset-order",
+      "/model fast",
+    );
+    expect(await screen.findByText("Fast")).toBeInTheDocument();
+    fireEvent.keyDown(
+      screen.getByRole("spinbutton", { name: "Fast" }),
+      { key: "End" },
+    );
+    expect(client.sendSystemCommand).toHaveBeenLastCalledWith(
+      "preset-order",
+      "/model extra",
+    );
+    expect(await screen.findByText("Extra")).toBeInTheDocument();
+
+    rerender(view("fast"));
+    expect(await screen.findByText("Fast")).toBeInTheDocument();
+  });
+
+  it("uses the backend-resolved provider for an auto session preset", async () => {
+    const client = makeClient();
+    const settings = modelSettings("deepseek-v4-pro", "deepseek");
+    settings.providers.push({
+      name: "companyproxy",
+      label: "Company Proxy",
+      configured: true,
+    });
+    settings.model_presets.push({
+      ...settings.model_presets[0]!,
+      name: "fast",
+      label: "Fast",
+      active: false,
+      is_default: false,
+      model: "companyproxy/gpt-4",
+      provider: "auto",
+      resolved_provider: "companyproxy",
+    });
+
+    render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("chat-auto", "fast")}
+          title="Auto provider session"
+          onToggleSidebar={() => {}}
+          settingsSnapshot={settings}
+        />,
+        "deepseek-v4-pro",
+      ),
+    );
+
+    expect(await screen.findByTitle("Fast · gpt-4 · Company Proxy")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Model not configured" })).not.toBeInTheDocument();
+  });
+
+  it("highlights the configured model badge without replacing the preset label", async () => {
+    const client = makeClient();
+    render(wrap(
+      client,
+      <ThreadShell
+        session={session("fallback-model")}
+        title="Fallback model"
+        onToggleSidebar={() => {}}
+        settingsSnapshot={modelSettings("openai-codex/gpt-5.5", "openai_codex")}
+      />,
+      "openai-codex/gpt-5.5",
+    ));
+
+    expect(await screen.findByText("Default")).toBeInTheDocument();
+    const configuredBadge = screen.getByTestId("composer-model-logo-openai_codex").parentElement;
+    expect(configuredBadge).not.toBeNull();
+    expect(configuredBadge).toHaveClass("composer-model-badge");
+    expect(configuredBadge).not.toHaveAttribute("data-fallback");
+
+    act(() => {
+      client._emitChat("fallback-model", {
+        event: "turn_model_updated",
+        chat_id: "fallback-model",
+        model_name: "deepseek/deepseek-chat",
+      });
+    });
+
+    const logo = screen.getByTestId("composer-model-logo-openai_codex");
+    const badge = logo.parentElement;
+    expect(badge).not.toBeNull();
+    expect(badge).toBe(configuredBadge);
+    expect(screen.getByText("Default")).toBeInTheDocument();
+    expect(screen.queryByText("deepseek-chat")).not.toBeInTheDocument();
+    expect(badge).toHaveAttribute("data-fallback", "true");
+    expect(badge).toHaveAttribute(
+      "title",
+      "deepseek/deepseek-chat",
+    );
+    expect(logo).not.toHaveAttribute("data-fallback");
+
+    act(() => {
+      client._emitChat("fallback-model", {
+        event: "turn_end",
+        chat_id: "fallback-model",
+      });
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("composer-model-logo-openai_codex").parentElement,
+      ).not.toHaveAttribute("data-fallback");
+    });
+    expect(
+      screen.getByTestId("composer-model-logo-openai_codex").parentElement,
+    ).toHaveAttribute("title", "Default · gpt-5.5 · OpenAI Codex");
+    expect(
+      screen.getByTestId("composer-model-logo-openai_codex").parentElement,
+    ).toBe(badge);
+  });
+
+  it("opens model settings from the unconfigured model badge", async () => {
+    const client = makeClient();
+    const settings = modelSettings("openai-codex/gpt-5.1-codex", "openai_codex");
+    settings.agent.has_api_key = false;
+    settings.providers = settings.providers.map((provider) =>
+      provider.name === "openai_codex"
+        ? { ...provider, auth_type: "oauth", configured: false }
+        : provider,
+    );
+    const onOpenModelSettings = vi.fn();
+
+    render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("unconfigured-model")}
+          title="Unconfigured model"
+          onToggleSidebar={() => {}}
+          settingsSnapshot={settings}
+          onOpenModelSettings={onOpenModelSettings}
+        />,
+        "openai-codex/gpt-5.1-codex",
+      ),
+    );
+
+    const badge = await screen.findByRole("button", { name: "Model not configured" });
+    expect(screen.getByTestId("composer-model-setup-icon")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-model-logo-openai_codex")).not.toBeInTheDocument();
+    fireEvent.click(badge);
+    expect(onOpenModelSettings).toHaveBeenCalledTimes(1);
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Message input" }), {
+      target: { value: "hello" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Configure model" }));
+    expect(onOpenModelSettings).toHaveBeenCalledTimes(2);
+    expect(client.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("keeps image generation controls out of the composer", async () => {
+    const client = makeClient();
+    const disabledSettings = modelSettings("deepseek-v4-pro", "deepseek");
+    const enabledSettings: SettingsPayload = {
+      ...disabledSettings,
+      image_generation: {
+        ...disabledSettings.image_generation,
+        enabled: true,
+        provider_configured: true,
+      },
+    };
+
+    const { rerender } = render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("image-generation-disabled")}
+          title="Image generation disabled"
+          onToggleSidebar={() => {}}
+          settingsSnapshot={disabledSettings}
+        />,
+        "deepseek-v4-pro",
+      ),
+    );
+
+    await screen.findByLabelText("Message input");
+    expect(screen.queryByRole("button", { name: "Toggle image generation mode" })).not.toBeInTheDocument();
+
+    await act(async () => {
+      rerender(
+        wrap(
+          client,
+          <ThreadShell
+            session={session("image-generation-disabled")}
+            title="Image generation disabled"
+            onToggleSidebar={() => {}}
+            settingsSnapshot={enabledSettings}
+          />,
+          "deepseek-v4-pro",
+        ),
+      );
+    });
+
+    expect(screen.queryByRole("button", { name: "Toggle image generation mode" })).not.toBeInTheDocument();
   });
 
   it("restores in-memory messages when switching away and back to a session", async () => {
@@ -85,10 +662,7 @@ describe("ThreadShell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await waitFor(() =>
-      expect(client.sendMessage).toHaveBeenCalledWith(
-        "chat-a",
-        "persist me across tabs",
-      ),
+      expectSendMessageWithTurn(client, "chat-a", "persist me across tabs"),
     );
     expect(screen.getByText("persist me across tabs")).toBeInTheDocument();
 
@@ -125,6 +699,29 @@ describe("ThreadShell", () => {
     expect(screen.getByText("persist me across tabs")).toBeInTheDocument();
   });
 
+  it("highlights sent skill references without skill metadata", async () => {
+    const client = makeClient();
+    render(wrap(
+      client,
+      <ThreadShell
+        session={session("skill-reference")}
+        title="Skill reference"
+        onToggleSidebar={() => {}}
+      />,
+    ));
+
+    fireEvent.change(screen.getByLabelText("Message input"), {
+      target: { value: "Use $github for this" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expectSendMessageWithTurn(client, "skill-reference", "Use $github for this"),
+    );
+    expect(screen.getByTestId("message-skill-reference-github"))
+      .toHaveTextContent("$github");
+  });
+
   it("clears the old thread when the active session is removed", async () => {
     const client = makeClient();
     const onNewChat = vi.fn().mockResolvedValue("chat-a");
@@ -148,10 +745,7 @@ describe("ThreadShell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await waitFor(() =>
-      expect(client.sendMessage).toHaveBeenCalledWith(
-        "chat-a",
-        "delete me cleanly",
-      ),
+      expectSendMessageWithTurn(client, "chat-a", "delete me cleanly"),
     );
     expect(screen.getByText("delete me cleanly")).toBeInTheDocument();
 
@@ -173,7 +767,318 @@ describe("ThreadShell", () => {
     await waitFor(() => {
       expect(screen.queryByText("delete me cleanly")).not.toBeInTheDocument();
     });
-    expect(screen.getByPlaceholderText("What's on your mind?")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Ask anything...")).toBeInTheDocument();
+  });
+
+  it("creates a chat only when the blank landing sends a first message", async () => {
+    const client = makeClient();
+    const onNewChat = vi.fn();
+    const onCreateChat = vi.fn().mockResolvedValue("chat-new");
+
+    render(
+      wrap(
+        client,
+        <ThreadShell
+          session={null}
+          title="nanobot"
+          onToggleSidebar={() => {}}
+          onGoHome={() => {}}
+          onNewChat={onNewChat}
+          onCreateChat={onCreateChat}
+        />,
+      ),
+    );
+
+    fireEvent.change(screen.getByLabelText("Message input"), {
+      target: { value: "start for real" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => expect(onCreateChat).toHaveBeenCalledTimes(1));
+    expect(onNewChat).not.toHaveBeenCalled();
+  });
+
+  it("applies the selected landing preset before sending the first prompt", async () => {
+    const client = makeClient();
+    const settings = settingsWithFastPreset();
+    settings.model_call_order = ["fast"];
+    let resolveModelCommand!: () => void;
+    client.sendSystemCommand.mockImplementation(
+      () => new Promise<void>((resolve) => {
+        resolveModelCommand = resolve;
+      }),
+    );
+    const onCreateChat = vi.fn().mockResolvedValue("chat-new");
+
+    const view = (currentSession: ReturnType<typeof session> | null) => wrap(client, (
+      <ThreadShell
+        session={currentSession}
+        title={currentSession ? "New chat" : "nanobot"}
+        onToggleSidebar={() => {}}
+        onCreateChat={onCreateChat}
+        settingsSnapshot={settings}
+      />
+    ));
+    const { rerender } = render(view(null));
+
+    fireEvent.keyDown(
+      await screen.findByRole("spinbutton", { name: "Default" }),
+      { key: "ArrowDown" },
+    );
+    expect(await screen.findByText("Fast")).toBeInTheDocument();
+    expect(client.sendSystemCommand).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText("Message input"), {
+      target: { value: "use the selected model" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => expect(client.sendSystemCommand).toHaveBeenCalledWith(
+      "chat-new",
+      "/model fast",
+    ));
+
+    rerender(view(session("chat-new")));
+    expect(client.sendMessage).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveModelCommand();
+    });
+    await waitFor(() => {
+      expectSendMessageWithTurn(client, "chat-new", "use the selected model");
+    });
+  });
+
+  it("binds a pending landing message to the chat created for it", async () => {
+    const client = makeClient();
+    let resolveCreate: ((chatId: string) => void) | null = null;
+    const onCreateChat = vi.fn(() => new Promise<string>((resolve) => {
+      resolveCreate = resolve;
+    }));
+
+    const { rerender } = render(
+      wrap(
+        client,
+        <ThreadShell
+          session={null}
+          title="nanobot"
+          onToggleSidebar={() => {}}
+          onCreateChat={onCreateChat}
+        />,
+      ),
+    );
+
+    fireEvent.change(screen.getByLabelText("Message input"), {
+      target: { value: "must not leak" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => expect(onCreateChat).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      rerender(
+        wrap(
+          client,
+          <ThreadShell
+            session={session("existing-chat")}
+            title="Existing chat"
+            onToggleSidebar={() => {}}
+            onCreateChat={onCreateChat}
+          />,
+        ),
+      );
+    });
+
+    await act(async () => {
+      resolveCreate?.("chat-new");
+    });
+
+    expect(client.sendMessage).not.toHaveBeenCalled();
+
+    await act(async () => {
+      rerender(
+        wrap(
+          client,
+          <ThreadShell
+            session={session("chat-new")}
+            title="New chat"
+            onToggleSidebar={() => {}}
+            onCreateChat={onCreateChat}
+          />,
+        ),
+      );
+    });
+
+    await waitFor(() =>
+      expectSendMessageWithTurn(client, "chat-new", "must not leak"),
+    );
+  });
+
+  it("keeps the first landing message when new chat history is still empty", async () => {
+    const client = makeClient();
+    const onCreateChat = vi.fn().mockResolvedValue("chat-new");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: false,
+        status: 404,
+        json: async () => ({}),
+      })),
+    );
+
+    const { rerender } = render(
+      wrap(
+        client,
+        <ThreadShell
+          session={null}
+          title="nanobot"
+          onToggleSidebar={() => {}}
+          onCreateChat={onCreateChat}
+        />,
+      ),
+    );
+
+    fireEvent.change(screen.getByLabelText("Message input"), {
+      target: { value: "first message should stay" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => expect(onCreateChat).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      rerender(
+        wrap(
+          client,
+          <ThreadShell
+            session={session("chat-new")}
+            title="Chat chat-new"
+            onToggleSidebar={() => {}}
+            onCreateChat={onCreateChat}
+          />,
+        ),
+      );
+    });
+
+    await waitFor(() =>
+      expectSendMessageWithTurn(client, "chat-new", "first message should stay"),
+    );
+    await waitFor(() =>
+      expect(screen.getByText("first message should stay")).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(HERO_GREETING_PATTERN)).not.toBeInTheDocument();
+  });
+
+  it("hides a live first /model turn when the initial history snapshot is stale", async () => {
+    const client = makeClient();
+    const onCreateChat = vi.fn().mockResolvedValue("chat-new");
+    let resolveThread:
+      | ((value: { ok: boolean; status: number; json: () => Promise<unknown> }) => void)
+      | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("websocket%3Achat-new/webui-thread")) {
+          return new Promise((resolve) => {
+            resolveThread = resolve;
+          });
+        }
+        return Promise.resolve({
+          ok: false,
+          status: 404,
+          json: async () => ({}),
+        });
+      }),
+    );
+
+    const { rerender } = render(
+      wrap(
+        client,
+        <ThreadShell
+          session={null}
+          title="nanobot"
+          onToggleSidebar={() => {}}
+          onCreateChat={onCreateChat}
+        />,
+      ),
+    );
+
+    fireEvent.change(screen.getByLabelText("Message input"), {
+      target: { value: "/model" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => expect(onCreateChat).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      rerender(
+        wrap(
+          client,
+          <ThreadShell
+            session={session("chat-new")}
+            title="Chat chat-new"
+            onToggleSidebar={() => {}}
+            onCreateChat={onCreateChat}
+          />,
+        ),
+      );
+    });
+
+    await waitFor(() =>
+      expectSendMessageWithTurn(client, "chat-new", "/model"),
+    );
+
+    await act(async () => {
+      client._emitChat("chat-new", {
+        event: "message",
+        chat_id: "chat-new",
+        text: "## Model\n- Current model: `Ring-2.6-1T`",
+      });
+      client._emitChat("chat-new", {
+        event: "message",
+        chat_id: "chat-new",
+        text: "This unrelated reply stays visible.",
+      });
+    });
+    expect(screen.queryByText("/model")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Current model/)).not.toBeInTheDocument();
+    expect(screen.getByText("This unrelated reply stays visible.")).toBeInTheDocument();
+
+    await act(async () => {
+      resolveThread?.(
+        httpJson(transcriptFromSimpleMessages([{ role: "user", content: "/model" }])),
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByText("/model")).not.toBeInTheDocument();
+      expect(screen.queryByText(/Current model/)).not.toBeInTheDocument();
+      expect(screen.getByText("This unrelated reply stays visible.")).toBeInTheDocument();
+    });
+  });
+
+  it("keeps the empty thread landing focused on the composer", async () => {
+    const client = makeClient();
+    render(
+      wrap(
+        client,
+        <ThreadShell
+          session={null}
+          title="nanobot"
+          onToggleSidebar={() => {}}
+          onGoHome={() => {}}
+          onNewChat={() => {}}
+        />,
+      ),
+    );
+    await act(async () => {});
+
+    const greeting = screen.getByRole("heading", { level: 1, name: HERO_GREETING_PATTERN });
+    expect(greeting).toHaveAttribute("data-testid", "hero-greeting");
+    expect(greeting).toHaveClass("whitespace-nowrap");
+    expect(screen.getByPlaceholderText("Ask anything...")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Write code" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Create a project plan" })).not.toBeInTheDocument();
   });
 
   it("does not leak the previous thread when opening a brand-new chat", async () => {
@@ -183,16 +1088,13 @@ describe("ThreadShell", () => {
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input);
-        if (url.includes("websocket%3Achat-a/messages")) {
-          return httpJson({
-            key: "websocket:chat-a",
-            created_at: null,
-            updated_at: null,
-            messages: [
+        if (url.includes("websocket%3Achat-a/webui-thread")) {
+          return httpJson(
+            transcriptFromSimpleMessages([
               { role: "user", content: "old question" },
               { role: "assistant", content: "old answer" },
-            ],
-          });
+            ]),
+          );
         }
         return {
           ok: false,
@@ -234,11 +1136,692 @@ describe("ThreadShell", () => {
 
     expect(screen.queryByText("old answer")).not.toBeInTheDocument();
     await waitFor(() =>
-      expect(screen.getByPlaceholderText("What's on your mind?")).toBeInTheDocument(),
+      expect(screen.getByPlaceholderText("Ask anything...")).toBeInTheDocument(),
     );
-    const input = screen.getByPlaceholderText("What's on your mind?");
-    expect(input.className).toContain("min-h-[96px]");
+    const input = screen.getByPlaceholderText("Ask anything...");
+    expect(input.className).toContain("min-h-[78px]");
     expect(screen.queryByText("old answer")).not.toBeInTheDocument();
+  });
+
+  it("forks assistant replies using the global user message index rather than the visible window index", async () => {
+    const client = makeClient();
+    const onForkChat = vi.fn().mockResolvedValue("chat-fork");
+    const rows = [
+      { role: "user" as const, content: "question 100" },
+      { role: "assistant" as const, content: "answer 100" },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("websocket%3Along-chat/webui-thread")) {
+          return httpJson({
+            ...transcriptFromSimpleMessages(rows),
+            page: {
+              before_cursor: "before-question-100",
+              has_more_before: true,
+              loaded_message_count: 2,
+              user_message_offset: 100,
+            },
+          });
+        }
+        return {
+          ok: false,
+          status: 404,
+          json: async () => ({}),
+        };
+      }),
+    );
+
+    render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("long-chat")}
+          title="Long chat"
+          onToggleSidebar={() => {}}
+          onForkChat={onForkChat}
+        />,
+      ),
+    );
+
+    const targetText = await screen.findByText("answer 100");
+    fireEvent.click(within(targetText.closest(".w-full") as HTMLElement).getByRole("button", {
+      name: "Fork",
+    }));
+
+    await waitFor(() =>
+      expect(onForkChat).toHaveBeenCalledWith("long-chat", 101),
+    );
+  });
+
+  it("does not cache optimistic messages under the next chat during a session switch", async () => {
+    const client = makeClient();
+    const onNewChat = vi.fn().mockResolvedValue("chat-b");
+
+    const { rerender } = render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("chat-a")}
+          title="Chat chat-a"
+          onToggleSidebar={() => {}}
+          onGoHome={() => {}}
+          onNewChat={onNewChat}
+        />,
+      ),
+    );
+
+    fireEvent.change(screen.getByLabelText("Message input"), {
+      target: { value: "only in chat a" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expectSendMessageWithTurn(client, "chat-a", "only in chat a"),
+    );
+    expect(screen.getByText("only in chat a")).toBeInTheDocument();
+
+    await act(async () => {
+      rerender(
+        wrap(
+          client,
+          <ThreadShell
+            session={session("chat-b")}
+            title="Chat chat-b"
+            onToggleSidebar={() => {}}
+            onGoHome={() => {}}
+            onNewChat={onNewChat}
+          />,
+        ),
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByText("only in chat a")).not.toBeInTheDocument();
+    });
+
+    await act(async () => {
+      rerender(
+        wrap(
+          client,
+          <ThreadShell
+            session={session("chat-a")}
+            title="Chat chat-a"
+            onToggleSidebar={() => {}}
+            onGoHome={() => {}}
+            onNewChat={onNewChat}
+          />,
+        ),
+      );
+    });
+
+    expect(screen.getByText("only in chat a")).toBeInTheDocument();
+
+    await act(async () => {
+      rerender(
+        wrap(
+          client,
+          <ThreadShell
+            session={session("chat-b")}
+            title="Chat chat-b"
+            onToggleSidebar={() => {}}
+            onGoHome={() => {}}
+            onNewChat={onNewChat}
+          />,
+        ),
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByText("only in chat a")).not.toBeInTheDocument();
+    });
+  });
+
+  it("keeps live assistant replies after visiting the blank new-chat page", async () => {
+    const client = makeClient();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("websocket%3Achat-a/webui-thread")) {
+          return httpJson(transcriptFromSimpleMessages([{ role: "user", content: "hello" }]));
+        }
+        return {
+          ok: false,
+          status: 404,
+          json: async () => ({}),
+        };
+      }),
+    );
+
+    const { rerender } = render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("chat-a")}
+          title="Chat chat-a"
+          onToggleSidebar={() => {}}
+          onNewChat={() => {}}
+        />,
+      ),
+    );
+
+    await waitFor(() => expect(screen.getByText("hello")).toBeInTheDocument());
+    await act(async () => {
+      client._emitChat("chat-a", {
+        event: "message",
+        chat_id: "chat-a",
+        text: "live assistant reply",
+      });
+    });
+    expect(screen.getByText("live assistant reply")).toBeInTheDocument();
+
+    await act(async () => {
+      rerender(
+        wrap(
+          client,
+          <ThreadShell
+            session={null}
+            title="nanobot"
+            onToggleSidebar={() => {}}
+            onNewChat={() => {}}
+          />,
+        ),
+      );
+    });
+
+    expect(screen.queryByText("live assistant reply")).not.toBeInTheDocument();
+    expect(screen.getByText(HERO_GREETING_PATTERN)).toBeInTheDocument();
+
+    await act(async () => {
+      rerender(
+        wrap(
+          client,
+          <ThreadShell
+            session={session("chat-a")}
+            title="Chat chat-a"
+            onToggleSidebar={() => {}}
+            onNewChat={() => {}}
+          />,
+        ),
+      );
+    });
+
+    await waitFor(() => expect(screen.getByText("live assistant reply")).toBeInTheDocument());
+  });
+
+  it("keeps live fork replies when a canonical refresh is missing an earlier assistant answer", async () => {
+    const client = makeClient();
+    let historyCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("websocket%3Achat-fork/webui-thread")) {
+          historyCalls += 1;
+          return httpJson(
+            transcriptFromSimpleMessages(
+              historyCalls === 1
+                ? [{ role: "user", content: "first fork question" }]
+                : [
+                    { role: "user", content: "first fork question" },
+                    { role: "user", content: "second fork question" },
+                  ],
+            ),
+          );
+        }
+        return {
+          ok: false,
+          status: 404,
+          json: async () => ({}),
+        };
+      }),
+    );
+
+    render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("chat-fork")}
+          title="Chat chat-fork"
+          onToggleSidebar={() => {}}
+          onNewChat={() => {}}
+        />,
+      ),
+    );
+
+    await waitFor(() => expect(screen.getByText("first fork question")).toBeInTheDocument());
+    await act(async () => {
+      client._emitChat("chat-fork", {
+        event: "message",
+        chat_id: "chat-fork",
+        text: "first fork answer",
+      });
+    });
+    expect(screen.getByText("first fork answer")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Message input"), {
+      target: { value: "second fork question" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expectSendMessageWithTurn(client, "chat-fork", "second fork question"),
+    );
+    expect(screen.getByText("second fork question")).toBeInTheDocument();
+
+    await act(async () => {
+      client._emitSessionUpdate("chat-fork");
+    });
+
+    await waitFor(() => expect(historyCalls).toBe(2));
+    expect(screen.getByText("first fork question")).toBeInTheDocument();
+    expect(screen.getByText("first fork answer")).toBeInTheDocument();
+    expect(screen.getByText("second fork question")).toBeInTheDocument();
+  });
+
+  it("does not refetch thread history on turn_end", async () => {
+    const client = makeClient();
+    let historyCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("websocket%3Achat-a/webui-thread")) {
+          historyCalls += 1;
+          return httpJson(
+            transcriptFromSimpleMessages(
+              historyCalls === 1
+                ? [{ role: "user", content: "question" }]
+                : [
+                    { role: "user", content: "question" },
+                    { role: "assistant", content: "canonical markdown answer" },
+                  ],
+            ),
+          );
+        }
+        return {
+          ok: false,
+          status: 404,
+          json: async () => ({}),
+        };
+      }),
+    );
+
+    render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("chat-a")}
+          title="Chat chat-a"
+          onToggleSidebar={() => {}}
+          onNewChat={() => {}}
+        />,
+      ),
+    );
+
+    await waitFor(() => expect(screen.getByText("question")).toBeInTheDocument());
+    await act(async () => {
+      client._emitChat("chat-a", {
+        event: "delta",
+        chat_id: "chat-a",
+        text: "live half-parsed | markdown",
+      });
+      client._emitChat("chat-a", {
+        event: "turn_end",
+        chat_id: "chat-a",
+      });
+    });
+
+    await waitFor(() => expect(screen.getByText("live half-parsed | markdown")).toBeInTheDocument());
+    expect(screen.queryByText("canonical markdown answer")).not.toBeInTheDocument();
+    expect(historyCalls).toBe(1);
+  });
+
+  it("does not refetch thread history for metadata-only session updates", async () => {
+    const client = makeClient();
+    let historyCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("websocket%3Achat-a/webui-thread")) {
+          historyCalls += 1;
+          return httpJson(
+            transcriptFromSimpleMessages([
+              { role: "user", content: "question" },
+              { role: "assistant", content: "answer" },
+            ]),
+          );
+        }
+        return {
+          ok: false,
+          status: 404,
+          json: async () => ({}),
+        };
+      }),
+    );
+
+    render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("chat-a")}
+          title="Chat chat-a"
+          onToggleSidebar={() => {}}
+          onNewChat={() => {}}
+        />,
+      ),
+    );
+
+    await waitFor(() => expect(screen.getByText("answer")).toBeInTheDocument());
+    expect(historyCalls).toBe(1);
+
+    await act(async () => {
+      client._emitSessionUpdate("chat-a", "metadata");
+    });
+
+    expect(historyCalls).toBe(1);
+  });
+
+  it("does not scroll again when canonical history refreshes after a session update", async () => {
+    const client = makeClient();
+    const scrollTo = vi.fn();
+    const originalScrollTo = HTMLElement.prototype.scrollTo;
+    HTMLElement.prototype.scrollTo = scrollTo;
+    let historyCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("websocket%3Achat-a/webui-thread")) {
+          historyCalls += 1;
+          return httpJson(
+            transcriptFromSimpleMessages(
+              historyCalls === 1
+                ? [{ role: "user", content: "question" }]
+                : [
+                    { role: "user", content: "question" },
+                    { role: "assistant", content: "canonical answer" },
+                  ],
+            ),
+          );
+        }
+        return {
+          ok: false,
+          status: 404,
+          json: async () => ({}),
+        };
+      }),
+    );
+
+    try {
+      render(
+        wrap(
+          client,
+          <ThreadShell
+            session={session("chat-a")}
+            title="Chat chat-a"
+            onToggleSidebar={() => {}}
+            onNewChat={() => {}}
+          />,
+        ),
+      );
+
+      await waitFor(() => expect(screen.getByText("question")).toBeInTheDocument());
+      await waitFor(() => expect(scrollTo).toHaveBeenCalled());
+      await act(async () => {
+        for (let i = 0; i < 8; i += 1) {
+          await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+        }
+      });
+      scrollTo.mockClear();
+
+      await act(async () => {
+        client._emitSessionUpdate("chat-a");
+      });
+
+      await waitFor(() => expect(historyCalls).toBe(2));
+      await waitFor(() => expect(screen.getByText("canonical answer")).toBeInTheDocument());
+      expect(scrollTo).not.toHaveBeenCalled();
+    } finally {
+      HTMLElement.prototype.scrollTo = originalScrollTo;
+    }
+  });
+
+  it("scrolls to the bottom after loading a session from the blank new-chat page", async () => {
+    const client = makeClient();
+    const scrollTo = vi.fn();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("websocket%3Achat-a/webui-thread")) {
+          return httpJson(
+            transcriptFromSimpleMessages([
+              { role: "user", content: "question" },
+              { role: "assistant", content: "loaded answer" },
+            ]),
+          );
+        }
+        return {
+          ok: false,
+          status: 404,
+          json: async () => ({}),
+        };
+      }),
+    );
+
+    const { container, rerender } = render(
+      wrap(
+        client,
+        <ThreadShell
+          session={null}
+          title="nanobot"
+          onToggleSidebar={() => {}}
+          onNewChat={() => {}}
+        />,
+      ),
+    );
+
+    expect(screen.getByText(HERO_GREETING_PATTERN)).toBeInTheDocument();
+    const scroller = container.querySelector(".thread-viewport-scrollbar") as HTMLElement;
+    Object.defineProperties(scroller, {
+      scrollHeight: { configurable: true, value: 2400 },
+      clientHeight: { configurable: true, value: 600 },
+      scrollTop: { configurable: true, writable: true, value: 0 },
+      scrollTo: { configurable: true, value: scrollTo },
+    });
+    scrollTo.mockClear();
+
+    await act(async () => {
+      rerender(
+        wrap(
+          client,
+          <ThreadShell
+            session={session("chat-a")}
+            title="Chat chat-a"
+            onToggleSidebar={() => {}}
+            onNewChat={() => {}}
+          />,
+        ),
+      );
+    });
+
+    await waitFor(() => expect(screen.getByText("loaded answer")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(scrollTo).toHaveBeenCalledWith({
+        top: 1800,
+        behavior: "auto",
+      }),
+    );
+  });
+
+  it("opens slash commands on the blank welcome page", async () => {
+    const client = makeClient();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/api/commands")) {
+          return httpJson({
+            commands: [
+              {
+                command: "/history",
+                title: "Show conversation history",
+                description: "Print the last N persisted messages.",
+                icon: "history",
+                arg_hint: "[n]",
+                lifecycle: "side_channel",
+                accepts_args: true,
+              },
+            ],
+          });
+        }
+        return {
+          ok: false,
+          status: 404,
+          json: async () => ({}),
+        };
+      }),
+    );
+
+    render(
+      wrap(
+        client,
+        <ThreadShell
+          session={null}
+          title="nanobot"
+          onToggleSidebar={() => {}}
+          onNewChat={() => {}}
+        />,
+      ),
+    );
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(
+      "/api/commands",
+      expect.objectContaining({
+        headers: { Authorization: "Bearer tok" },
+      }),
+    ));
+
+    fireEvent.change(screen.getByLabelText("Message input"), {
+      target: { value: "/" },
+    });
+
+    expect(screen.getByRole("listbox", { name: "Slash commands" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /\/history/i })).toBeInTheDocument();
+  });
+
+  it("does not bring back welcome cards when image mode is enabled", async () => {
+    const client = makeClient();
+    const settings = modelSettings("deepseek-v4-pro", "deepseek");
+    render(
+      wrap(
+        client,
+        <ThreadShell
+          session={null}
+          title="nanobot"
+          onToggleSidebar={() => {}}
+          onNewChat={() => {}}
+          settingsSnapshot={{
+            ...settings,
+            image_generation: {
+              ...settings.image_generation,
+              enabled: true,
+              provider_configured: true,
+            },
+          }}
+        />,
+      ),
+    );
+    await act(async () => {});
+
+    expect(screen.queryByText("Design an app icon")).not.toBeInTheDocument();
+    expect(screen.queryByText("Write code")).not.toBeInTheDocument();
+
+    expect(screen.queryByText("Design an app icon")).not.toBeInTheDocument();
+    expect(screen.queryByText("Write code")).not.toBeInTheDocument();
+  });
+
+  it("surfaces a dismissible banner when the stream reports message_too_big", async () => {
+    const client = makeClient();
+    const onNewChat = vi.fn().mockResolvedValue("chat-a");
+
+    render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("chat-a")}
+          title="Chat chat-a"
+          onToggleSidebar={() => {}}
+          onGoHome={() => {}}
+          onNewChat={onNewChat}
+        />,
+      ),
+    );
+
+    // No banner yet: only appears once the client emits a matching error.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    await act(async () => {});
+    await act(async () => {
+      client._emitError({ kind: "message_too_big" });
+    });
+
+    const banner = await screen.findByRole("alert");
+    expect(banner).toHaveTextContent("Message too large");
+
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    });
+  });
+
+  it("clears the stream error banner when the user switches to another chat", async () => {
+    const client = makeClient();
+    const onNewChat = vi.fn().mockResolvedValue("chat-a");
+
+    const { rerender } = render(
+      wrap(
+        client,
+        <ThreadShell
+          session={session("chat-a")}
+          title="Chat chat-a"
+          onToggleSidebar={() => {}}
+          onGoHome={() => {}}
+          onNewChat={onNewChat}
+        />,
+      ),
+    );
+
+    await act(async () => {});
+    await act(async () => {
+      client._emitError({ kind: "message_too_big" });
+    });
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+
+    // Switch to a different chat. The banner was about the *previous* send
+    // in chat-a; it must not leak into chat-b's view.
+    await act(async () => {
+      rerender(
+        wrap(
+          client,
+          <ThreadShell
+            session={session("chat-b")}
+            title="Chat chat-b"
+            onToggleSidebar={() => {}}
+            onGoHome={() => {}}
+            onNewChat={onNewChat}
+          />,
+        ),
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    });
   });
 
   it("clears the previous thread immediately while the next session loads", async () => {
@@ -251,17 +1834,14 @@ describe("ThreadShell", () => {
       "fetch",
       vi.fn((input: RequestInfo | URL) => {
         const url = String(input);
-        if (url.includes("websocket%3Achat-a/messages")) {
+        if (url.includes("websocket%3Achat-a/webui-thread")) {
           return Promise.resolve(
-            httpJson({
-              key: "websocket:chat-a",
-              created_at: null,
-              updated_at: null,
-              messages: [{ role: "assistant", content: "from chat a" }],
-            }),
+            httpJson(
+              transcriptFromSimpleMessages([{ role: "assistant", content: "from chat a" }]),
+            ),
           );
         }
-        if (url.includes("websocket%3Achat-b/messages")) {
+        if (url.includes("websocket%3Achat-b/webui-thread")) {
           return new Promise((resolve) => {
             resolveChatB = resolve;
           });
@@ -309,16 +1889,120 @@ describe("ThreadShell", () => {
 
     await act(async () => {
       resolveChatB?.(
-        httpJson({
-          key: "websocket:chat-b",
-          created_at: null,
-          updated_at: null,
-          messages: [{ role: "assistant", content: "from chat b" }],
-        }),
+        httpJson(transcriptFromSimpleMessages([{ role: "assistant", content: "from chat b" }])),
       );
     });
 
     await waitFor(() => expect(screen.getByText("from chat b")).toBeInTheDocument());
     expect(screen.queryByText("from chat a")).not.toBeInTheDocument();
+  });
+
+  it("updates @ CLI app suggestions when settings broadcasts an install", async () => {
+    const client = makeClient();
+    render(wrap(
+      client,
+      <ThreadShell
+        session={session("chat-cli-apps")}
+        title="Chat chat-cli-apps"
+        onToggleSidebar={() => {}}
+        onGoHome={() => {}}
+        onNewChat={() => {}}
+      />,
+    ));
+
+    const input = await screen.findByLabelText("Message input");
+    expect(screen.queryByRole("listbox", { name: "Apps" })).not.toBeInTheDocument();
+
+    const payload: CliAppsPayload = {
+      apps: [{
+        name: "gimp",
+        display_name: "GIMP",
+        category: "image",
+        description: "Image editing",
+        requires: "",
+        source: "harness",
+        entry_point: "cli-anything-gimp",
+        install_supported: true,
+        installed: true,
+        available: true,
+        status: "installed",
+        logo_url: null,
+        brand_color: "#5C5543",
+        skill_installed: true,
+      }],
+      installed_count: 1,
+      catalog_updated_at: "2026-04-18",
+    };
+
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent(CLI_APPS_CHANGED_EVENT, { detail: payload }));
+    });
+    fireEvent.change(input, { target: { value: "@", selectionStart: 1 } });
+
+    expect(screen.getByRole("listbox", { name: "Apps" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /@gimp/i })).toBeInTheDocument();
+  });
+
+  it("keeps installed app mentions available during transient catalog refresh failures", async () => {
+    const client = makeClient();
+    const payload: CliAppsPayload = {
+      apps: [{
+        name: "obsidian-agent-cli",
+        display_name: "Obsidian",
+        category: "productivity",
+        description: "Obsidian automation",
+        requires: "",
+        source: "harness",
+        entry_point: "cli-anything-obsidian",
+        install_supported: true,
+        installed: true,
+        available: true,
+        status: "installed",
+        logo_url: null,
+        brand_color: "#7C3AED",
+        skill_installed: true,
+      }],
+      installed_count: 1,
+      catalog_updated_at: "2026-07-14",
+    };
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      if (String(input).includes("/api/settings/cli-apps?installed_only=1")) {
+        throw new Error("temporary catalog failure");
+      }
+      return {
+        ok: false,
+        status: 404,
+        json: async () => ({}),
+      } as Response;
+    });
+
+    render(wrap(
+      client,
+      <ThreadShell
+        session={session("chat-cli-refresh")}
+        title="Chat chat-cli-refresh"
+        onToggleSidebar={() => {}}
+        onGoHome={() => {}}
+        onNewChat={() => {}}
+      />,
+    ));
+
+    const input = await screen.findByLabelText("Message input");
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent(CLI_APPS_CHANGED_EVENT, { detail: payload }));
+    });
+    const mention = "@obsidian-agent-cli";
+    fireEvent.change(input, { target: { value: mention, selectionStart: mention.length } });
+    expect(screen.getByRole("option", { name: /@obsidian-agent-cli/i })).toBeInTheDocument();
+
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("option", { name: /@obsidian-agent-cli/i })).toBeInTheDocument();
+    expect(screen.getByTestId("composer-cli-mention-obsidian-agent-cli")).toHaveTextContent(
+      "@obsidian-agent-cli",
+    );
   });
 });

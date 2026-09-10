@@ -1,0 +1,46 @@
+# nanobot baseline: 0.3.0
+# upstream commit: 3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec
+
+diff --git aa/nanobot/nanobot/security/workspace_access.py bb/nanobot/nanobot/security/workspace_access.py
+index 59c5455..46a63ea 100644
+--- aa/nanobot/nanobot/security/workspace_access.py
++++ bb/nanobot/nanobot/security/workspace_access.py
+@@ -71,6 +71,15 @@ class WorkspaceScope:
+     restrict_to_workspace: bool
+     sandbox_status: WorkspaceSandboxStatus
+     source_channel: str | None = None
++    # Shared capability roots (global media/workspace skills/history) are
++    # available to the stock standalone runtime.  Product adapters may bind
++    # an actor-owned scope with this disabled; the value is server-owned and
++    # intentionally omitted from client metadata/payloads.
++    allow_shared_extras: bool = True
++    # Optional server-owned root to hide before rebinding the tool workspace.
++    # This remains outside client metadata so a caller cannot widen the mount
++    # namespace or choose a less restrictive mask.
++    sandbox_mask_root: Path | None = None
+ 
+     @property
+     def project_name(self) -> str:
+@@ -216,6 +225,8 @@ def build_workspace_scope(
+     access_mode: str,
+     *,
+     source_channel: str | None = None,
++    allow_shared_extras: bool = True,
++    sandbox_mask_root: str | Path | None = None,
+ ) -> WorkspaceScope:
+     mode = _normalize_access_mode(access_mode)
+     root = Path(project_path).expanduser().resolve(strict=False)
+@@ -229,6 +240,12 @@ def build_workspace_scope(
+             workspace=root,
+         ),
+         source_channel=source_channel,
++        allow_shared_extras=allow_shared_extras,
++        sandbox_mask_root=(
++            Path(sandbox_mask_root).expanduser().resolve(strict=False)
++            if sandbox_mask_root is not None
++            else None
++        ),
+     )
+ 
+ 
+

@@ -1,0 +1,17 @@
+# nanobot baseline: 0.3.0
+# upstream commit: 3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec
+
+diff --git aa/nanobot/nanobot/config/loader.py bb/nanobot/nanobot/config/loader.py
+index 90da366..11135db 100644
+--- aa/nanobot/nanobot/config/loader.py
++++ bb/nanobot/nanobot/config/loader.py
+@@ -208,6 +208,8 @@ def _migrate_config(data: dict) -> dict:
+         )
+         defaults.pop("maxMessages", None)
+         defaults.pop("max_messages", None)
++        defaults.pop("memoryWindow", None)
++        defaults.pop("memory_window", None)
+         if had_legacy_max_messages:
+             # TODO(v0.2.4): Remove this legacy cleanup branch. v0.2.3 is the
+             # final release that warns before the schema silently ignores the field.
+

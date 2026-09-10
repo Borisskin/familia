@@ -1010,21 +1010,53 @@ def _docker_verify_target(config: dict[str, Any]) -> None:
     if actual_members != network_members or actual_members != expected_ids:
         raise MigrationPreflightError("Docker target network membership mismatch")
 
-    for section, actual in containers.items():
-        declared_mount = config[section].get("install_mount") if section == "runner" else None
-        if declared_mount is None:
-            continue
-        mounts = actual.get("Mounts") or []
-        if not any(
-            mount.get("Type") == "volume"
-            and mount.get("Name") == declared_mount["name"]
-            and mount.get("Destination") == declared_mount["destination"]
-            and mount.get("RW") is True
-            for mount in mounts
-        ):
-            raise MigrationPreflightError("install root is not on the configured runner volume")
-    runner_volume = _docker_inspect("volume", config["runner"]["install_mount"]["name"])
     runner_mount = config["runner"]["install_mount"]
+    mounts = containers["runner"].get("Mounts") or []
+
+    def is_runner_volume(mount: Any) -> bool:
+        return (
+            isinstance(mount, dict)
+            and mount.get("Type") == "volume"
+            and mount.get("Name") == runner_mount["name"]
+            and mount.get("Destination") == runner_mount["destination"]
+            and mount.get("RW") is True
+        )
+
+    if not any(is_runner_volume(mount) for mount in mounts):
+        raise MigrationPreflightError("install root is not on the configured runner volume")
+    install_root = PurePosixPath(config["install_root"])
+    volume_destination = PurePosixPath(runner_mount["destination"])
+    if not install_root.is_absolute() or not volume_destination.is_absolute():
+        raise MigrationPreflightError("install root is not on the configured runner volume")
+    covering_mounts = [
+        mount
+        for mount in mounts
+        if isinstance(mount, dict)
+        and isinstance(mount.get("Destination"), str)
+        and install_root.is_relative_to(PurePosixPath(mount["Destination"]))
+    ]
+    if not covering_mounts:
+        raise MigrationPreflightError("install root is not on the configured runner volume")
+    deepest = max(
+        len(PurePosixPath(mount["Destination"]).parts)
+        for mount in covering_mounts
+    )
+    deepest_mounts = [
+        mount
+        for mount in covering_mounts
+        if len(PurePosixPath(mount["Destination"]).parts) == deepest
+    ]
+    if len(deepest_mounts) != 1 or not is_runner_volume(deepest_mounts[0]):
+        raise MigrationPreflightError("install root is not on the configured runner volume")
+    for mount in mounts:
+        if (
+            isinstance(mount, dict)
+            and not is_runner_volume(mount)
+            and isinstance(mount.get("Destination"), str)
+            and PurePosixPath(mount["Destination"]).is_relative_to(install_root)
+        ):
+            raise MigrationPreflightError("install root is overlapped by another mount")
+    runner_volume = _docker_inspect("volume", config["runner"]["install_mount"]["name"])
     runner_volume_id = runner_volume.get("Id") or runner_volume.get("Name")
     if runner_volume.get("Name") != runner_mount["name"] or runner_volume_id != runner_mount.get("id", runner_mount["name"]):
         raise MigrationPreflightError("runner install volume identity mismatch")

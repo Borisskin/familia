@@ -111,6 +111,7 @@ async def gate_outbound_send(
     inbound_channel: str | None,
     inbound_chat_id: str | None,
     publish_outbound: Callable[[OutboundMessage], Awaitable[None]],
+    already_approved: bool = False,
 ) -> GateResult:
     """Evaluate the policy and, on ASK, park the outbound + notify approvers.
 
@@ -118,8 +119,13 @@ async def gate_outbound_send(
     deliver the approval prompts + later the parked outbound on
     approval). The ALLOW branch intentionally does NOT publish — that
     stays with the caller so its path-specific bookkeeping (message_id
-    echo, pending-ask watchdog, etc.) still runs.
+    echo, pending-ask watchdog, etc.) still runs. ``already_approved`` is
+    reserved for the atomic callback path: the pending store has consumed a
+    valid approval token, so an ASK result is allowed to continue once instead
+    of opening a second approval cycle. Explicit DENY rules still win.
     """
+    if not isinstance(action, str) or not action.strip():
+        return GateResult("deny", reason="исходящее действие не задано")
     decision = evaluate_outbound_send(
         action=action,
         to_channel=outbound.channel,
@@ -139,11 +145,22 @@ async def gate_outbound_send(
             rule_name=rule_name,
         )
 
+    if already_approved:
+        audit.log_event(
+            "policy_approved_delivery",
+            action=action,
+            target_channel=outbound.channel,
+            target_chat_id=outbound.chat_id,
+            rule_name=rule_name,
+        )
+        return GateResult("allow", rule_name=rule_name)
+
     parked, reached = await request_approval(
         action=action,
         outbound=outbound,
         requester_actor=get_current_actor(),
         requester_channel=get_current_channel(),
+        requester_chat_id=inbound_chat_id,
         approvers=decision.approver,
         reason=decision.reason,
         rule_name=rule_name,

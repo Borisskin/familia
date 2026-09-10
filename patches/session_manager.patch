@@ -1,115 +1,269 @@
-# nanobot baseline: 0.1.5.post2
-# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+# nanobot baseline: 0.3.0
+# upstream commit: 3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec
 
-diff --git a/nanobot/nanobot/session/manager.py b/nanobot/nanobot/session/manager.py
-index 4add4fd..e21dc9d 100644
---- a/nanobot/nanobot/session/manager.py
-+++ b/nanobot/nanobot/session/manager.py
-@@ -3,6 +3,7 @@
+diff --git aa/nanobot/nanobot/session/manager.py bb/nanobot/nanobot/session/manager.py
+index a791967..1c195df 100644
+--- aa/nanobot/nanobot/session/manager.py
++++ bb/nanobot/nanobot/session/manager.py
+@@ -2,6 +2,7 @@
+ 
+ import base64
+ import errno
++import inspect
  import json
  import os
- import shutil
-+import threading
- from dataclasses import dataclass, field
- from datetime import datetime
- from pathlib import Path
-@@ -106,6 +107,16 @@ class SessionManager:
-         self.sessions_dir = ensure_dir(self.workspace / "sessions")
-         self.legacy_sessions_dir = get_legacy_sessions_dir()
-         self._cache: dict[str, Session] = {}
-+        self._save_locks_guard = threading.Lock()
-+        self._save_locks: dict[str, threading.RLock] = {}
+ import re
+@@ -18,6 +19,7 @@ from weakref import WeakValueDictionary
+ from loguru import logger
+ 
+ from nanobot.config.paths import get_legacy_sessions_dir
++from nanobot.runtime_adapters import ArchiveResult
+ from nanobot.runtime_context import (
+     RUNTIME_CONTEXT_HISTORY_META,
+     public_history_message,
+@@ -52,6 +54,24 @@ _FORK_VOLATILE_METADATA_KEYS = {
+     "title",
+     "title_user_edited",
+ }
++_RUNTIME_PRIVATE_METADATA_KEYS = {
++    "_runtime_request_context",
++    "_runtime_actor",
++    "_runtime_action",
++    "_runtime_inbound_channel",
++    "_runtime_inbound_chat_id",
++}
 +
-+    def _save_lock_for(self, key: str) -> threading.RLock:
-+        with self._save_locks_guard:
-+            lock = self._save_locks.get(key)
-+            if lock is None:
-+                lock = threading.RLock()
-+                self._save_locks[key] = lock
-+            return lock
++
++def _strip_runtime_metadata(value: Any) -> dict[str, Any]:
++    """Copy a record without in-process provenance objects."""
++    if not isinstance(value, dict):
++        return {}
++    return {
++        key: item
++        for key, item in value.items()
++        if key not in _RUNTIME_PRIVATE_METADATA_KEYS
++    }
  
-     @staticmethod
-     def safe_key(key: str) -> str:
-@@ -169,6 +180,8 @@ class SessionManager:
-                         continue
  
-                     data = json.loads(line)
-+                    if not isinstance(data, dict):
-+                        raise TypeError("session JSONL record must be an object")
+ def replay_max_messages_for_context(context_window_tokens: int | None) -> int:
+@@ -164,6 +184,7 @@ class Session:
+         max_tokens: int = 0,
+         extend_to_user: bool = False,
+         include_runtime_context: bool = True,
++        actor: str | None = None,
+     ) -> list[dict[str, Any]]:
+         """Return unconsolidated messages for LLM input.
  
-                     if data.get("_type") == "metadata":
-                         metadata = data.get("metadata", {})
-@@ -184,7 +197,7 @@ class SessionManager:
-                 created_at=created_at or datetime.now(),
-                 updated_at=updated_at or datetime.now(),
-                 metadata=metadata,
--                last_consolidated=last_consolidated
-+                last_consolidated=last_consolidated,
-             )
-         except Exception as e:
-             logger.warning("Failed to load session {}: {}", key, e)
-@@ -217,6 +230,9 @@ class SessionManager:
-                     except json.JSONDecodeError:
-                         skipped += 1
-                         continue
-+                    if not isinstance(data, dict):
-+                        skipped += 1
-+                        continue
+@@ -171,6 +192,24 @@ class Session:
+         token budget from the tail (``max_tokens``) when provided.
+         """
+         unconsolidated = self.messages[self.last_consolidated:]
++        if actor is not None:
++            # Familia-style sessions are actor-scoped.  Filter before applying
++            # replay limits so another principal's messages cannot displace
++            # or leak through the bounded history window.
++            unconsolidated = [
++                message
++                for message in unconsolidated
++                if (
++                    message.get("actor")
++                    if isinstance(message, dict)
++                    else None
++                ) == actor
++                or (
++                    isinstance(message, dict)
++                    and isinstance(message.get("metadata"), dict)
++                    and message["metadata"].get("actor") == actor
++                )
++            ]
+         max_messages = max_messages if max_messages > 0 else FILE_MAX_MESSAGES
+         start_idx = recent_message_start_index(
+             unconsolidated,
+@@ -396,13 +435,97 @@ class Session:
+         if limit <= 0 or len(self.messages) <= limit:
+             return
  
-                     if data.get("_type") == "metadata":
-                         metadata = data.get("metadata", {})
-@@ -246,7 +262,7 @@ class SessionManager:
-                 created_at=created_at or datetime.now(),
-                 updated_at=updated_at or datetime.now(),
-                 metadata=metadata,
--                last_consolidated=last_consolidated
-+                last_consolidated=last_consolidated,
-             )
-         except Exception as e:
-             logger.warning("Repair failed for session {}: {}", key, e)
-@@ -259,11 +275,11 @@ class SessionManager:
++        previous_messages = list(self.messages)
++        previous_last_consolidated = self.last_consolidated
++        previous_updated_at = self.updated_at
+         result = self.retain_recent_legal_suffix(limit)
+         if not result.dropped:
+             return
+ 
+         archive_chunk = result.dropped[result.already_consolidated_count:]
+         if archive_chunk and on_archive:
+-            on_archive(archive_chunk)
++            try:
++                archive_result = on_archive(archive_chunk)
++            except BaseException:
++                self.messages = previous_messages
++                self.last_consolidated = previous_last_consolidated
++                self.updated_at = previous_updated_at
++                raise
++            if inspect.isawaitable(archive_result):
++                close = getattr(archive_result, "close", None)
++                if callable(close):
++                    close()
++                self.messages = previous_messages
++                self.last_consolidated = previous_last_consolidated
++                self.updated_at = previous_updated_at
++                logger.warning(
++                    "Async file-cap archiver cannot run in synchronous session save; "
++                    "cursor remains at {}",
++                    self.last_consolidated,
++                )
++                return
++            if isinstance(archive_result, ArchiveResult) and not archive_result.committed:
++                self.messages = previous_messages
++                self.last_consolidated = previous_last_consolidated
++                self.updated_at = previous_updated_at
++                logger.warning(
++                    "File-cap archive not committed for {}; retained {} messages",
++                    self.key,
++                    len(self.messages),
++                )
++                return
++        logger.info(
++            "Session file cap hit for {}: dropped {}, raw-archived {}, kept {}",
++            self.key,
++            len(result.dropped),
++            len(archive_chunk),
++            len(self.messages),
++        )
++
++    async def enforce_file_cap_async(
++        self,
++        on_archive: Any = None,
++        limit: int = FILE_MAX_MESSAGES,
++    ) -> bool:
++        """Archive overflow before committing an asynchronous trim.
++
++        The synchronous path intentionally remains available for the stock
++        nanobot runtime.  Familia's archive hook is asynchronous, so this
++        variant keeps the original session intact until its durable result is
++        committed and also restores it on any failure.
++        """
++        if limit <= 0 or len(self.messages) <= limit:
++            return True
++
++        previous_messages = list(self.messages)
++        previous_last_consolidated = self.last_consolidated
++        previous_updated_at = self.updated_at
++        result = self.retain_recent_legal_suffix(limit)
++        if not result.dropped:
++            return True
++
++        archive_chunk = result.dropped[result.already_consolidated_count:]
++        if archive_chunk and on_archive:
++            try:
++                archive_result = on_archive(archive_chunk)
++                if inspect.isawaitable(archive_result):
++                    archive_result = await archive_result
++            except BaseException:
++                self.messages = previous_messages
++                self.last_consolidated = previous_last_consolidated
++                self.updated_at = previous_updated_at
++                raise
++            if isinstance(archive_result, ArchiveResult) and not archive_result.committed:
++                self.messages = previous_messages
++                self.last_consolidated = previous_last_consolidated
++                self.updated_at = previous_updated_at
++                logger.warning(
++                    "Async file-cap archive not committed for {}; retained {} messages",
++                    self.key,
++                    len(self.messages),
++                )
++                return False
++
+         logger.info(
+             "Session file cap hit for {}: dropped {}, raw-archived {}, kept {}",
+             self.key,
+@@ -410,6 +533,7 @@ class Session:
+             len(archive_chunk),
+             len(self.messages),
+         )
++        return True
+ 
+ 
+ class SessionManager:
+@@ -427,7 +551,7 @@ class SessionManager:
+         # Preserve identity for sessions held by active callers without retaining idle ones.
+         self._overflow_cache: WeakValueDictionary[str, Session] = WeakValueDictionary()
+         self._max_cached_sessions = SESSION_CACHE_MAX_SIZE
+-        self._file_cap_archiver: Callable[..., None] | None = None
++        self._file_cap_archiver: Callable[..., Any] | None = None
+ 
+     def _remember(self, session: Session) -> None:
+         """Keep recent sessions strongly cached without duplicating live objects."""
+@@ -449,7 +573,7 @@ class SessionManager:
+             self._remember(session)
+         return session
+ 
+-    def set_file_cap_archiver(self, archiver: Callable[..., None]) -> None:
++    def set_file_cap_archiver(self, archiver: Callable[..., Any]) -> None:
+         """Archive unconsolidated overflow whenever a session is persisted."""
+         self._file_cap_archiver = archiver
+ 
+@@ -674,11 +798,31 @@ class SessionManager:
+             "key": session.key,
              "created_at": session.created_at.isoformat(),
              "updated_at": session.updated_at.isoformat(),
-             "metadata": session.metadata,
+-            "metadata": session.metadata,
 -            "messages": session.messages,
-+            "messages": [dict(message) for message in session.messages],
++            "metadata": _strip_runtime_metadata(session.metadata),
++            "messages": [
++                _strip_runtime_metadata(message)
++                for message in session.messages
++            ],
          }
  
--    def save(self, session: Session) -> None:
--        """Save a session to disk atomically."""
-+    def _write_session(self, session: Session) -> None:
-+        """Atomically write the session."""
-         path = self._get_session_path(session.key)
-         tmp_path = path.with_suffix(".jsonl.tmp")
+-    def save(self, session: Session, *, fsync: bool = False) -> None:
++    async def save_async(self, session: Session, *, fsync: bool = False) -> None:
++        """Archive asynchronous overflow before atomically saving a session."""
++        if self._file_cap_archiver is not None:
++            await session.enforce_file_cap_async(
++                on_archive=lambda messages: self._file_cap_archiver(
++                    messages,
++                    session_key=session.key,
++                )
++            )
++        self.save(session, fsync=fsync, skip_file_cap=True)
++
++    def save(
++        self,
++        session: Session,
++        *,
++        fsync: bool = False,
++        skip_file_cap: bool = False,
++    ) -> None:
+         """Save a session to disk atomically.
  
-@@ -275,7 +291,7 @@ class SessionManager:
+         When *fsync* is ``True`` the final file and its parent directory are
+@@ -688,7 +832,7 @@ class SessionManager:
+         write-back caching (e.g. rclone VFS, NFS, FUSE mounts) do not lose
+         the most recent writes.
+         """
+-        if self._file_cap_archiver is not None:
++        if self._file_cap_archiver is not None and not skip_file_cap:
+             session.enforce_file_cap(
+                 on_archive=lambda messages: self._file_cap_archiver(
+                     messages,
+@@ -706,12 +850,15 @@ class SessionManager:
+                     "key": session.key,
                      "created_at": session.created_at.isoformat(),
                      "updated_at": session.updated_at.isoformat(),
-                     "metadata": session.metadata,
--                    "last_consolidated": session.last_consolidated
-+                    "last_consolidated": session.last_consolidated,
+-                    "metadata": session.metadata,
++                    "metadata": _strip_runtime_metadata(session.metadata),
+                     "last_consolidated": session.last_consolidated
                  }
                  f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
                  for msg in session.messages:
-@@ -286,7 +302,11 @@ class SessionManager:
-             tmp_path.unlink(missing_ok=True)
-             raise
- 
--        self._cache[session.key] = session
-+    def save(self, session: Session) -> None:
-+        """Atomically save a session."""
-+        with self._save_lock_for(session.key):
-+            self._write_session(session)
-+            self._cache[session.key] = session
- 
-     def invalidate(self, key: str) -> None:
-         """Remove a session from the in-memory cache."""
-@@ -341,7 +361,7 @@ class SessionManager:
-                 "created_at": created_at,
-                 "updated_at": updated_at,
-                 "metadata": metadata,
--                "messages": messages,
-+                "messages": [dict(message) for message in messages],
-             }
-         except Exception as e:
-             logger.warning("Failed to read session {}: {}", key, e)
+-                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
++                    f.write(
++                        json.dumps(_strip_runtime_metadata(msg), ensure_ascii=False)
++                        + "\n"
++                    )
+                 if fsync:
+                     f.flush()
+                     os.fsync(f.fileno())
+

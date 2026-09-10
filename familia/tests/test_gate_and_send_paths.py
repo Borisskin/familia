@@ -14,6 +14,8 @@ can actually route approval prompts.
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -33,9 +35,13 @@ from familia.principals import (
 )
 from familia.tools.ask import AskPrincipalTool
 from familia.tools.buttons import SendButtonsTool
-from nanobot.agent.loop import AgentLoop
+from nanobot.agent.tools.context import RequestContext, request_context
+from nanobot.agent.tools.context import RUNTIME_REQUEST_CONTEXT_KEY
+from nanobot.agent.turn_delivery import TurnDeliveryFactory
 from nanobot.agent.tools.message import MessageTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.queue import MessageBus
+from nanobot.bus.runtime_events import RuntimeEventBus
 
 
 OWNER = "owner"
@@ -123,6 +129,7 @@ def registry():
          patch("familia.policy.gate.get_current_actor", return_value=MEMBER_A), \
          patch("familia.policy.approval.resolve_identity", side_effect=resolver), \
          patch("familia.tools.ask.resolve_identity", side_effect=resolver), \
+         patch("familia.bus.callback_dispatcher.get_registry", return_value=reg), \
          patch("familia.bus.callback_dispatcher.resolve_identity", side_effect=resolver):
         set_current_actor(MEMBER_A)
         yield reg
@@ -294,14 +301,37 @@ class TestGateOutboundSend:
 # ---------- send path: direct reply (agent loop) ----------
 
 
-async def _invoke_publish_reply(bus_publish, inbound, outbound):
-    """Call ``AgentLoop._publish_reply_with_policy`` without constructing
-    the whole loop — it only ever reaches into ``self.bus.publish_outbound``."""
-    fake_self = SimpleNamespace(
-        bus=SimpleNamespace(publish_outbound=bus_publish),
-        _outbound_guard=familia_bootstrap.make_outbound_guard(),
+async def _invoke_turn_delivery(inbound, outbound) -> list[OutboundMessage]:
+    """Publish one real turn response through MessageBus and its guard."""
+    bus = MessageBus(outbound_guard=familia_bootstrap.make_outbound_guard())
+    request_ctx = RequestContext(
+        channel=inbound.channel,
+        chat_id=inbound.chat_id,
+        session_key=inbound.session_key,
+        original_user_text=inbound.content,
+        metadata={"actor": inbound.actor},
+        sender_id=inbound.sender_id,
+        actor=inbound.actor,
     )
-    await AgentLoop._publish_reply_with_policy(fake_self, inbound, outbound)
+    outbound = replace(
+        outbound,
+        metadata={RUNTIME_REQUEST_CONTEXT_KEY: request_ctx},
+    )
+    delivery = TurnDeliveryFactory(bus, RuntimeEventBus()).create(
+        inbound, inbound.session_key,
+    )
+    await delivery.complete(outbound, publish_completion=False)
+    published: list[OutboundMessage] = []
+    while bus.outbound_size:
+        published.append(await bus.consume_outbound())
+    return published
+
+
+async def _drain_bus(bus: MessageBus) -> list[OutboundMessage]:
+    published: list[OutboundMessage] = []
+    while bus.outbound_size:
+        published.append(await bus.consume_outbound())
+    return published
 
 
 def _inbound_from_member_a(chat_id: str = MEMBER_A_CHAT) -> InboundMessage:
@@ -319,81 +349,98 @@ class TestDirectReplyPath:
     async def test_self_reply_published(self, policy, registry, sink):
         inbound = _inbound_from_member_a()
         outbound = OutboundMessage(channel="vk", chat_id=MEMBER_A_CHAT, content="hi back")
-        await _invoke_publish_reply(sink.publish, inbound, outbound)
-        assert [m.content for m in sink.published] == ["hi back"]
+        published = await _invoke_turn_delivery(inbound, outbound)
+        assert [m.content for m in published] == ["hi back"]
 
     @pytest.mark.asyncio
     async def test_cross_chat_allowed_published(self, policy, registry, sink):
         inbound = _inbound_from_member_a()
         outbound = OutboundMessage(channel="vk", chat_id=OWNER_CHAT, content="to owner")
-        await _invoke_publish_reply(sink.publish, inbound, outbound)
-        assert [m.content for m in sink.published] == ["to owner"]
+        published = await _invoke_turn_delivery(inbound, outbound)
+        assert [m.content for m in published] == ["to owner"]
 
     @pytest.mark.asyncio
     async def test_cross_chat_denied_dropped(self, policy, registry, sink):
         inbound = _inbound_from_member_a()
         outbound = OutboundMessage(channel="vk", chat_id=STRANGER_CHAT, content="leak")
-        await _invoke_publish_reply(sink.publish, inbound, outbound)
-        assert sink.published == []
+        published = await _invoke_turn_delivery(inbound, outbound)
+        assert published == []
 
     @pytest.mark.asyncio
-    async def test_ask_sends_approval_prompt_and_waiting_notice(
+    async def test_ask_sends_approval_prompt_and_parks_response(
         self, policy, registry, sink,
     ):
         inbound = _inbound_from_member_a()
         outbound = OutboundMessage(channel="vk", chat_id="7777777", content="q")
-        await _invoke_publish_reply(sink.publish, inbound, outbound)
-        # One prompt to approver, one "reply held" notice back to Member_a.
-        targets = [(m.chat_id, bool(m.metadata.get("approval_prompt"))) for m in sink.published]
+        published = await _invoke_turn_delivery(inbound, outbound)
+        # The public turn path publishes the approval prompt; the original is parked.
+        targets = [(m.chat_id, bool(m.metadata.get("approval_prompt"))) for m in published]
         assert (OWNER_CHAT, True) in targets
-        assert any(
-            cid == MEMBER_A_CHAT and not appr for cid, appr in targets
-        )
         # The real "q" outbound stays parked.
-        assert all(m.content != "q" for m in sink.published)
+        assert all(m.content != "q" for m in published)
 
 
 # ---------- send path: MessageTool ----------
 
 
 class TestMessageTool:
-    def _tool(self, sink, chat_id: str = MEMBER_A_CHAT) -> MessageTool:
+    def _tool(self, bus: MessageBus, chat_id: str = MEMBER_A_CHAT) -> MessageTool:
         t = MessageTool(
-            send_callback=sink.publish,
-            outbound_guard=familia_bootstrap.make_outbound_guard(),
+            send_callback=bus.publish_outbound,
+            default_channel="vk",
+            default_chat_id=chat_id,
         )
-        t.set_context("vk", chat_id)
         return t
+
+    def _context(self, chat_id: str = MEMBER_A_CHAT) -> RequestContext:
+        return RequestContext(
+            channel="vk",
+            chat_id=chat_id,
+            sender_id=chat_id,
+            actor=MEMBER_A,
+        )
 
     @pytest.mark.asyncio
     async def test_self_reply_published(self, policy, registry, sink):
-        t = self._tool(sink, MEMBER_A_CHAT)
-        result = await t.execute(content="same chat")
+        bus = MessageBus(outbound_guard=familia_bootstrap.make_outbound_guard())
+        t = self._tool(bus, MEMBER_A_CHAT)
+        with request_context(self._context(MEMBER_A_CHAT)):
+            result = await t.execute(content="same chat")
+        published = await _drain_bus(bus)
         assert "sent" in result.lower()
-        assert [m.content for m in sink.published] == ["same chat"]
+        assert [m.content for m in published] == ["same chat"]
 
     @pytest.mark.asyncio
     async def test_cross_chat_allowed_published(self, policy, registry, sink):
-        t = self._tool(sink, MEMBER_A_CHAT)
-        result = await t.execute(content="hi owner", chat_id=OWNER_CHAT)
+        bus = MessageBus(outbound_guard=familia_bootstrap.make_outbound_guard())
+        t = self._tool(bus, MEMBER_A_CHAT)
+        with request_context(self._context(MEMBER_A_CHAT)):
+            result = await t.execute(content="hi owner", chat_id=OWNER_CHAT)
+        published = await _drain_bus(bus)
         assert "sent" in result.lower()
-        assert [m.chat_id for m in sink.published] == [OWNER_CHAT]
+        assert [m.chat_id for m in published] == [OWNER_CHAT]
 
     @pytest.mark.asyncio
     async def test_cross_chat_denied(self, policy, registry, sink):
-        t = self._tool(sink, MEMBER_A_CHAT)
-        result = await t.execute(content="nope", chat_id=STRANGER_CHAT)
-        assert result.lower().startswith("policy denied")
-        assert sink.published == []
+        bus = MessageBus(outbound_guard=familia_bootstrap.make_outbound_guard())
+        t = self._tool(bus, MEMBER_A_CHAT)
+        with request_context(self._context(MEMBER_A_CHAT)):
+            result = await t.execute(content="nope", chat_id=STRANGER_CHAT)
+        published = await _drain_bus(bus)
+        # The bus guard drops a denied message before the tool callback returns;
+        # MessageTool's generic result text is not a policy verdict.
+        assert published == []
 
     @pytest.mark.asyncio
     async def test_ask_parks(self, policy, registry, sink):
-        t = self._tool(sink, MEMBER_A_CHAT)
-        result = await t.execute(content="pls", chat_id="7777777")
-        assert "подтвержд" in result.lower()
+        bus = MessageBus(outbound_guard=familia_bootstrap.make_outbound_guard())
+        t = self._tool(bus, MEMBER_A_CHAT)
+        with request_context(self._context(MEMBER_A_CHAT)):
+            result = await t.execute(content="pls", chat_id="7777777")
+        published = await _drain_bus(bus)
         # Approval prompt went out; original "pls" did not.
-        assert any(m.metadata.get("approval_prompt") for m in sink.published)
-        assert all(m.content != "pls" for m in sink.published)
+        assert any(m.metadata.get("approval_prompt") for m in published)
+        assert all(m.content != "pls" for m in published)
 
 
 # ---------- send path: SendButtonsTool ----------
@@ -625,6 +672,8 @@ class TestCallbackCornerCases:
             correlation_id="cid-dbl",
             target_actor=OWNER,
             question="Child A дома?",
+            target_channel="vk",
+            target_chat_id=OWNER_CHAT,
             requester_channel="vk",
             requester_chat_id=MEMBER_A_CHAT,
             requester_sender_id=MEMBER_A_CHAT,
@@ -646,6 +695,114 @@ class TestCallbackCornerCases:
         # Second press: orphan fallback (no owner rerouting configured).
         assert bus.inbound[1].chat_id == OWNER_CHAT
         assert "нажал кнопку" in bus.inbound[1].content
+
+    @pytest.mark.asyncio
+    async def test_foreign_ask_callback_keeps_pending_and_watchdog(
+        self, policy, registry, monkeypatch,
+    ):
+        from familia import pending_asks as _pa
+        from familia.bus.callback_dispatcher import CallbackDispatcher
+        from familia.pending_asks import PendingAsk
+
+        monkeypatch.delenv("FAMILIA_OWNER_ACTOR", raising=False)
+        bus = _FakeBus()
+        disp = CallbackDispatcher(bus)  # type: ignore[arg-type]
+        ask = PendingAsk(
+            correlation_id="cid-owner-only",
+            target_actor=OWNER,
+            target_channel="vk",
+            target_chat_id=OWNER_CHAT,
+            question="Child A дома?",
+            requester_channel="vk",
+            requester_chat_id=MEMBER_A_CHAT,
+            requester_sender_id=MEMBER_A_CHAT,
+            requester_actor=MEMBER_A,
+        )
+        ask.watchdog = asyncio.create_task(asyncio.sleep(60))
+        _pa.register(ask)
+
+        await disp._handle(_callback(
+            correlation_id=ask.correlation_id,
+            payload="yes",
+            pressed_label="✅ Да",
+            actor=MEMBER_A,
+            chat_id=MEMBER_A_CHAT,
+        ))
+
+        assert _pa.get(ask.correlation_id) is ask
+        assert not ask.watchdog.cancelled()
+        assert bus.inbound == []
+        ask.watchdog.cancel()
+
+    @pytest.mark.asyncio
+    async def test_legacy_ask_callback_fails_closed(
+        self, policy, registry, monkeypatch,
+    ):
+        from familia import pending_asks as _pa
+        from familia.bus.callback_dispatcher import CallbackDispatcher
+        from familia.pending_asks import PendingAsk
+
+        monkeypatch.delenv("FAMILIA_OWNER_ACTOR", raising=False)
+        bus = _FakeBus()
+        disp = CallbackDispatcher(bus)  # type: ignore[arg-type]
+        ask = PendingAsk(
+            correlation_id="cid-legacy",
+            target_actor=OWNER,
+            question="legacy",
+            requester_channel="vk",
+            requester_chat_id=MEMBER_A_CHAT,
+            requester_sender_id=MEMBER_A_CHAT,
+            requester_actor=MEMBER_A,
+        )
+        _pa.register(ask)
+
+        await disp._handle(_callback(
+            correlation_id=ask.correlation_id,
+            payload="yes",
+            actor=OWNER,
+            chat_id=OWNER_CHAT,
+        ))
+
+        assert _pa.get(ask.correlation_id) is ask
+        assert bus.inbound == []
+
+    @pytest.mark.asyncio
+    async def test_revoked_approver_cannot_consume_token(
+        self, policy, registry, tmp_path: Path,
+    ):
+        from familia.bus.callback_dispatcher import CallbackDispatcher
+
+        p = tmp_path / "revoked.yaml"
+        p.write_text(
+            "rules:\n"
+            "  - name: ask with member_a approver\n"
+            "    action: message.send\n"
+            "    actor: member_a\n"
+            "    decision: ask\n"
+            "    approver: member_a\n",
+            encoding="utf-8",
+        )
+        reload_engine(p)
+        pending = get_pending_store().park(
+            action="message.send",
+            outbound=OutboundMessage(channel="vk", chat_id=STRANGER_CHAT, content="payload"),
+            requester_actor=MEMBER_A,
+            requester_channel="vk",
+            requester_chat_id=MEMBER_A_CHAT,
+            approvers=[OWNER],
+            reason="test",
+            rule_name="old owner grant",
+        )
+        bus = _FakeBus()
+        await CallbackDispatcher(bus)._handle(_callback(
+            payload=f"approve:{pending.token}",
+            actor=OWNER,
+            chat_id=OWNER_CHAT,
+        ))
+
+        assert get_pending_store().peek(pending.token) is pending
+        assert bus.outbound
+        assert "актуальных полномочий" in bus.outbound[0].content
 
     @pytest.mark.asyncio
     async def test_approve_after_token_expired(self, policy, registry):
@@ -710,7 +867,7 @@ class TestCallbackCornerCases:
         from familia.bus.callback_dispatcher import CallbackDispatcher
 
         parked = OutboundMessage(
-            channel="vk", chat_id=STRANGER_CHAT, content="payload",
+            channel="vk", chat_id="7777777", content="payload",
         )
         pending = get_pending_store().park(
             action="message.send",
@@ -719,6 +876,8 @@ class TestCallbackCornerCases:
             approvers=[OWNER],
             reason="",
             rule_name="test",
+            requester_channel="vk",
+            requester_chat_id=MEMBER_A_CHAT,
         )
 
         bus = _FakeBus()

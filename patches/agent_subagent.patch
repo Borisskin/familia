@@ -1,0 +1,196 @@
+# nanobot baseline: 0.3.0
+# upstream commit: 3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec
+
+diff --git aa/nanobot/nanobot/agent/subagent.py bb/nanobot/nanobot/agent/subagent.py
+index b4f4cec..a1cc458 100644
+--- aa/nanobot/nanobot/agent/subagent.py
++++ bb/nanobot/nanobot/agent/subagent.py
+@@ -5,13 +5,14 @@ import json
+ import time
+ import uuid
+ import warnings
+-from dataclasses import dataclass, field
++from dataclasses import dataclass, field, replace
+ from pathlib import Path
+ from typing import Any, Callable
+ 
+ from loguru import logger
+ 
+ from nanobot.agent.hook import AgentHook, AgentHookContext
++from nanobot.agent.outbound import RUNTIME_REQUEST_CONTEXT_KEY
+ from nanobot.agent.runner import AgentRunner, AgentRunSpec
+ from nanobot.agent.tools.base import ToolResult
+ from nanobot.agent.tools.context import (
+@@ -52,6 +53,7 @@ class SubagentStatus:
+     usage: dict = field(default_factory=dict)          # token usage
+     stop_reason: str | None = None
+     error: str | None = None
++    session_key: str | None = None
+ 
+ 
+ class _SubagentHook(AgentHook):
+@@ -97,6 +99,7 @@ class SubagentManager:
+         max_concurrent_subagents: int | None = None,
+         fail_on_tool_error: bool | None = None,
+         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
++        runtime_adapters: Any | None = None,
+     ):
+         if workspace is None:
+             raise TypeError("SubagentManager.__init__() missing required argument: 'workspace'")
+@@ -125,6 +128,7 @@ class SubagentManager:
+             )
+         self.workspace = workspace
+         self.bus = bus
++        self.runtime_adapters = runtime_adapters
+         self.tools_config = tools_config or ToolsConfig()
+         self.max_tool_result_chars = max_tool_result_chars
+         self.restrict_to_workspace = restrict_to_workspace
+@@ -207,6 +211,8 @@ class SubagentManager:
+         ctx = ToolContext(
+             config=cfg,
+             workspace=str(root.resolve()),
++            bus=self.bus,
++            subagent_manager=self,
+             exec_session_manager=self._exec_session_manager,
+             file_state_store=FileStates(),
+             workspace_sandbox=workspace_sandbox_status(
+@@ -215,6 +221,9 @@ class SubagentManager:
+             ),
+         )
+         ToolLoader().load(ctx, registry, scope="subagent")
++        installer = getattr(self.runtime_adapters, "install_tools", None)
++        if installer is not None:
++            installer(ctx, registry)
+         return registry
+ 
+     async def spawn(
+@@ -229,6 +238,7 @@ class SubagentManager:
+         workspace_scope: WorkspaceScope | None = None,
+         *,
+         runtime: LLMRuntime | None = None,
++        origin_context: RequestContext | None = None,
+     ) -> str:
+         """Spawn a subagent to execute a task in the background."""
+         if runtime is None:
+@@ -237,13 +247,20 @@ class SubagentManager:
+             runtime = runtime.with_generation_overrides(temperature=temperature)
+         task_id = str(uuid.uuid4())[:8]
+         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
+-        origin = {"channel": origin_channel, "chat_id": origin_chat_id, "session_key": session_key}
++        origin: dict[str, Any] = {
++            "channel": origin_channel,
++            "chat_id": origin_chat_id,
++            "session_key": session_key,
++            "actor": origin_context.actor if origin_context is not None else None,
++            "request_context": origin_context,
++        }
+ 
+         status = SubagentStatus(
+             task_id=task_id,
+             label=display_label,
+             task_description=task,
+             started_at=time.monotonic(),
++            session_key=session_key,
+         )
+         self._task_statuses[task_id] = status
+ 
+@@ -288,6 +305,7 @@ class SubagentManager:
+         workspace_scope: WorkspaceScope | None = None,
+         *,
+         runtime: LLMRuntime | None = None,
++        origin_context: RequestContext | None = None,
+     ) -> str:
+         """Run a subagent synchronously and return its result to the caller."""
+         if runtime is None:
+@@ -296,16 +314,19 @@ class SubagentManager:
+             runtime = runtime.with_generation_overrides(temperature=temperature)
+         task_id = str(uuid.uuid4())[:8]
+         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
+-        origin = {
++        origin: dict[str, Any] = {
+             "channel": origin_channel,
+             "chat_id": origin_chat_id,
+             "session_key": session_key,
++            "actor": origin_context.actor if origin_context is not None else None,
++            "request_context": origin_context,
+         }
+         status = SubagentStatus(
+             task_id=task_id,
+             label=display_label,
+             task_description=task,
+             started_at=time.monotonic(),
++            session_key=session_key,
+         )
+         self._task_statuses[task_id] = status
+         logger.info("Running inline subagent [{}]: {}", task_id, display_label)
+@@ -343,7 +364,7 @@ class SubagentManager:
+         task_id: str,
+         task: str,
+         label: str,
+-        origin: dict[str, str],
++        origin: dict[str, Any],
+         status: SubagentStatus,
+         runtime: LLMRuntime,
+         origin_message_id: str | None = None,
+@@ -378,13 +399,26 @@ class SubagentManager:
+                 if self._llm_wall_timeout_for_session
+                 else None
+             )
+-            request_token = bind_request_context(RequestContext(
+-                channel=origin["channel"],
+-                chat_id=origin["chat_id"],
+-                message_id=origin_message_id,
+-                session_key=sess_key,
+-                runtime=runtime,
+-            ))
++            parent_context = origin.get("request_context")
++            if isinstance(parent_context, RequestContext):
++                request_ctx = replace(
++                    parent_context,
++                    message_id=origin_message_id or parent_context.message_id,
++                    session_key=sess_key,
++                    runtime=runtime,
++                    workspace=root,
++                    metadata=dict(parent_context.metadata or {}),
++                )
++            else:
++                request_ctx = RequestContext(
++                    channel=origin["channel"],
++                    chat_id=origin["chat_id"],
++                    message_id=origin_message_id,
++                    session_key=sess_key,
++                    runtime=runtime,
++                    actor=origin.get("actor"),
++                )
++            request_token = bind_request_context(request_ctx)
+             token = bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
+             try:
+                 result = await self.runner.run(AgentRunSpec(
+@@ -456,7 +490,7 @@ class SubagentManager:
+         label: str,
+         task: str,
+         result: str,
+-        origin: dict[str, str],
++        origin: dict[str, Any],
+         status: str,
+         origin_message_id: str | None = None,
+     ) -> None:
+@@ -481,6 +515,9 @@ class SubagentManager:
+             "injected_event": "subagent_result",
+             "subagent_task_id": task_id,
+         }
++        parent_context = origin.get("request_context")
++        if isinstance(parent_context, RequestContext):
++            metadata[RUNTIME_REQUEST_CONTEXT_KEY] = parent_context
+         if origin_message_id:
+             metadata["origin_message_id"] = origin_message_id
+         msg = InboundMessage(
+@@ -489,6 +526,7 @@ class SubagentManager:
+             chat_id=f"{origin['channel']}:{origin['chat_id']}",
+             content=announce_content,
+             session_key_override=override,
++            actor=origin.get("actor") if isinstance(origin.get("actor"), str) else None,
+             metadata=metadata,
+         )
+ 
+

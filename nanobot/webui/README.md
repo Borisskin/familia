@@ -1,41 +1,54 @@
-# nanobot webui
+# nanobot WebUI Source
 
-The browser front-end for `nanobot web`. It is built with Vite + React 18 +
-TypeScript + Tailwind 3 + shadcn/ui, talks to the gateway over the WebSocket
-multiplex protocol, and reads session metadata from the embedded REST surface
-on the same port.
+This directory contains the React/TypeScript source for the nanobot WebUI. If
+you installed `nanobot-ai` from PyPI and only want to use the bundled browser UI,
+read the user guide in [`docs/webui.md`](../docs/webui.md). You do not need
+Node.js, Bun, Vite, or anything in this directory unless you are changing the
+frontend.
 
-For the project overview, install guide, and general docs map, see the root
-[`README.md`](../README.md).
+For the project overview, install guide, and general docs map, see the root [`README.md`](../README.md) and [`docs/README.md`](../docs/README.md).
 
-## Current status
+## Pick a Path
 
-> [!NOTE]
-> The standalone WebUI development workflow currently requires a source
-> checkout.
->
-> WebUI changes in the GitHub repository may land before they are included in
-> the next packaged release, so source installs and published package versions
-> are not yet guaranteed to move in lockstep.
+| Goal | Start with | Opens at |
+|---|---|---|
+| Use the bundled browser UI | [`docs/webui.md`](../docs/webui.md) | `http://127.0.0.1:8765` |
+| Use the WebUI from another device | [`docs/webui.md#lan-access`](../docs/webui.md#lan-access) | `http://<your-ip>:8765` |
+| Change WebUI source code | [Develop the WebUI (Vite HMR)](#develop-the-webui-vite-hmr) | `http://127.0.0.1:5173` |
+| Debug setup failures | [`docs/troubleshooting.md#webui-problems`](../docs/troubleshooting.md#webui-problems) | Diagnosis order and common fixes |
+
+The source app is built with Vite + React 18 + TypeScript + Tailwind 3 +
+shadcn/ui. It talks to the gateway over the WebSocket multiplex protocol and
+reads session metadata from the embedded REST surface on the same port.
 
 ## Layout
 
 ```text
 webui/                 source tree (this directory)
-nanobot/web/dist/      build output consumed by `nanobot web`
+nanobot/web/dist/      build output served by the gateway
 ```
 
-## Develop from source
+## Develop the WebUI (Vite HMR)
 
 ### 1. Install nanobot from source
 
 From the repository root:
 
 ```bash
-pip install -e .
+python -m pip install -e .
 ```
 
-### 2. Start the gateway
+> Editable installs intentionally **skip** the WebUI bundle step — Vite HMR is faster than rebuilding `dist/` on every change.
+
+### 2. Enable the WebSocket channel
+
+In `~/.nanobot/config.json`, merge:
+
+```json
+{ "channels": { "websocket": { "enabled": true } } }
+```
+
+### 3. Start the gateway
 
 In one terminal:
 
@@ -43,7 +56,7 @@ In one terminal:
 nanobot gateway
 ```
 
-### 3. Start the WebUI dev server
+### 4. Start the WebUI dev server
 
 In another terminal:
 
@@ -55,8 +68,7 @@ bun run dev
 
 Then open `http://127.0.0.1:5173`.
 
-By default, the dev server proxies `/api`, `/webui`, `/auth`, and WebSocket
-traffic to `http://127.0.0.1:8765`.
+By default the dev server proxies `/api`, `/webui`, `/auth`, and WebSocket traffic to `http://127.0.0.1:8765`.
 
 If your gateway listens on a non-default port, point the dev server at it:
 
@@ -66,16 +78,16 @@ NANOBOT_API_URL=http://127.0.0.1:9000 bun run dev
 
 ## Build for packaged runtime
 
+You usually do not need to run this by hand: `python -m build` invokes the WebUI build automatically when packaging the wheel.
+
+If you want to preview the production bundle locally without rebuilding the wheel:
+
 ```bash
 cd webui
-bun run build
+bun run build          # writes to ../nanobot/web/dist
 ```
 
-This writes the production assets to `../nanobot/web/dist`, which is the
-directory served by `nanobot web` and bundled into the Python wheel.
-
-If you are cutting a release, run the build before packaging so the published
-wheel contains the current WebUI assets.
+The gateway picks up the new bundle on the next restart.
 
 ## Test
 
@@ -86,5 +98,4 @@ bun run test
 
 ## Acknowledgements
 
-- [`agent-chat-ui`](https://github.com/langchain-ai/agent-chat-ui) for UI and
-  interaction inspiration across the chat surface.
+- [`agent-chat-ui`](https://github.com/langchain-ai/agent-chat-ui) for UI and interaction inspiration across the chat surface.

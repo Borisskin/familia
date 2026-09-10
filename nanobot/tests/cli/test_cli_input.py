@@ -1,4 +1,5 @@
-import asyncio
+from contextlib import nullcontext
+from io import StringIO
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -24,7 +25,7 @@ async def test_read_interactive_input_async_returns_input(mock_prompt_session):
     mock_prompt_session.prompt_async.return_value = "hello world"
 
     result = await commands._read_interactive_input_async()
-    
+
     assert result == "hello world"
     mock_prompt_session.prompt_async.assert_called_once()
     args, _ = mock_prompt_session.prompt_async.call_args
@@ -44,20 +45,104 @@ def test_init_prompt_session_creates_session():
     """Test that _init_prompt_session initializes the global session."""
     # Ensure global is None before test
     commands._PROMPT_SESSION = None
-    
-    with patch("nanobot.cli.commands.PromptSession") as MockSession, \
-         patch("nanobot.cli.commands.FileHistory") as MockHistory, \
+
+    with patch("nanobot.cli.commands.PromptSession") as mock_session_cls, \
+         patch("nanobot.cli.commands.FileHistory"), \
          patch("pathlib.Path.home") as mock_home:
-        
+
         mock_home.return_value = MagicMock()
-        
+
         commands._init_prompt_session()
-        
+
         assert commands._PROMPT_SESSION is not None
-        MockSession.assert_called_once()
-        _, kwargs = MockSession.call_args
-        assert kwargs["multiline"] is False
+        mock_session_cls.assert_called_once()
+        _, kwargs = mock_session_cls.call_args
+        # Buffer is multiline-capable so Alt+Enter can insert newlines;
+        # Enter-to-submit is restored via custom key bindings.
+        assert kwargs["multiline"] is True
         assert kwargs["enable_open_in_editor"] is False
+        assert kwargs.get("key_bindings") is not None
+
+
+def test_cli_key_bindings_enter_submits_and_alt_enter_newlines():
+    """Enter submits the buffer; Alt+Enter inserts a newline."""
+    from prompt_toolkit.keys import Keys
+
+    kb = commands._build_cli_key_bindings()
+
+    def _keys(binding):
+        return tuple(getattr(k, "value", k) for k in binding.keys)
+
+    bound = {_keys(b): b for b in kb.bindings}
+
+    # Enter -> submit
+    enter = bound[(Keys.Enter.value,)]
+    buf = MagicMock()
+    enter.call(MagicMock(current_buffer=buf))
+    buf.validate_and_handle.assert_called_once()
+    buf.insert_text.assert_not_called()
+
+    # Alt+Enter (escape, enter) -> newline
+    alt_enter = bound[(Keys.Escape.value, Keys.Enter.value)]
+    buf = MagicMock()
+    alt_enter.call(MagicMock(current_buffer=buf))
+    buf.insert_text.assert_called_once_with("\n")
+
+
+@pytest.mark.asyncio
+async def test_raw_lf_enter_still_submits_like_wsl_terminals():
+    """A raw LF byte (\\x0a) is what some terminals -- e.g. WSL -- send for a
+    plain Enter keypress. It must submit the buffer, not insert a newline;
+    a mock buffer can't catch a key binding shadowing prompt_toolkit's own
+    default \\n-as-\\r handling, so this drives a real PromptSession/parser.
+    """
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    with create_pipe_input() as pipe_input:
+        with create_app_session(input=pipe_input, output=DummyOutput()):
+            commands._init_prompt_session()
+            session = commands._PROMPT_SESSION
+            pipe_input.send_text("hello\x0aworld\r")
+            result = await session.prompt_async("> ")
+
+    assert result == "hello"
+
+
+@pytest.mark.asyncio
+async def test_alt_enter_inserts_newline_on_lf_terminals():
+    """LF-as-Enter terminals send Alt+Enter as ESC + LF, which needs its own binding."""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    with create_pipe_input() as pipe_input:
+        with create_app_session(input=pipe_input, output=DummyOutput()):
+            commands._init_prompt_session()
+            session = commands._PROMPT_SESSION
+            pipe_input.send_text("foo\x1b\x0abar\r")
+            result = await session.prompt_async("> ")
+
+    assert result == "foo\nbar"
+
+
+@pytest.mark.asyncio
+async def test_csi_u_shift_enter_inserts_newline_not_raw_escape():
+    """CSI-u Shift+Enter inserts a newline instead of raw escape bytes."""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    with create_pipe_input() as pipe_input:
+        with create_app_session(input=pipe_input, output=DummyOutput()):
+            commands._init_prompt_session()
+            session = commands._PROMPT_SESSION
+            pipe_input.send_text("foo\x1b[13;2ubar\r")
+            result = await session.prompt_async("> ")
+
+    # A newline is inserted and no raw escape bytes leak into the result.
+    assert result == "foo\nbar"
 
 
 def test_thinking_spinner_pause_stops_and_restarts():
@@ -94,6 +179,66 @@ def test_print_cli_progress_line_pauses_spinner_before_printing():
             commands._print_cli_progress_line("tool running", thinking)
 
     assert order == ["start", "stop", "print", "start", "stop"]
+
+
+def test_thinking_spinner_clears_status_line_when_paused():
+    """Stopping the spinner should erase its transient line before output."""
+    stream = StringIO()
+    stream.isatty = lambda: True  # type: ignore[method-assign]
+    mock_console = MagicMock()
+    mock_console.file = stream
+    spinner = MagicMock()
+    mock_console.status.return_value = spinner
+
+    thinking = stream_mod.ThinkingSpinner(console=mock_console)
+    with thinking:
+        with thinking.pause():
+            pass
+
+    assert "\r\x1b[2K" in stream.getvalue()
+
+
+def test_stream_renderer_stops_spinner_even_after_header_printed():
+    """A later answer delta must stop the spinner even when header already exists."""
+    stream = StringIO()
+    stream.isatty = lambda: True  # type: ignore[method-assign]
+    mock_console = MagicMock()
+    mock_console.file = stream
+    spinner = MagicMock()
+    mock_console.status.return_value = spinner
+
+    with patch.object(stream_mod, "_make_console", return_value=mock_console):
+        renderer = stream_mod.StreamRenderer(show_spinner=True)
+        renderer._header_printed = True
+        renderer.ensure_header()
+
+    spinner.stop.assert_called_once()
+    assert "\r\x1b[2K" in stream.getvalue()
+
+
+def test_print_cli_progress_line_opens_renderer_header_before_trace():
+    """Trace lines should appear under the assistant header, not under You."""
+    order: list[str] = []
+    renderer = MagicMock()
+    renderer.console.print.side_effect = lambda *_args, **_kwargs: order.append("print")
+    renderer.ensure_header.side_effect = lambda: order.append("header")
+    renderer.pause_spinner.return_value = nullcontext()
+
+    commands._print_cli_progress_line("tool running", None, renderer)
+
+    assert order == ["header", "print"]
+
+
+def test_print_cli_progress_line_stops_live_before_trace():
+    """A trace line should not leak the current transient Live frame."""
+    mock_live = MagicMock()
+    renderer = stream_mod.StreamRenderer(show_spinner=False)
+    renderer._live = mock_live
+
+    commands._print_cli_progress_line("tool running", None, renderer)
+
+    mock_live.stop.assert_called_once()
+    assert renderer._live is None
 
 
 @pytest.mark.asyncio
@@ -156,15 +301,63 @@ def test_stream_renderer_stop_for_input_stops_spinner():
     # Create renderer with mocked console
     with patch.object(stream_mod, "_make_console", return_value=mock_console):
         renderer = stream_mod.StreamRenderer(show_spinner=True)
-        
+
         # Verify spinner started
         spinner.start.assert_called_once()
-        
+
         # Stop for input
         renderer.stop_for_input()
-        
+
         # Verify spinner stopped
         spinner.stop.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_on_end_writes_final_content_to_stdout_after_stopping_live():
+    """on_end should stop Live (transient erases it) then print final content to stdout."""
+    mock_live = MagicMock()
+    mock_console = MagicMock()
+    mock_console.capture.return_value.__enter__ = MagicMock(
+        return_value=MagicMock(get=lambda: "final output\n")
+    )
+    mock_console.capture.return_value.__exit__ = MagicMock(return_value=False)
+
+    with patch.object(stream_mod, "_make_console", return_value=mock_console):
+        renderer = stream_mod.StreamRenderer(show_spinner=False)
+        renderer._live = mock_live
+        renderer._buf = "final output"
+
+        written: list[str] = []
+        with patch("sys.stdout") as mock_stdout:
+            mock_stdout.write = lambda s: written.append(s)
+            mock_stdout.flush = MagicMock()
+            await renderer.on_end()
+
+    mock_live.stop.assert_called_once()
+    assert renderer._live is None
+    assert written == ["final output\n"]
+
+
+@pytest.mark.asyncio
+async def test_on_end_resuming_clears_buffer_and_restarts_spinner():
+    """on_end(resuming=True) should reset state for the next iteration."""
+    spinner = MagicMock()
+    mock_console = MagicMock()
+    mock_console.status.return_value = spinner
+    mock_console.capture.return_value.__enter__ = MagicMock(
+        return_value=MagicMock(get=lambda: "")
+    )
+    mock_console.capture.return_value.__exit__ = MagicMock(return_value=False)
+
+    with patch.object(stream_mod, "_make_console", return_value=mock_console):
+        renderer = stream_mod.StreamRenderer(show_spinner=True)
+        renderer._buf = "some content"
+
+        await renderer.on_end(resuming=True)
+
+    assert renderer._buf == ""
+    # Spinner should have been restarted (start called twice: __init__ + resuming)
+    assert spinner.start.call_count == 2
 
 
 def test_make_console_force_terminal_when_stdout_is_tty():
@@ -183,3 +376,22 @@ def test_make_console_force_terminal_false_when_stdout_is_not_tty():
     with patch.object(sys.stdout, "isatty", return_value=False):
         console = stream_mod._make_console()
         assert console._force_terminal is False
+
+
+def test_render_interactive_ansi_force_terminal_follows_isatty():
+    """Mirror of _make_console: the capture console used to produce ANSI for
+    prompt_toolkit must also defer to sys.stdout.isatty(), otherwise cursor
+    escapes and spinner frames leak into piped output (#3265, #3370)."""
+    import sys
+    captured: dict = {}
+
+    def render_fn(c):
+        captured["console"] = c
+
+    with patch.object(sys.stdout, "isatty", return_value=True):
+        commands._render_interactive_ansi(render_fn)
+        assert captured["console"]._force_terminal is True
+
+    with patch.object(sys.stdout, "isatty", return_value=False):
+        commands._render_interactive_ansi(render_fn)
+        assert captured["console"]._force_terminal is False

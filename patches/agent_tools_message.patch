@@ -1,111 +1,16 @@
-# nanobot baseline: 0.1.5.post2
-# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+# nanobot baseline: 0.3.0
+# upstream commit: 3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec
 
-diff --git a/nanobot/nanobot/agent/tools/message.py b/nanobot/nanobot/agent/tools/message.py
-index ee81eff..b58b02f 100644
---- a/nanobot/nanobot/agent/tools/message.py
-+++ b/nanobot/nanobot/agent/tools/message.py
-@@ -3,6 +3,7 @@
- from contextvars import ContextVar
- from typing import Any, Awaitable, Callable
- 
-+from nanobot.agent.outbound import OutboundGuard, OutboundRequest, allow_outbound
- from nanobot.agent.tools.base import Tool, tool_parameters
- from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
- from nanobot.bus.events import OutboundMessage
-@@ -29,15 +30,24 @@ class MessageTool(Tool):
-         default_channel: str = "",
-         default_chat_id: str = "",
-         default_message_id: str | None = None,
-+        outbound_guard: OutboundGuard | None = None,
-     ):
-         self._send_callback = send_callback
-+        self._outbound_guard = outbound_guard or allow_outbound
-         self._default_channel: ContextVar[str] = ContextVar("message_default_channel", default=default_channel)
-         self._default_chat_id: ContextVar[str] = ContextVar("message_default_chat_id", default=default_chat_id)
-         self._default_message_id: ContextVar[str | None] = ContextVar(
-             "message_default_message_id",
-             default=default_message_id,
-         )
--        self._sent_in_turn_var: ContextVar[bool] = ContextVar("message_sent_in_turn", default=False)
-+        # ContextVar holds a mutable 1-element list so writes from child
-+        # contexts (e.g. coroutines launched under asyncio.gather, which
-+        # copy the parent Context) are visible to the parent.  A plain
-+        # bool ContextVar would be isolated per-child and the parent's
-+        # suppression check would never see the True written by execute().
-+        self._sent_in_turn_var: ContextVar[list[bool]] = ContextVar(
-+            "message_sent_in_turn", default=[False]
-+        )
- 
-     def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
-         """Set the current message context."""
-@@ -49,17 +59,22 @@ class MessageTool(Tool):
-         """Set the callback for sending messages."""
-         self._send_callback = callback
- 
-+    def set_outbound_guard(self, guard: OutboundGuard) -> None:
-+        """Set the policy guard used before publishing messages."""
-+        self._outbound_guard = guard
-+
-     def start_turn(self) -> None:
--        """Reset per-turn send tracking."""
--        self._sent_in_turn = False
-+        """Reset per-turn send tracking.  Installs a fresh holder in the
-+        current context so child tasks see the same mutable object."""
-+        self._sent_in_turn_var.set([False])
- 
-     @property
-     def _sent_in_turn(self) -> bool:
--        return self._sent_in_turn_var.get()
-+        return self._sent_in_turn_var.get()[0]
- 
-     @_sent_in_turn.setter
-     def _sent_in_turn(self, value: bool) -> None:
--        self._sent_in_turn_var.set(value)
-+        self._sent_in_turn_var.get()[0] = value
- 
-     @property
-     def name(self) -> str:
-@@ -117,6 +132,28 @@ class MessageTool(Tool):
-             } if message_id else {},
-         )
- 
-+        # MessageTool stays policy-agnostic; deployments inject a guard that
-+        # can deny, park, audit, or allow the outbound before it is published.
-+        result = await self._outbound_guard(
-+            OutboundRequest(
-+                action="message.send",
-+                outbound=msg,
-+                inbound_channel=default_channel or None,
-+                inbound_chat_id=default_chat_id or None,
-+                publish_outbound=self._send_callback,
-+            )
-+        )
-+        if result.kind == "deny":
-+            return f"Policy denied message.send to {channel}:{chat_id}: {result.reason}"
-+        if result.kind == "asked":
-+            return (
-+                f"Отправлен запрос на подтверждение ({result.approvers_label}). "
-+                "Жду ответа (до 15 минут)."
-+            )
-+
-+        if result.kind != "allow":
-+            return f"Policy denied message.send to {channel}:{chat_id}: unsupported decision"
-+
-         try:
-             await self._send_callback(msg)
-             if channel == default_channel and chat_id == default_chat_id:
-@@ -125,3 +162,13 @@ class MessageTool(Tool):
-             return f"Message sent to {channel}:{chat_id}{media_info}"
-         except Exception as e:
-             return f"Error sending message: {str(e)}"
-+
-+    async def send_approved(self, outbound: OutboundMessage) -> None:
-+        """Send an outbound message previously parked by the policy gate.
-+
-+        Bypasses the policy engine because the action has already been
-+        authorized by an approver.  Raises if no send_callback is set.
-+        """
-+        if not self._send_callback:
-+            raise RuntimeError("Message sending not configured")
-+        await self._send_callback(outbound)
+diff --git aa/nanobot/nanobot/agent/tools/message.py bb/nanobot/nanobot/agent/tools/message.py
+index dad393d..5f16493 100644
+--- aa/nanobot/nanobot/agent/tools/message.py
++++ bb/nanobot/nanobot/agent/tools/message.py
+@@ -243,7 +243,6 @@ class MessageTool(Tool):
+             metadata["message_id"] = message_id
+         if self._record_channel_delivery_var.get() or media:
+             metadata["_record_channel_delivery"] = True
+-
+         msg = OutboundMessage(
+             channel=channel,
+             chat_id=chat_id,
+

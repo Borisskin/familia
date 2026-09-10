@@ -19,10 +19,14 @@ Usage from the patched loop.py::
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -30,12 +34,284 @@ from loguru import logger
 from familia.principals import get_current_actor, set_current_actor, set_current_channel
 from familia.roles import load_effective_roles
 
+
+def _runtime_types() -> Any:
+    """Import target boundary types lazily to keep standalone imports cheap."""
+    from nanobot.runtime_adapters import (
+        Admission,
+        ArchiveResult,
+        RuntimeAdapters,
+        default_context_factory,
+    )
+
+    return Admission, ArchiveResult, RuntimeAdapters, default_context_factory
+
+
+def _trusted_runtime_context(msg: Any) -> Any | None:
+    """Return only a server-created context carried through the message bus.
+
+    A ContextVar belongs to the producer task and is not propagated through an
+    ``asyncio.Queue``.  The queue contract therefore carries the actual typed
+    ``RequestContext`` object in metadata; untyped client JSON is rejected.
+    """
+    from nanobot.agent.tools.context import RequestContext
+
+    from familia.principals import get_registry
+    from familia.session_identity import parse_private_session_key
+
+    metadata = getattr(msg, "metadata", None)
+    candidate = metadata.get("_runtime_request_context") if isinstance(metadata, dict) else None
+    if not isinstance(candidate, RequestContext):
+        return None
+    actor = candidate.actor
+    channel = getattr(msg, "channel", "")
+    chat_id = getattr(msg, "chat_id", "")
+    if not isinstance(actor, str) or get_registry().get(actor) is None:
+        return None
+    if (candidate.channel, candidate.chat_id) != (channel, chat_id):
+        return None
+    parsed = parse_private_session_key(candidate.session_key or "")
+    if parsed is None or parsed[0] != actor:
+        return None
+    return candidate
+
+
+def _server_actor(msg: Any) -> str | None:
+    """Resolve one server-owned actor before a session or command exists."""
+    from familia.principals import get_registry, resolve_actor
+
+    channel = getattr(msg, "channel", "")
+    sender_id = getattr(msg, "sender_id", "")
+    resolved = resolve_actor(channel, sender_id)
+    supplied = getattr(msg, "actor", None)
+    trusted = _trusted_runtime_context(msg)
+    trusted_actor = getattr(trusted, "actor", None)
+    if supplied is not None:
+        # InboundMessage.actor is written by trusted channel/background code;
+        # client metadata never reaches this branch.  Still require registry
+        # membership and reject disagreement with the channel identity.
+        if not isinstance(supplied, str) or get_registry().get(supplied) is None:
+            return None
+        if resolved is None and not (trusted is not None and supplied == trusted_actor):
+            return None
+        if resolved is not None and supplied != resolved:
+            return None
+        return supplied
+    if trusted is not None:
+        return trusted_actor
+    return resolved
+
+
+def _private_route(actor: str, msg: Any) -> str:
+    """Build a private route from server fields; ignore client session overrides."""
+    from familia.session_identity import make_private_session_key
+
+    return make_private_session_key(
+        actor,
+        f"{getattr(msg, 'channel', '')}:{getattr(msg, 'chat_id', '')}",
+    )
+
+
+def _rejected_response(msg: Any) -> Any:
+    from nanobot.bus.events import OutboundMessage
+
+    return OutboundMessage(
+        channel=str(getattr(msg, "channel", "")),
+        chat_id=str(getattr(msg, "chat_id", "")),
+        content="Неизвестный отправитель: доступ запрещён.",
+    )
+
+
+def _familia_command_rejection(msg: Any) -> Any | None:
+    """Reject second-queue commands before sessions or stores are touched."""
+    raw = str(getattr(msg, "content", "") or "").strip()
+    token = raw.split(None, 1)[0].split("@", 1)[0].lower() if raw else ""
+    if token not in {"/trigger", "/pairing"}:
+        return None
+    from nanobot.bus.events import OutboundMessage
+
+    return OutboundMessage(
+        channel=str(getattr(msg, "channel", "")),
+        chat_id=str(getattr(msg, "chat_id", "")),
+        content=f"Команда {token} недоступна в режиме Familia.",
+    )
+
+
+async def _admit_message(msg: Any) -> Any:
+    """Admit only registry-backed senders, before session/command processing."""
+    Admission, _ArchiveResult, _RuntimeAdapters, _default_context_factory = _runtime_types()
+    actor = _server_actor(msg)
+    if actor is None:
+        return Admission(response=_rejected_response(msg))
+    command_rejection = _familia_command_rejection(msg)
+    if command_rejection is not None:
+        return Admission(response=command_rejection)
+    trusted = _trusted_runtime_context(msg)
+    metadata = dict(getattr(msg, "metadata", {}) or {})
+    # The in-process context proves admission but must never enter serialized
+    # history, logs, or outbound payloads.
+    metadata.pop("_runtime_request_context", None)
+    admitted = replace(msg, actor=actor, metadata=metadata)
+    return Admission(
+        actor=actor,
+        session_key=(trusted.session_key if trusted is not None else _private_route(actor, msg)),
+        message=admitted,
+    )
+
+
+def _context_factory(admission: Any, message: Any) -> Any:
+    _Admission, _ArchiveResult, _RuntimeAdapters, default_context_factory = _runtime_types()
+    ctx = default_context_factory(admission, message)
+    metadata = dict(ctx.metadata)
+    metadata.pop("_runtime_request_context", None)
+    metadata["familia_admitted"] = True
+    return replace(ctx, metadata=metadata)
+
+
+def _turn_scope(ctx: Any) -> Any:
+    """Bind actor/channel/request ContextVars and restore all prior values."""
+    @contextmanager
+    def _scope():
+        previous_actor = get_current_actor()
+        from nanobot.security.workspace_access import (
+            bind_workspace_scope,
+            build_workspace_scope,
+            reset_workspace_scope,
+        )
+
+        from familia.principals import get_current_channel
+
+        previous_channel = get_current_channel()
+        set_current_actor(ctx.actor)
+        set_current_channel(ctx.channel)
+        scope_token = None
+        try:
+            workspace = getattr(ctx, "workspace", None)
+            base = Path(workspace).expanduser().resolve(strict=False) if workspace else Path.cwd().resolve()
+            actor = str(getattr(ctx, "actor", "") or "")
+            digest = hashlib.sha256(actor.encode("utf-8")).hexdigest()[:32]
+            actor_root = base / "actors" / digest / "tool"
+            # The root is server-derived from the admitted actor, never from
+            # client metadata.  Refuse pre-existing symlink/junction escapes and
+            # keep standalone contexts side-effect free until a real turn runs.
+            lexical_root = actor_root.absolute()
+            if lexical_root.exists() and lexical_root.resolve(strict=False) != lexical_root:
+                raise ValueError("Familia actor workspace must not be a symlink")
+            if workspace is not None:
+                lexical_root.mkdir(parents=True, exist_ok=True)
+                if lexical_root.resolve(strict=False) != lexical_root:
+                    raise ValueError("Familia actor workspace must not be a symlink")
+            scope = build_workspace_scope(
+                lexical_root,
+                "restricted",
+                source_channel=ctx.channel,
+                allow_shared_extras=False,
+                sandbox_mask_root=base,
+            )
+            scope_token = bind_workspace_scope(scope)
+            from nanobot.agent.tools.context import request_context
+
+            bound_context = replace(ctx, workspace=scope.project_path)
+            with request_context(bound_context) as entered:
+                yield entered
+        finally:
+            if scope_token is not None:
+                reset_workspace_scope(scope_token)
+            set_current_actor(previous_actor)
+            set_current_channel(previous_channel)
+
+    return _scope()
+
+
+def _context_builder_factory(
+    workspace: Path,
+    timezone: str | None,
+    disabled_skills: list[str] | None,
+) -> Any:
+    from familia.nanobot_extension.context import FamiliaContextBuilder
+
+    return FamiliaContextBuilder(
+        workspace,
+        timezone=timezone,
+        disabled_skills=disabled_skills,
+    )
+
+
+async def _runtime_context_provider(ctx: Any) -> Any:
+    from nanobot.runtime_context import RuntimeContextBlock
+
+    from familia.nanobot_extension.context import FamiliaContextExtension
+
+    sections = FamiliaContextExtension(ctx.workspace or Path.cwd()).build_runtime_sections(
+        actor=ctx.actor,
+        channel=ctx.channel,
+        chat_id=ctx.chat_id,
+    )
+    return [RuntimeContextBlock(source="familia.acl", content=section) for section in sections]
+
+
+async def _archive_messages(owner: str, messages: Any) -> Any:
+    """Store one actor-owned atomic archive fact; never fall back to files."""
+    _Admission, ArchiveResult, _RuntimeAdapters, _default_context_factory = _runtime_types()
+    from familia.memx_client import memx_base_url
+    from familia.principal_memory_ingestor import PrincipalMemoryIngestor
+    from familia.principals import get_registry
+    if not isinstance(owner, str) or not owner:
+        return ArchiveResult(committed=False, retryable=False)
+    actor = owner
+    principal = get_registry().get(actor)
+    if principal is None or not principal.memx_key:
+        return ArchiveResult(committed=False, retryable=False)
+    clean_messages: list[dict[str, Any]] = []
+    for raw in messages or ():
+        if not isinstance(raw, dict):
+            return ArchiveResult(committed=False, retryable=False)
+        if raw.get("actor") not in (None, actor):
+            return ArchiveResult(committed=False, retryable=False)
+        metadata = raw.get("metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            return ArchiveResult(committed=False, retryable=False)
+        if isinstance(metadata, dict) and metadata.get("actor") not in (None, actor):
+            return ArchiveResult(committed=False, retryable=False)
+        clean = {
+            key: value
+            for key, value in raw.items()
+            if key not in {"_meta", "_runtime_request_context"}
+        }
+        if isinstance(metadata, dict):
+            clean["metadata"] = {
+                key: value
+                for key, value in metadata.items()
+                if key != "_runtime_request_context"
+            }
+        clean_messages.append(clean)
+    if not clean_messages:
+        return ArchiveResult(committed=False, retryable=False)
+    encoded = json.dumps(clean_messages, ensure_ascii=False, sort_keys=True, default=str)
+    fact_id = "archive-" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:48]
+    from familia.tools.dream_memory import CONSOLIDATOR_ACTOR
+    from familia.tools.memory import _check_memory_write_policy
+
+    if _check_memory_write_policy(
+        actor=CONSOLIDATOR_ACTOR,
+        full_key=f"private:{actor}:memory:{fact_id}",
+    ):
+        return ArchiveResult(committed=False, retryable=False)
+    ingestor = PrincipalMemoryIngestor(
+        base_url=memx_base_url(),
+        api_key=principal.memx_key,
+    )
+    result = await ingestor.ingest(
+        server_principal=actor,
+        server_topic=None,
+        operation={"kind": "memory", "fact_id": fact_id, "value": encoded},
+    )
+    committed = isinstance(result, str) and result.startswith("committed:")
+    retryable = isinstance(result, str) and result.startswith(("error:", "retryable_failure:"))
+    return ArchiveResult(committed=committed, retryable=retryable)
+
 _dream_principal: ContextVar[str | None] = ContextVar(
     "familia_dream_principal",
-    default=None,
-)
-_dream_profile: ContextVar[dict[str, Any] | None] = ContextVar(
-    "familia_dream_profile",
     default=None,
 )
 
@@ -107,14 +383,11 @@ def make_agent_loop_kwargs(workspace: Any) -> dict[str, Any]:
             "current_actor_getter": get_current_actor,
             "is_admin_getter": make_admin_check(),
             "reachable_tags_getter": make_reachable_tags_getter(),
-            "target_actor_getter": make_principal_actor_resolver(),
         },
         "dream_tool_installers": make_dream_tool_installers(),
         "dream_turn_context": make_dream_turn_context(),
         "dream_restore_policy": make_dream_restore_policy(),
         "dream_batch_context": make_dream_batch_context(),
-        "dream_profile_reader": make_dream_profile_reader(),
-        "dream_profile_context": make_dream_profile_context(),
     }
 
 
@@ -129,17 +402,7 @@ def make_dream_tool_installers() -> list[Any]:
     """Return familia Dream memory tool installers for nanobot Dream."""
     from familia.nanobot_extension.cron import make_dream_tool_installers as _make
 
-    return _make(
-        server_principal_getter=make_dream_server_context_resolver(),
-        profile_version_getter=make_dream_profile_version_resolver(),
-    )
-
-
-def make_dream_profile_reader() -> Any:
-    """Return the Familia-owned reader for the current participant profile."""
-    from familia.nanobot_extension.cron import make_dream_profile_reader as _make
-
-    return _make()
+    return _make(server_principal_getter=make_dream_server_context_resolver())
 
 
 def make_dream_restore_policy() -> Any:
@@ -209,37 +472,6 @@ def make_dream_batch_context() -> Any:
             _dream_principal.reset(token)
 
     return _scope
-
-
-def make_dream_profile_context() -> Any:
-    """Bind the profile revision used by the active Dream write."""
-
-    @contextmanager
-    def _scope(snapshot: dict[str, Any]):
-        token = _dream_profile.set(snapshot)
-        try:
-            yield
-        finally:
-            _dream_profile.reset(token)
-
-    return _scope
-
-
-def make_dream_profile_version_resolver() -> Any:
-    """Return the revision captured before the active Dream analysis."""
-
-    def _resolve() -> float | None:
-        snapshot = _dream_profile.get()
-        if not isinstance(snapshot, dict):
-            return None
-        version = snapshot.get("version")
-        return (
-            version
-            if isinstance(version, (int, float)) and not isinstance(version, bool)
-            else None
-        )
-
-    return _resolve
 
 
 def make_dream_server_context_resolver() -> Any:
@@ -317,6 +549,7 @@ def make_outbound_guard() -> Any:
             kind=result.kind,
             reason=result.reason,
             approvers_label=result.approvers_label,
+            outbound=getattr(result, "outbound", None),
         )
 
     return _guard
@@ -378,12 +611,49 @@ async def handle_pending_inbound(msg: Any) -> tuple[bool, Any | None]:
         )
 
 
-def install_tools(loop: Any) -> None:
-    """Register every familia tool on ``loop.tools``.
+def _ensure_familia_tool_security(config: Any) -> None:
+    """Keep shell and filesystem tools inside the selected runtime boundary."""
+    exec_config = getattr(config, "exec", None)
+    if exec_config is None:
+        return
+    sandbox = getattr(exec_config, "sandbox", "") or ""
+    fields_set = getattr(exec_config, "model_fields_set", None)
+    explicit_empty = (
+        isinstance(fields_set, (set, frozenset))
+        and "sandbox" in fields_set
+        and not sandbox
+    )
+    if not sandbox:
+        if explicit_empty:
+            if os.environ.get("NANOBOT_ALLOW_UNSANDBOXED_EXEC") != "1":
+                from nanobot.runtime_adapters import RuntimeAdapterError
 
-    Mirrors the set of registrations that used to live inline in
-    ``AgentLoop._register_tools``.  Call this after upstream tools are
-    registered (MessageTool etc.) so ordering is preserved.
+                raise RuntimeAdapterError(
+                    "Familia requires exec.sandbox='bwrap'; explicitly empty sandbox "
+                    "needs NANOBOT_ALLOW_UNSANDBOXED_EXEC=1"
+                )
+            return
+        # Omitted value keeps the historical Familia/container default. The
+        # explicit empty value is only an opt-in development escape hatch.
+        try:
+            exec_config.sandbox = "bwrap"
+        except (AttributeError, TypeError, ValueError) as exc:
+            from nanobot.runtime_adapters import RuntimeAdapterError
+
+            raise RuntimeAdapterError("Familia cannot set the exec sandbox") from exc
+        return
+    if sandbox != "bwrap":
+        from nanobot.runtime_adapters import RuntimeAdapterError
+
+        raise RuntimeAdapterError(f"unsupported Familia exec sandbox: {sandbox!r}")
+
+
+def install_tools(context_or_loop: Any, registry: Any | None = None) -> Any:
+    """Register Familia tools through the neutral ``ToolInstaller`` seam.
+
+    The two-argument form is the 0.3.0 adapter contract.  The one-argument
+    legacy form remains for the old bootstrap tests and starts the existing
+    model-refresh task only in that compatibility path.
 
     Tool imports are deferred to break a circular dependency: the tool
     modules import ``nanobot.agent.tools.base``, and loading nanobot in
@@ -399,21 +669,42 @@ def install_tools(loop: Any) -> None:
     from familia.tools.family_graph import ResolvePersonTool
     from familia.tools.memory import MemoryGetTool, MemorySetTool
 
-    bus = loop.bus
-    loop.tools.register(SendButtonsTool(send_callback=bus.publish_outbound))
+    legacy_loop = registry is None
+    loop = context_or_loop if legacy_loop else None
+    if legacy_loop:
+        registry = loop.tools
+        context = None
+        bus = loop.bus
+    else:
+        context = context_or_loop
+        bus = getattr(context, "bus", None)
+        _ensure_familia_tool_security(getattr(context, "config", None))
+        from familia.nanobot_extension.cron import make_cron_job_access
+
+        context.cron_job_access = make_cron_job_access(
+            is_admin=make_admin_check(),
+            reachable_tags=make_reachable_tags_getter(),
+        )
+    publish_outbound = getattr(bus, "publish_outbound", None)
+    registry.register(SendButtonsTool(send_callback=publish_outbound))
     # AskPrincipalTool deprecated 2026-04-27: межпринципальные действия
     # решает peer-edge ACL + policy.yaml, без интерактивных подтверждений
     # у адресата. Регистрация снята, чтобы LLM не видел тул в списке
     # доступных. Сам класс и pending_asks оставлены в коде до полной
     # чистки — старые callback'и (если есть в персистентном state) ещё
     # маршрутизируются CallbackDispatcher'ом и не теряются.
-    loop.tools.register(MemoryGetTool())
-    loop.tools.register(MemorySetTool())
-    loop.tools.register(ResolvePersonTool())
-    loop.tools.register(AdminGrantTool())
-    loop.tools.register(AdminRevokeTool())
-    loop.tools.register(AdminListTool())
-    loop.tools.register(AdminSetTzTool())
+    registry.register(MemoryGetTool())
+    registry.register(MemorySetTool())
+    registry.register(ResolvePersonTool())
+    registry.register(AdminGrantTool())
+    registry.register(AdminRevokeTool())
+    registry.register(AdminListTool())
+    registry.register(AdminSetTzTool())
+
+    names = tuple(registry.tool_names)
+    if not legacy_loop:
+        logger.debug("familia.bootstrap: tools registered through RuntimeAdapters")
+        return names
 
     # Daily background pull of provider /v1/models lists. The CLI
     # subprocess writes a cache file; the admin app's `agents get`
@@ -449,6 +740,7 @@ def install_tools(loop: Any) -> None:
         pass
 
     logger.debug("familia.bootstrap: tools registered")
+    return names
 
 
 def make_admin_check() -> Any:
@@ -692,18 +984,6 @@ def make_principal_chat_validator() -> Any:
     return _validate
 
 
-def make_principal_actor_resolver() -> Any:
-    """Return ``(channel, chat_id) -> actor`` for saved cron routes."""
-    from familia.principals import get_registry
-
-    def _resolve(channel: str, chat_id: str) -> str | None:
-        if not channel or not chat_id:
-            return None
-        return get_registry().resolve(channel, str(chat_id))
-
-    return _resolve
-
-
 def apply_heartbeat_defaults(hb_cfg: Any) -> None:
     """Fill ``HeartbeatConfig.target_actor`` from FAMILIA_OWNER_ACTOR if blank.
 
@@ -731,3 +1011,126 @@ async def on_inbound(msg: Any) -> None:
     set_current_actor(actor)
     set_current_channel(getattr(msg, "channel", None))
     await load_effective_roles(actor)
+
+
+def _runtime_service_hooks(config: Any, bus: Any) -> dict[str, Any]:
+    """Load hooks owned by the independent service/channel adapter."""
+    try:
+        from familia.nanobot_extension import runtime_services
+    except ImportError:
+        return {}
+    factory = getattr(runtime_services, "make_runtime_service_hooks", None)
+    if not callable(factory):
+        return {}
+    hooks = factory(config, bus)
+    if hooks is None:
+        return {}
+    if isinstance(hooks, dict):
+        return dict(hooks)
+    names = (
+        "run_dream",
+        "run_heartbeat",
+        "run_scheduled",
+        "resolve_heartbeat_target",
+        "make_heartbeat_source_reader",
+        "channel_plugins",
+        "register_channel_descriptor",
+        "callback_handler",
+    )
+    return {name: getattr(hooks, name) for name in names if callable(getattr(hooks, name, None))}
+
+
+def _channel_plugins(enabled: set[str] | None = None) -> dict[str, Any]:
+    """Expose Familia's VK descriptor before standard channel discovery."""
+    if enabled is not None and "vk" not in enabled:
+        return {}
+    from nanobot.channels.plugin import ChannelPlugin
+
+    return {
+        "vk": ChannelPlugin(
+            name="vk",
+            display_name="VK",
+            runtime="familia.channels.vk:VKChannel",
+            default_enabled=True,
+            settings_visible=True,
+            capabilities=frozenset({"text", "media", "buttons", "callbacks"}),
+        )
+    }
+
+
+def _register_channel_descriptor(descriptor: Any) -> None:
+    """Validate a product descriptor; target registry performs registration."""
+    if descriptor is None:
+        return
+    if not isinstance(getattr(descriptor, "name", None), str) or not descriptor.name:
+        raise TypeError("Familia channel descriptor must have a name")
+
+
+def _callback_handler(bus: Any) -> Any:
+    if bus is None:
+        return None
+    from familia.bus.callback_dispatcher import CallbackDispatcher
+
+    return CallbackDispatcher(bus).handle_callback
+
+
+def make_runtime_adapters(config: Any, bus: Any = None) -> Any:
+    """Build the complete Familia adapter object for nanobot 0.3.0."""
+    _Admission, _ArchiveResult, RuntimeAdapters, _default_context_factory = _runtime_types()
+    from nanobot.agent.outbound import OutboundDecision
+
+    from familia.policy import gate_outbound_send
+
+    async def outbound_guard(request: Any) -> Any:
+        result = await gate_outbound_send(
+            action=request.action,
+            outbound=request.outbound,
+            inbound_channel=request.inbound_channel,
+            inbound_chat_id=request.inbound_chat_id,
+            publish_outbound=request.publish_outbound,
+        )
+        return OutboundDecision(
+            kind=result.kind,
+            reason=result.reason,
+            approvers_label=result.approvers_label,
+            outbound=getattr(result, "outbound", None),
+        )
+
+    def context_factory(admission: Any, message: Any) -> Any:
+        ctx = _context_factory(admission, message)
+        workspace = getattr(config, "workspace_path", None)
+        if workspace is None:
+            return ctx
+        return replace(ctx, workspace=Path(workspace))
+
+    hooks = _runtime_service_hooks(config, bus)
+    # Dream/heartbeat/scheduling are owned by the sibling service adapter;
+    # selected Familia mode must fail closed until all three are present.
+    missing_service_hooks = {
+        name for name in ("run_dream", "run_heartbeat", "run_scheduled")
+        if not callable(hooks.get(name))
+    }
+    if missing_service_hooks:
+        from nanobot.runtime_adapters import RuntimeAdapterError
+
+        missing = ", ".join(sorted(missing_service_hooks))
+        raise RuntimeAdapterError(
+            f"Familia runtime service hooks missing: {missing}"
+        )
+    values: dict[str, Any] = {
+        "admit": _admit_message,
+        "context_factory": context_factory,
+        "context_builder_factory": _context_builder_factory,
+        "context_providers": (_runtime_context_provider,),
+        "install_tools": install_tools,
+        "turn_scope": _turn_scope,
+        "archive": _archive_messages,
+        "channel_plugins": hooks.pop("channel_plugins", _channel_plugins),
+        "register_channel_descriptor": hooks.pop(
+            "register_channel_descriptor", _register_channel_descriptor
+        ),
+        "callback_handler": hooks.pop("callback_handler", _callback_handler(bus)),
+        "outbound_guard": outbound_guard,
+    }
+    values.update(hooks)
+    return RuntimeAdapters(**values)

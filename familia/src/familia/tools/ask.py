@@ -23,6 +23,7 @@ from typing import Any
 
 from loguru import logger
 from nanobot.agent.tools.base import Tool, tool_parameters
+from nanobot.agent.tools.context import RequestContext, current_request_context
 from nanobot.agent.tools.schema import (
     ArraySchema,
     IntegerSchema,
@@ -106,9 +107,18 @@ class AskPrincipalTool(Tool):
             "ask_principal_default_chat_id", default=""
         )
 
-    def set_context(self, channel: str, chat_id: str) -> None:
-        self._default_channel.set(channel)
-        self._default_chat_id.set(chat_id)
+    def set_context(
+        self,
+        context_or_channel: RequestContext | str,
+        chat_id: str | None = None,
+    ) -> None:
+        """Keep legacy setters working while accepting the trusted turn context."""
+        if isinstance(context_or_channel, RequestContext):
+            self._default_channel.set(context_or_channel.channel)
+            self._default_chat_id.set(context_or_channel.chat_id)
+            return
+        self._default_channel.set(context_or_channel)
+        self._default_chat_id.set(chat_id or "")
 
     def set_send_callback(
         self, publish: Callable[[OutboundMessage], Awaitable[None]]
@@ -156,8 +166,17 @@ class AskPrincipalTool(Tool):
         if principal is None:
             return f"Error: unknown principal '{actor}'"
 
-        requester_channel = self._default_channel.get() or ""
-        requester_chat_id = self._default_chat_id.get() or ""
+        request_context = current_request_context()
+        requester_channel = (
+            request_context.channel
+            if request_context is not None
+            else self._default_channel.get()
+        ) or ""
+        requester_chat_id = (
+            request_context.chat_id
+            if request_context is not None
+            else self._default_chat_id.get()
+        ) or ""
         if not requester_channel or not requester_chat_id:
             return "Error: requester context not set (channel/chat_id)"
 
@@ -169,7 +188,11 @@ class AskPrincipalTool(Tool):
             )
         target_channel, target_chat_id = ident
 
-        requester_actor = get_current_actor()
+        requester_actor = (
+            request_context.actor
+            if request_context is not None
+            else get_current_actor()
+        )
         display = actor_display(actor) or actor
 
         normalized: list[list[dict[str, Any]]] = []
@@ -192,9 +215,15 @@ class AskPrincipalTool(Tool):
             correlation_id=correlation_id,
             target_actor=actor,
             question=question,
+            target_channel=target_channel,
+            target_chat_id=target_chat_id,
             requester_channel=requester_channel,
             requester_chat_id=requester_chat_id,
-            requester_sender_id=requester_chat_id,
+            requester_sender_id=(
+                request_context.sender_id
+                if request_context is not None and request_context.sender_id
+                else requester_chat_id
+            ),
             requester_actor=requester_actor,
             wait_s=wait_s,
             publish_inbound=self._publish_inbound,

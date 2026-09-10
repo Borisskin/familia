@@ -23,6 +23,9 @@ dependencies = [
     "httpx>=0.27,<1.0",
     "loguru>=0.7,<1.0",
     "pyyaml>=6,<7",
+    "python-telegram-bot[socks,webhooks]>=22.6,<23.0",
+    "socksio>=1.0.0,<2.0.0",
+    "python-socks[asyncio]>=2.8.0,<3.0.0; sys_platform != 'win32'",
 ]
 
 [project.optional-dependencies]
@@ -39,7 +42,7 @@ familia = "familia.cli.graph_admin:main"
 vk = "familia.channels.vk:VKChannel"
 
 [project.entry-points."nanobot.runtime_adapters"]
-familia = "familia.bootstrap"
+familia = "familia.bootstrap:make_runtime_adapters"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/familia"]

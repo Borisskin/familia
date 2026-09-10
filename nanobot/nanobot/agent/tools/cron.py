@@ -1,19 +1,22 @@
 """Cron tool for scheduling reminders and tasks."""
 
+from __future__ import annotations
+
+from collections.abc import Callable
 from contextvars import ContextVar
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any
 
-from nanobot.agent.tools.base import Tool, tool_parameters
+from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
+from nanobot.agent.tools.context import RequestContext, current_request_context
 from nanobot.agent.tools.schema import (
-    ArraySchema,
-    BooleanSchema,
     IntegerSchema,
     StringSchema,
     tool_parameters_schema,
 )
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronJobState, CronSchedule
+from nanobot.session.keys import UNIFIED_SESSION_KEY
 
 _CRON_PARAMETERS = tool_parameters_schema(
     action=StringSchema("Action to perform", enum=["add", "list", "remove"]),
@@ -36,26 +39,6 @@ _CRON_PARAMETERS = tool_parameters_schema(
         "ISO datetime for one-time execution (e.g. '2026-02-12T10:30:00'). "
         "Naive values use the tool's default timezone."
     ),
-    deliver=BooleanSchema(
-        description="Whether to deliver the execution result to the user channel (default true)",
-        default=True,
-    ),
-    to=StringSchema(
-        "Optional override for the delivery target chat_id. By default the reminder is "
-        "delivered to the chat that scheduled it. Set this when scheduling a reminder for "
-        "*another* participant: pass their chat_id (e.g. obtained via resolve_person → "
-        "channels[<channel>]). The channel stays the same as the current session."
-    ),
-    tags=ArraySchema(
-        StringSchema(""),
-        description=(
-            "Optional list of tag ids attached to this job. When a tag visibility "
-            "adapter is configured, tag ids must be reachable by the calling actor, "
-            "and ``cron list`` filters jobs by intersection with the viewer's "
-            "reachable set."
-        ),
-        nullable=True,
-    ),
     job_id=StringSchema("REQUIRED when action='remove'. Job ID to remove (obtain via action='list')."),
     required=["action"],
     description=(
@@ -76,44 +59,38 @@ class CronTool(Tool):
         self,
         cron_service: CronService,
         default_timezone: str = "UTC",
-        to_validator: Callable[[str, str], bool] | None = None,
-        current_actor_getter: Callable[[], str | None] | None = None,
-        is_admin_getter: Callable[[str | None], bool] | None = None,
-        reachable_tags_getter: Callable[[str | None], set[str]] | None = None,
-        target_actor_getter: Callable[[str, str], str | None] | None = None,
+        *,
+        job_access: Callable[[CronJob, RequestContext | None], bool] | None = None,
     ):
         self._cron = cron_service
         self._default_timezone = default_timezone
-        # Optional callback (channel, chat_id) -> bool. When set, the ``to``
-        # override must point at a known principal identity on ``channel``.
-        # Without it (nanobot-standalone), ``to`` is accepted verbatim. The
-        # check exists to prevent a hallucinating/jailbroken LLM from
-        # redirecting cron deliveries to arbitrary outsider chat ids.
-        self._to_validator = to_validator
-        # Identity of the caller for two purposes:
-        #   1. stamp ``payload.created_by`` on jobs so ``cron list`` can
-        #      filter by ownership (non-admin sees only their own jobs);
-        #   2. tell admin from non-admin so admins still see everything.
-        # Without these (nanobot-standalone), list returns all jobs as
-        # before — backwards-compat for single-user installs.
-        self._current_actor_getter = current_actor_getter
-        self._is_admin_getter = is_admin_getter
-        # Optional callback for tag-based visibility.
-        # Returns the set of tag ids reachable by the actor. Without it,
-        # tags are stored on jobs but ``cron list``
-        # falls back to the legacy ownership-only filter.
-        self._reachable_tags_getter = reachable_tags_getter
-        # Resolve the saved delivery route to a principal at job creation;
-        # execution still revalidates the route before private archival.
-        self._target_actor_getter = target_actor_getter
-        self._channel: ContextVar[str] = ContextVar("cron_channel", default="")
-        self._chat_id: ContextVar[str] = ContextVar("cron_chat_id", default="")
+        self._job_access = job_access
         self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
 
-    def set_context(self, channel: str, chat_id: str) -> None:
-        """Set the current session context for delivery."""
-        self._channel.set(channel)
-        self._chat_id.set(chat_id)
+    @classmethod
+    def enabled(cls, ctx: Any) -> bool:
+        return ctx.cron_service is not None
+
+    @classmethod
+    def create(cls, ctx: Any) -> Tool:
+        job_access = getattr(ctx, "cron_job_access", None)
+        return cls(
+            cron_service=ctx.cron_service,
+            default_timezone=ctx.timezone,
+            job_access=job_access if callable(job_access) else None,
+        )
+
+    @staticmethod
+    def _request_route() -> tuple[str, str, str, dict[str, Any]]:
+        """Return routing from the authoritative request snapshot."""
+        ctx = current_request_context()
+        if ctx is None:
+            return "", "", "", {}
+        raw_key = f"{ctx.channel}:{ctx.chat_id}" if ctx.channel and ctx.chat_id else ""
+        session_key = (
+            raw_key if ctx.session_key == UNIFIED_SESSION_KEY else (ctx.session_key or "")
+        )
+        return session_key, ctx.channel or "", ctx.chat_id or "", dict(ctx.metadata or {})
 
     def set_cron_context(self, active: bool):
         """Mark whether the tool is executing inside a cron job callback."""
@@ -130,7 +107,7 @@ class CronTool(Tool):
         try:
             ZoneInfo(tz)
         except (KeyError, Exception):
-            return f"Error: unknown timezone '{tz}'"
+            return ToolResult.error(f"Error: unknown timezone '{tz}'")
         return None
 
     def _display_timezone(self, schedule: CronSchedule) -> str:
@@ -175,14 +152,12 @@ class CronTool(Tool):
         at: str | None = None,
         job_id: str | None = None,
         deliver: bool = True,
-        to: str | None = None,
-        tags: list[str] | None = None,
         **kwargs: Any,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
-                return "Error: cannot schedule new jobs from within a cron job execution"
-            return self._add_job(name, message, every_seconds, cron_expr, tz, at, deliver, to, tags)
+                return ToolResult.error("Error: cannot schedule new jobs from within a cron job execution")
+            return self._add_job(name, message, every_seconds, cron_expr, tz, at)
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -197,31 +172,20 @@ class CronTool(Tool):
         cron_expr: str | None,
         tz: str | None,
         at: str | None,
-        deliver: bool = True,
-        to: str | None = None,
-        tags: list[str] | None = None,
     ) -> str:
         if not message:
-            return (
+            return ToolResult.error(
                 "Error: cron action='add' requires a non-empty 'message' parameter "
                 "describing what to do when the job triggers "
                 "(e.g. the reminder text). Retry including message=\"...\"."
             )
-        channel = self._channel.get()
-        chat_id = self._chat_id.get()
-        if not channel or not chat_id:
-            return "Error: no session context (channel/chat_id)"
-        to_clean = (to or "").strip()
-        target_chat_id = to_clean or chat_id
-        if to_clean and to_clean != chat_id and self._to_validator is not None:
-            if not self._to_validator(channel, to_clean):
-                return (
-                    f"Error: 'to={to_clean}' is not a known participant on channel "
-                    f"'{channel}'. Use a chat_id from resolve_person → channels[<channel>], "
-                    "or omit 'to' to deliver into the current chat."
-                )
+        session_key, origin_channel, origin_chat_id, origin_metadata = self._request_route()
+        if not session_key:
+            return ToolResult.error("Error: scheduled cron jobs must be created from a chat session")
+        if not origin_channel or not origin_chat_id:
+            return ToolResult.error("Error: scheduled cron jobs must be created from a chat session")
         if tz and not cron_expr:
-            return "Error: tz can only be used with cron_expr"
+            return ToolResult.error("Error: tz can only be used with cron_expr")
         if tz:
             if err := self._validate_timezone(tz):
                 return err
@@ -241,7 +205,7 @@ class CronTool(Tool):
             try:
                 dt = datetime.fromisoformat(at)
             except ValueError:
-                return f"Error: invalid ISO datetime format '{at}'. Expected format: YYYY-MM-DDTHH:MM:SS"
+                return ToolResult.error(f"Error: invalid ISO datetime format '{at}'. Expected format: YYYY-MM-DDTHH:MM:SS")
             if dt.tzinfo is None:
                 if err := self._validate_timezone(self._default_timezone):
                     return err
@@ -250,50 +214,26 @@ class CronTool(Tool):
             schedule = CronSchedule(kind="at", at_ms=at_ms)
             delete_after = True
         else:
-            return "Error: either every_seconds, cron_expr, or at is required"
+            return ToolResult.error("Error: either every_seconds, cron_expr, or at is required")
 
-        creator = self._current_actor_getter() if self._current_actor_getter else None
-        target_actor = (
-            self._target_actor_getter(channel, target_chat_id)
-            if self._target_actor_getter is not None
-            else None
-        )
-        # Tag write-side ACL: if a reachable getter is wired, every tag must
-        # be in the actor's reachable set. Admin bypass: if is_admin_getter
-        # says yes, skip the check.
-        clean_tags: list[str] = []
-        if tags:
-            clean_tags = [t.strip() for t in tags if isinstance(t, str) and t.strip()]
-        if clean_tags and self._reachable_tags_getter is not None:
-            is_admin = (
-                self._is_admin_getter(creator)
-                if self._is_admin_getter is not None
-                else False
-            )
-            if not is_admin:
-                reachable = self._reachable_tags_getter(creator) or set()
-                missing = sorted(set(clean_tags) - reachable)
-                if missing:
-                    return (
-                        f"Error: cannot tag job with {missing} — outside your "
-                        "reachable set. Use only ids of principals/topics you "
-                        "have access to."
-                    )
+        request = current_request_context()
+        actor = request.actor if request and isinstance(request.actor, str) else None
+        if actor is not None and not actor.strip():
+            actor = None
         job = self._cron.add_job(
             name=name or message[:30],
             schedule=schedule,
             message=message,
-            deliver=deliver,
-            channel=channel,
-            to=target_chat_id,
             delete_after_run=delete_after,
-            created_by=creator,
-            tags=clean_tags,
-            creator_actor=creator,
-            target_actor=target_actor,
+            session_key=session_key,
+            origin_channel=origin_channel,
+            origin_chat_id=origin_chat_id,
+            origin_metadata=origin_metadata,
+            created_by=actor,
+            creator_actor=actor,
+            owner_actor=actor,
+            target_actor=actor,
         )
-        if clean_tags:
-            return f"Created job '{job.name}' (id: {job.id}, теги: {', '.join(clean_tags)})"
         return f"Created job '{job.name}' (id: {job.id})"
 
     def _format_timing(self, schedule: CronSchedule) -> str:
@@ -336,56 +276,12 @@ class CronTool(Tool):
             return "Dream memory consolidation for long-term memory."
         return "System-managed internal job."
 
-    def _is_visible_to(self, job: CronJob, viewer: str | None, viewer_chat_id: str) -> bool:
-        """Visibility rule for ``cron list``.
-
-        Admins see everything. System jobs (``system_event``) are admin-only —
-        non-admins shouldn't even see internal scheduling. Regular jobs are
-        visible to a non-admin viewer if any of:
-          (a) they created the job (``payload.created_by``);
-          (b) they are the recipient (``payload.to`` matches their chat_id);
-          (c) tag-intersection: ``payload.tags`` intersects the viewer's
-              reachable set provided by the integration.
-
-        When neither getter callback is wired (nanobot-standalone), we
-        preserve the original "show everything" behavior for backwards
-        compatibility — single-user installs don't need ownership filtering.
-        """
-        if self._current_actor_getter is None and self._is_admin_getter is None:
-            return True
-        if self._is_admin_getter and self._is_admin_getter(viewer):
-            return True
-        if job.payload.kind == "system_event":
-            return False
-        creator = job.payload.created_by
-        if creator and viewer and creator == viewer:
-            return True
-        if viewer_chat_id and job.payload.to == viewer_chat_id:
-            return True
-        # Tag-intersection visibility.
-        if (job.payload.tags
-                and self._reachable_tags_getter is not None
-                and viewer is not None):
-            reachable = self._reachable_tags_getter(viewer) or set()
-            if reachable & set(job.payload.tags):
-                return True
-        return False
-
     def _list_jobs(self) -> str:
-        jobs = self._cron.list_jobs()
-        viewer = self._current_actor_getter() if self._current_actor_getter else None
-        viewer_chat_id = self._chat_id.get()
-        visible = [j for j in jobs if self._is_visible_to(j, viewer, viewer_chat_id)]
-        hidden_n = len(jobs) - len(visible)
-        if not visible:
-            if hidden_n:
-                return (
-                    f"No scheduled jobs visible to you "
-                    f"({hidden_n} hidden — owned by other participants or system)."
-                )
+        jobs = [job for job in self._cron.list_jobs() if self._can_access(job)]
+        if not jobs:
             return "No scheduled jobs."
         lines = []
-        for j in visible:
+        for j in jobs:
             timing = self._format_timing(j.schedule)
             parts = [f"- {j.name} (id: {j.id}, {timing})"]
             if j.payload.kind == "system_event":
@@ -393,27 +289,23 @@ class CronTool(Tool):
                 parts.append("  Protected: visible for inspection, but cannot be removed.")
             parts.extend(self._format_state(j.state, j.schedule))
             lines.append("\n".join(parts))
-        out = "Scheduled jobs:\n" + "\n".join(lines)
-        if hidden_n:
-            out += f"\n\n({hidden_n} more hidden — owned by other participants or system.)"
-        return out
+        return "Scheduled jobs:\n" + "\n".join(lines)
+
+    def _can_access(self, job: CronJob) -> bool:
+        if self._job_access is None:
+            return True
+        try:
+            return bool(self._job_access(job, current_request_context()))
+        except Exception:
+            return False
 
     def _remove_job(self, job_id: str | None) -> str:
         if not job_id:
-            return "Error: job_id is required for remove"
-        # Symmetric ownership check: non-admin can only remove jobs they own
-        # or that are addressed to them. System jobs are protected separately
-        # by the service layer (it returns "protected").
-        if self._current_actor_getter is not None or self._is_admin_getter is not None:
-            target = self._cron.get_job(job_id)
-            if target is None:
+            return ToolResult.error("Error: job_id is required for remove")
+        if self._job_access is not None:
+            job = self._cron.get_job(job_id)
+            if job is None or not self._can_access(job):
                 return f"Job {job_id} not found"
-            viewer = self._current_actor_getter() if self._current_actor_getter else None
-            viewer_chat_id = self._chat_id.get()
-            if not self._is_visible_to(target, viewer, viewer_chat_id):
-                return (
-                    f"Job {job_id} not found"
-                )  # 404 not 403: don't leak existence to non-owners
         result = self._cron.remove_job(job_id)
         if result == "removed":
             return f"Removed job {job_id}"

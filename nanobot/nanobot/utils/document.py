@@ -1,32 +1,14 @@
 """Document text extraction utilities for nanobot."""
 
 import mimetypes
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
+from zipfile import BadZipFile, ZipFile
 
 from loguru import logger
 
 from nanobot.utils.helpers import detect_image_mime
-
-try:
-    from pypdf import PdfReader
-except ImportError:
-    PdfReader = None  # type: ignore
-
-try:
-    from docx import Document as DocxDocument
-except ImportError:
-    DocxDocument = None  # type: ignore
-
-try:
-    from openpyxl import load_workbook
-except ImportError:
-    load_workbook = None  # type: ignore
-
-try:
-    from pptx import Presentation as PptxPresentation
-except ImportError:
-    PptxPresentation = None  # type: ignore
-
 
 # Supported file extensions for text extraction
 SUPPORTED_EXTENSIONS: set[str] = {
@@ -58,6 +40,66 @@ SUPPORTED_EXTENSIONS: set[str] = {
 }
 
 _MAX_TEXT_LENGTH = 200_000
+_MAX_EXTRACT_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+_MAX_OFFICE_ARCHIVE_MEMBERS = 10_000
+_MAX_OFFICE_UNCOMPRESSED_SIZE = 256 * 1024 * 1024  # 256 MB
+_MAX_OFFICE_MEMBER_SIZE = 128 * 1024 * 1024  # 128 MB
+_MAX_DOCX_TABLE_CELLS = 100_000
+_MAX_DOCX_TABLE_DEPTH = 8
+_MAX_PDF_CONTENT_STREAM_SIZE = 32 * 1024 * 1024  # 32 MB per page
+_MAX_PDF_ATTACHMENT_PAGES = 100
+
+
+class _TextCollector:
+    """Build bounded parser output without retaining the full document text."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.parts: list[str] = []
+        self.length = 0
+        self.truncated = False
+
+    def add(self, text: str, *, separator: str = "") -> bool:
+        if not text:
+            return True
+        prefix = separator if self.parts else ""
+        chunk = prefix + text
+        remaining = self.limit - self.length
+        if len(chunk) > remaining:
+            if remaining > 0:
+                self.parts.append(chunk[:remaining])
+                self.length += remaining
+            self.truncated = True
+            return False
+        self.parts.append(chunk)
+        self.length += len(chunk)
+        return True
+
+    def render(self) -> str:
+        text = "".join(self.parts)
+        if self.truncated:
+            text += f"... (truncated at {self.limit} chars)"
+        return text
+
+
+class PdfSafetyError(Exception):
+    """Raised when a PDF exceeds a parser safety boundary."""
+
+
+class PdfPageRangeError(Exception):
+    """Raised when a requested PDF page range is invalid."""
+
+
+class DocxSafetyError(Exception):
+    """Raised when a DOCX table exceeds a parser safety boundary."""
+
+
+@dataclass(frozen=True, slots=True)
+class PdfExtraction:
+    text: str
+    total_pages: int
+    start_page: int
+    end_page: int
 
 
 def extract_text(path: Path) -> str | None:
@@ -75,25 +117,23 @@ def extract_text(path: Path) -> str | None:
 
     if not path.exists():
         return f"[error: file not found: {path}]"
+    try:
+        if path.stat().st_size > _MAX_EXTRACT_FILE_SIZE:
+            return f"[error: file exceeds {_MAX_EXTRACT_FILE_SIZE // (1024 * 1024)} MB limit]"
+    except OSError as e:
+        return f"[error: failed to inspect file: {e!s}]"
 
     ext = path.suffix.lower()
 
-    # Document formats
+    # Parsers stay lazy even though they are bundled so idle processes do not
+    # retain their import cost (see issue #3422).
     if ext == ".pdf":
-        if PdfReader is None:
-            return "[error: pypdf not installed]"
         return _extract_pdf(path)
     elif ext == ".docx":
-        if DocxDocument is None:
-            return "[error: python-docx not installed]"
         return _extract_docx(path)
     elif ext == ".xlsx":
-        if load_workbook is None:
-            return "[error: openpyxl not installed]"
         return _extract_xlsx(path)
     elif ext == ".pptx":
-        if PptxPresentation is None:
-            return "[error: python-pptx not installed]"
         return _extract_pptx(path)
     elif _is_text_extension(ext):
         return _extract_text_file(path)
@@ -108,65 +148,198 @@ def extract_text(path: Path) -> str | None:
 def _extract_pdf(path: Path) -> str:
     """Extract text from PDF using pypdf."""
     try:
-        reader = PdfReader(path)
-        pages: list[str] = []
-        for i, page in enumerate(reader.pages, 1):
-            text = page.extract_text() or ""
-            pages.append(f"--- Page {i} ---\n{text}")
-        return _truncate("\n\n".join(pages), _MAX_TEXT_LENGTH)
+        result = extract_pdf_pages(
+            path,
+            max_pages=_MAX_PDF_ATTACHMENT_PAGES,
+            max_chars=_MAX_TEXT_LENGTH,
+        )
+        text = result.text
+        if result.end_page < result.total_pages - 1:
+            text += f"\n\n(Showing pages 1-{result.end_page + 1} of {result.total_pages}.)"
+        return text
     except Exception as e:
-        logger.error("Failed to extract PDF {}: {}", path, e)
+        logger.exception("Failed to extract PDF {}", path)
         return f"[error: failed to extract PDF: {e!s}]"
+
+
+def extract_pdf_pages(
+    path: Path,
+    *,
+    pages: str | None = None,
+    max_pages: int = _MAX_PDF_ATTACHMENT_PAGES,
+    max_chars: int = _MAX_TEXT_LENGTH,
+) -> PdfExtraction:
+    """Extract a bounded PDF page range using the bundled pypdf reader."""
+    from pypdf import PdfReader
+
+    reader = PdfReader(path, strict=False)
+    total_pages = len(reader.pages)
+    if total_pages == 0:
+        return PdfExtraction("", 0, 0, -1)
+
+    start, end = _parse_pdf_page_range(pages, total_pages)
+    end = min(end, start + max_pages - 1)
+    collector = _TextCollector(max_chars)
+    for index in range(start, end + 1):
+        page = reader.pages[index]
+        contents = page.get_contents()
+        if contents is not None:
+            stream_size = len(contents.get_data())
+            if stream_size > _MAX_PDF_CONTENT_STREAM_SIZE:
+                raise PdfSafetyError(
+                    f"page {index + 1} content stream exceeds "
+                    f"{_MAX_PDF_CONTENT_STREAM_SIZE // (1024 * 1024)} MB limit"
+                )
+        text = (page.extract_text() or "").strip()
+        if text and not collector.add(f"--- Page {index + 1} ---\n{text}", separator="\n\n"):
+            end = index
+            break
+    return PdfExtraction(collector.render(), total_pages, start, end)
+
+
+def _parse_pdf_page_range(pages: str | None, total_pages: int) -> tuple[int, int]:
+    if not pages:
+        return 0, total_pages - 1
+    values = pages.strip().split("-")
+    if len(values) not in {1, 2}:
+        raise PdfPageRangeError(f"invalid page range: {pages}")
+    try:
+        start = int(values[0])
+        end = int(values[-1])
+    except ValueError as e:
+        raise PdfPageRangeError(f"invalid page range: {pages}") from e
+    if start < 1 or end < start or start > total_pages:
+        raise PdfPageRangeError(f"invalid page range: {pages}")
+    return start - 1, min(end, total_pages) - 1
 
 
 def _extract_docx(path: Path) -> str:
     """Extract text from DOCX using python-docx."""
     try:
+        from docx import Document as DocxDocument
+        from docx.table import Table, _Cell
+        from docx.text.paragraph import Paragraph
+    except ImportError:
+        return "[error: python-docx not installed]"
+    try:
+        if error := _office_archive_error(path):
+            return error
         doc = DocxDocument(path)
-        paragraphs: list[str] = [p.text for p in doc.paragraphs if p.text.strip()]
-        return _truncate("\n\n".join(paragraphs), _MAX_TEXT_LENGTH)
+        collector = _TextCollector(_MAX_TEXT_LENGTH)
+        table_cell_count = 0
+
+        def cell_text(cell: _Cell, depth: int) -> str:
+            parts: list[str] = []
+            for block in cell.iter_inner_content():
+                if isinstance(block, Paragraph):
+                    text = " ".join(block.text.split())
+                    if text:
+                        parts.append(text)
+                elif isinstance(block, Table):
+                    parts.extend(row.replace("\t", " | ") for row in table_rows(block, depth + 1))
+            return " ".join(parts)
+
+        def table_rows(table: Table, depth: int) -> Iterator[str]:
+            nonlocal table_cell_count
+            if depth > _MAX_DOCX_TABLE_DEPTH:
+                raise DocxSafetyError(
+                    f"table nesting exceeds {_MAX_DOCX_TABLE_DEPTH} levels"
+                )
+            for row in table.rows:
+                cells: list[str] = []
+                # row.cells expands w:gridSpan before callers can apply a bound.
+                # Physical w:tc elements keep malformed documents proportional to XML size.
+                for tc in row._tr.tc_lst:
+                    table_cell_count += 1
+                    if table_cell_count > _MAX_DOCX_TABLE_CELLS:
+                        raise DocxSafetyError(
+                            f"document contains more than {_MAX_DOCX_TABLE_CELLS} table cells"
+                        )
+                    cells.append(cell_text(_Cell(tc, table), depth))
+                if any(cells):
+                    yield "\t".join(cells)
+
+        for block in doc.iter_inner_content():
+            if isinstance(block, Paragraph):
+                text = block.text.strip()
+                if text and not collector.add(text, separator="\n\n"):
+                    break
+                continue
+            if not isinstance(block, Table):
+                continue
+            first_row = True
+            for row_text in table_rows(block, 1):
+                separator = "\n\n" if first_row else "\n"
+                first_row = False
+                if not collector.add(row_text, separator=separator):
+                    return collector.render()
+        return collector.render()
+    except DocxSafetyError as e:
+        return f"[error: unsafe DOCX: {e!s}]"
     except Exception as e:
-        logger.error("Failed to extract DOCX {}: {}", path, e)
+        logger.exception("Failed to extract DOCX {}", path)
         return f"[error: failed to extract DOCX: {e!s}]"
 
 
 def _extract_xlsx(path: Path) -> str:
     """Extract text from XLSX using openpyxl."""
     try:
+        from openpyxl import load_workbook
+    except ImportError:
+        return "[error: openpyxl not installed]"
+    try:
+        if error := _office_archive_error(path):
+            return error
         wb = load_workbook(path, read_only=True, data_only=True)
         try:
-            sheets: list[str] = []
+            collector = _TextCollector(_MAX_TEXT_LENGTH)
             for sheet_name in wb.sheetnames:
                 ws = wb[sheet_name]
-                rows: list[str] = []
+                wrote_header = False
                 for row in ws.iter_rows(values_only=True):
                     row_text = "\t".join(str(cell) if cell is not None else "" for cell in row)
                     if row_text.strip():
-                        rows.append(row_text)
-                if rows:
-                    sheets.append(f"--- Sheet: {sheet_name} ---\n" + "\n".join(rows))
-            return _truncate("\n\n".join(sheets), _MAX_TEXT_LENGTH)
+                        if not wrote_header:
+                            if not collector.add(
+                                f"--- Sheet: {sheet_name} ---",
+                                separator="\n\n",
+                            ):
+                                return collector.render()
+                            wrote_header = True
+                        if not collector.add(row_text, separator="\n"):
+                            return collector.render()
+            return collector.render()
         finally:
             wb.close()
     except Exception as e:
-        logger.error("Failed to extract XLSX {}: {}", path, e)
+        logger.exception("Failed to extract XLSX {}", path)
         return f"[error: failed to extract XLSX: {e!s}]"
 
 
 def _extract_pptx(path: Path) -> str:
     """Extract text from PPTX using python-pptx."""
     try:
+        from pptx import Presentation as PptxPresentation
+    except ImportError:
+        return "[error: python-pptx not installed]"
+    try:
+        if error := _office_archive_error(path):
+            return error
         prs = PptxPresentation(path)
-        slides: list[str] = []
+        collector = _TextCollector(_MAX_TEXT_LENGTH)
         for i, slide in enumerate(prs.slides, 1):
             slide_text: list[str] = []
             for shape in slide.shapes:
                 _collect_pptx_shape_text(shape, slide_text)
             if slide_text:
-                slides.append(f"--- Slide {i} ---\n" + "\n".join(slide_text))
-        return _truncate("\n\n".join(slides), _MAX_TEXT_LENGTH)
+                if not collector.add(
+                    f"--- Slide {i} ---\n" + "\n".join(slide_text),
+                    separator="\n\n",
+                ):
+                    break
+        return collector.render()
     except Exception as e:
-        logger.error("Failed to extract PPTX {}: {}", path, e)
+        logger.exception("Failed to extract PPTX {}", path)
         return f"[error: failed to extract PPTX: {e!s}]"
 
 
@@ -195,6 +368,28 @@ def _collect_pptx_shape_text(shape, out: list[str]) -> None:
         out.append(text)
 
 
+def _office_archive_error(path: Path) -> str | None:
+    """Reject oversized or encrypted OOXML containers before parsing XML."""
+    try:
+        with ZipFile(path) as archive:
+            members = archive.infolist()
+    except (BadZipFile, OSError) as e:
+        return f"[error: invalid Office document: {e!s}]"
+    if len(members) > _MAX_OFFICE_ARCHIVE_MEMBERS:
+        return f"[error: Office document contains too many files ({len(members)})]"
+    total_size = 0
+    for member in members:
+        if member.flag_bits & 0x1:
+            return "[error: encrypted Office documents are not supported]"
+        if member.file_size > _MAX_OFFICE_MEMBER_SIZE:
+            return "[error: Office document contains an oversized internal file]"
+        total_size += member.file_size
+        if total_size > _MAX_OFFICE_UNCOMPRESSED_SIZE:
+            limit_mb = _MAX_OFFICE_UNCOMPRESSED_SIZE / (1024 * 1024)
+            return f"[error: Office document expands beyond the {limit_mb:g} MB safety limit]"
+    return None
+
+
 def _extract_text_file(path: Path) -> str:
     """Extract text from a plain text file."""
     try:
@@ -205,7 +400,7 @@ def _extract_text_file(path: Path) -> str:
             content = path.read_text(encoding="latin-1")
         return _truncate(content, _MAX_TEXT_LENGTH)
     except Exception as e:
-        logger.error("Failed to read text file {}: {}", path, e)
+        logger.exception("Failed to read text file {}", path)
         return f"[error: failed to read file: {e!s}]"
 
 
@@ -239,7 +434,45 @@ def _is_text_extension(ext: str) -> bool:
 # High-level helper: split media into images + extracted document text
 # ---------------------------------------------------------------------------
 
-_MAX_EXTRACT_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+
+def is_image_file(path: str) -> bool:
+    """Check whether *path* looks like an image file.
+
+    Uses magic-byte detection (reads first 16 bytes) with a ``mimetypes``
+    extension-based fallback.
+    """
+    p = Path(path)
+    mime: str | None = None
+    if p.is_file():
+        try:
+            with p.open("rb") as f:
+                mime = detect_image_mime(f.read(16))
+        except OSError:
+            mime = None
+    if not mime:
+        mime = mimetypes.guess_type(path)[0]
+    return bool(mime and mime.startswith("image/"))
+
+
+def reference_non_image_attachments(
+    content: str, media: list[str],
+) -> tuple[str, list[str]]:
+    """Separate images from non-image attachments without reading file content.
+
+    Image paths are preserved for downstream vision-block construction.
+    Non-image paths are appended as ``[Attachment: path]`` references.
+    """
+    image_paths: list[str] = []
+    attachment_refs: list[str] = []
+    for path in media:
+        if is_image_file(path):
+            image_paths.append(path)
+        else:
+            attachment_refs.append(f"[Attachment: {path}]")
+    if attachment_refs:
+        suffix = "\n".join(attachment_refs)
+        content = f"{content}\n\n{suffix}" if content else suffix
+    return content, image_paths
 
 
 def extract_documents(
@@ -277,10 +510,7 @@ def extract_documents(
             )
             continue
 
-        with open(p, "rb") as f:
-            header = f.read(16)
-        mime = detect_image_mime(header) or mimetypes.guess_type(path_str)[0]
-        if mime and mime.startswith("image/"):
+        if is_image_file(path_str):
             image_paths.append(path_str)
         else:
             extracted = extract_text(p)

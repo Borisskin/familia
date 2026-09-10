@@ -21,6 +21,7 @@ import time
 from typing import Any
 
 from nanobot.agent.tools.base import Tool, tool_parameters
+from nanobot.agent.tools.context import current_request_context
 from nanobot.agent.tools.schema import (
     NumberSchema,
     StringSchema,
@@ -48,7 +49,12 @@ def _policy_check(action: str, actor: str | None, target: str) -> tuple[bool, st
 
 
 def _current_actor_with_key() -> tuple[str | None, str | None, str | None]:
-    actor_id = get_current_actor()
+    request_context = current_request_context()
+    actor_id = (
+        request_context.actor
+        if request_context is not None and request_context.actor
+        else get_current_actor()
+    )
     if not actor_id:
         return None, None, "Error: no actor in context"
     p = get_registry().get(actor_id)
@@ -303,7 +309,12 @@ class AdminSetTzTool(Tool):
     async def execute(self, tz: str, **kwargs: Any) -> str:
         from familia import tz as tzmod
 
-        actor_id = get_current_actor()
+        request_context = current_request_context()
+        actor_id = (
+            request_context.actor
+            if request_context is not None and request_context.actor
+            else get_current_actor()
+        )
         if not actor_id:
             return "Error: no actor in context"
 

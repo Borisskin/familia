@@ -12,9 +12,10 @@ Flow:
        returns a short ack to the agent.
     3. Target presses a button; channel emits ``CallbackEvent`` carrying
        ``metadata["correlation_id"] == cid``.
-    4. ``CallbackDispatcher`` calls :func:`pop`; if a record is present,
-       the watchdog is cancelled and the dispatcher injects a *new*
-       inbound turn into the **requester's** session carrying the answer.
+    4. ``CallbackDispatcher`` calls :func:`take_for_callback`; only a
+       server-authorized target route consumes the record, then the watchdog
+       is cancelled and the dispatcher injects a *new* inbound turn into the
+       **requester's** session carrying the answer.
     5. If no press arrives in time, the watchdog fires and injects a
        timeout inbound into the requester's session instead.
 
@@ -46,6 +47,10 @@ class PendingAsk:
     requester_chat_id: str
     requester_sender_id: str
     requester_actor: str | None = None
+    # Server-resolved route used to authorize the callback before consuming
+    # this record. Missing values are legacy/ambiguous and fail closed.
+    target_channel: str | None = None
+    target_chat_id: str | None = None
     watchdog: asyncio.Task[None] | None = None
     # Seconds the watchdog should wait; set by the ask_principal tool.
     wait_s: int = 1800
@@ -79,6 +84,36 @@ def register(ask: PendingAsk) -> None:
 def pop(correlation_id: str) -> PendingAsk | None:
     """Remove and return the ask under ``correlation_id``, or None."""
     return _pending.pop(correlation_id, None)
+
+
+def take_for_callback(
+    correlation_id: str,
+    *,
+    actor: str | None,
+    channel: str | None,
+    chat_id: str | None,
+) -> tuple[PendingAsk | None, bool]:
+    """Authorize and consume one ask atomically.
+
+    The boolean reports that a record existed.  A present but unauthorized
+    record is deliberately left untouched, so a foreign press cannot cancel
+    its watchdog.  Legacy records without a stored target route are treated as
+    ambiguous and also remain pending.
+    """
+    ask = _pending.get(correlation_id)
+    if ask is None:
+        return None, False
+    if (
+        not actor
+        or not ask.target_actor
+        or actor != ask.target_actor
+        or not ask.target_channel
+        or not ask.target_chat_id
+        or channel != ask.target_channel
+        or chat_id != ask.target_chat_id
+    ):
+        return None, True
+    return _pending.pop(correlation_id), True
 
 
 def get(correlation_id: str) -> PendingAsk | None:

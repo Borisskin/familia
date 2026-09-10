@@ -1,9 +1,17 @@
 """Base class for agent tools."""
+from __future__ import annotations
 
+import typing
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from copy import deepcopy
 from typing import Any, TypeVar
+
+if typing.TYPE_CHECKING:
+    from pydantic import BaseModel
+
+    from nanobot.agent.tools.context import ToolContext
+    from nanobot.runtime_context import RuntimeContextProvider
 
 _ToolT = TypeVar("_ToolT", bound="Tool")
 
@@ -77,9 +85,16 @@ class Schema(ABC):
             for k in schema.get("required", []):
                 if k not in val:
                     errors.append(f"missing required {Schema.subpath(path, k)}")
+            additional = schema.get("additionalProperties", True)
             for k, v in val.items():
                 if k in props:
                     errors.extend(Schema.validate_json_schema_value(v, props[k], Schema.subpath(path, k)))
+                elif additional is False:
+                    errors.append(f"unexpected parameter {Schema.subpath(path, k)}")
+                elif isinstance(additional, dict):
+                    errors.extend(
+                        Schema.validate_json_schema_value(v, additional, Schema.subpath(path, k))
+                    )
         if t == "array":
             if "minItems" in schema and len(val) < schema["minItems"]:
                 errors.append(f"{label} must have at least {schema['minItems']} items")
@@ -114,17 +129,25 @@ class Schema(ABC):
         return Schema.validate_json_schema_value(value, self.to_json_schema(), path)
 
 
+class ToolResult(str):
+    """String-compatible tool output with structured status."""
+
+    is_error: bool
+
+    def __new__(cls, content: str, *, is_error: bool = False) -> ToolResult:
+        obj = str.__new__(cls, content)
+        obj.is_error = is_error
+        return obj
+
+    @classmethod
+    def error(cls, content: str) -> ToolResult:
+        return cls(content, is_error=True)
+
+
 class Tool(ABC):
     """Agent capability: read files, run commands, etc."""
 
-    _TYPE_MAP = {
-        "string": str,
-        "integer": int,
-        "number": (int, float),
-        "boolean": bool,
-        "array": list,
-        "object": dict,
-    }
+    _TYPE_MAP = _JSON_TYPE_MAP
     _BOOL_TRUE = frozenset(("true", "1", "yes"))
     _BOOL_FALSE = frozenset(("false", "0", "no"))
 
@@ -166,16 +189,51 @@ class Tool(ABC):
         """Whether this tool should run alone even if concurrency is enabled."""
         return False
 
+    # --- Plugin metadata ---
+
+    config_key: str = ""
+    _plugin_discoverable: bool = True
+    _scopes: set[str] = {"core"}
+
+    @classmethod
+    def config_cls(cls) -> type[BaseModel] | None:
+        return None
+
+    @classmethod
+    def enabled(cls, ctx: ToolContext) -> bool:
+        return True
+
+    @classmethod
+    def create(cls, ctx: ToolContext) -> Tool:
+        return cls()
+
+    def runtime_context_provider(self) -> RuntimeContextProvider | None:
+        """Return optional per-turn prompt context owned by this tool."""
+        return None
+
     @abstractmethod
     async def execute(self, **kwargs: Any) -> Any:
-        """Run the tool; returns a string or list of content blocks."""
+        """Run the tool; return content, or ``ToolResult.error(...)`` for failures."""
         ...
+
+    @staticmethod
+    def error(content: str) -> ToolResult:
+        return ToolResult.error(content)
 
     def _cast_object(self, obj: Any, schema: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(obj, dict):
             return obj
         props = schema.get("properties", {})
-        return {k: self._cast_value(v, props[k]) if k in props else v for k, v in obj.items()}
+        additional = schema.get("additionalProperties")
+        casted: dict[str, Any] = {}
+        for k, v in obj.items():
+            if k in props:
+                casted[k] = self._cast_value(v, props[k])
+            elif isinstance(additional, dict):
+                casted[k] = self._cast_value(v, additional)
+            else:
+                casted[k] = v
+        return casted
 
     def cast_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Apply safe schema-driven casts before validation."""
@@ -267,7 +325,6 @@ def tool_parameters(schema: dict[str, Any]) -> Callable[[type[_ToolT]], type[_To
         def parameters(self: Any) -> dict[str, Any]:
             return deepcopy(frozen)
 
-        cls._tool_parameters_schema = deepcopy(frozen)
         cls.parameters = parameters  # type: ignore[assignment]
 
         abstract = getattr(cls, "__abstractmethods__", None)

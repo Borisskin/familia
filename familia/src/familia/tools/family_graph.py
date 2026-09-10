@@ -24,6 +24,7 @@ from typing import Any
 
 import httpx
 from nanobot.agent.tools.base import Tool, tool_parameters
+from nanobot.agent.tools.context import current_request_context
 from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
 
 from familia.memx_client import memx_base_url
@@ -299,7 +300,12 @@ class ResolvePersonTool(Tool):
         from_actor: str | None = None,
         **kwargs: Any,
     ) -> str:
-        actor_id = get_current_actor()
+        request_context = current_request_context()
+        actor_id = (
+            request_context.actor
+            if request_context is not None and request_context.actor
+            else get_current_actor()
+        )
         if not actor_id:
             return "Error: no actor in context"
         principal = get_registry().get(actor_id)

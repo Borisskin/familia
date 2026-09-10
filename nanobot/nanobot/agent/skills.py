@@ -125,21 +125,34 @@ class SkillsLoader:
         if not all_skills:
             return ""
 
-        lines: list[str] = []
-        for entry in all_skills:
-            skill_name = entry["name"]
-            if exclude and skill_name in exclude:
+        sections: list[str] = []
+        groups = (
+            ("Workspace skills", "workspace", self.workspace_skills),
+            ("Built-in skills", "builtin", self.builtin_skills),
+        )
+        for label, source, root in groups:
+            entries = [
+                entry
+                for entry in all_skills
+                if entry["source"] == source and (not exclude or entry["name"] not in exclude)
+            ]
+            if not entries:
                 continue
-            meta = self._get_skill_meta(skill_name)
-            available = self._check_requirements(meta)
-            desc = self._get_skill_description(skill_name)
-            if available:
-                lines.append(f"- **{skill_name}** — {desc}  `{entry['path']}`")
-            else:
-                missing = self._get_missing_requirements(meta)
-                suffix = f" (unavailable: {missing})" if missing else " (unavailable)"
-                lines.append(f"- **{skill_name}** — {desc}{suffix}  `{entry['path']}`")
-        return "\n".join(lines)
+
+            lines = [f"### {label} (`{root.expanduser().resolve()}`)"]
+            for entry in entries:
+                skill_name = entry["name"]
+                meta = self._get_skill_meta(skill_name)
+                available = self._check_requirements(meta)
+                desc = self._get_skill_description(skill_name)
+                suffix = ""
+                if not available:
+                    missing = self._get_missing_requirements(meta)
+                    suffix = f" (unavailable: {missing})" if missing else " (unavailable)"
+                relative_path = Path(entry["path"]).relative_to(root).as_posix()
+                lines.append(f"- **{skill_name}** — {desc}{suffix}  `{relative_path}`")
+            sections.append("\n".join(lines))
+        return "\n\n".join(sections)
 
     def _get_missing_requirements(self, skill_meta: dict) -> str:
         """Get a description of missing requirements."""
@@ -150,6 +163,24 @@ class SkillsLoader:
             [f"CLI: {command_name}" for command_name in required_bins if not shutil.which(command_name)]
             + [f"ENV: {env_name}" for env_name in required_env_vars if not os.environ.get(env_name)]
         )
+
+    def get_skill_availability(self, name: str) -> tuple[bool, str]:
+        """Return whether a skill can run and why not when it cannot."""
+        meta = self._get_skill_meta(name)
+        available = self._check_requirements(meta)
+        return available, "" if available else self._get_missing_requirements(meta)
+
+    def get_skill_requirements(self, name: str) -> dict[str, list[str]]:
+        """Return explicit command/env requirements and currently missing entries."""
+        requires = self._get_skill_meta(name).get("requires", {})
+        bins = [str(value) for value in requires.get("bins", [])]
+        env = [str(value) for value in requires.get("env", [])]
+        return {
+            "bins": bins,
+            "env": env,
+            "missing_bins": [value for value in bins if not shutil.which(value)],
+            "missing_env": [value for value in env if not os.environ.get(value)],
+        }
 
     def _get_skill_description(self, name: str) -> str:
         """Get the description of a skill from its frontmatter."""

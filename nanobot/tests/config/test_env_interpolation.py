@@ -8,6 +8,7 @@ from nanobot.config.loader import (
     resolve_config_env_vars,
     save_config,
 )
+from nanobot.config.schema import Config
 
 
 class TestResolveEnvVars:
@@ -80,3 +81,184 @@ class TestResolveConfig:
 
         saved = json.loads(config_path.read_text(encoding="utf-8"))
         assert saved["channels"]["telegram"]["token"] == "${MY_TOKEN}"
+
+    def test_save_preserves_dream_legacy_cron(self, tmp_path):
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {"agents": {"defaults": {"dream": {"cron": "0 */4 * * *"}}}}
+            ),
+            encoding="utf-8",
+        )
+
+        config = load_config(config_path)
+        config.agents.defaults.max_tokens = 1234
+        save_config(config, config_path)
+
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        assert saved["agents"]["defaults"]["dream"]["cron"] == "0 */4 * * *"
+
+        reloaded = load_config(config_path)
+        schedule = reloaded.agents.defaults.dream.build_schedule("UTC")
+        assert schedule.kind == "cron"
+        assert schedule.expr == "0 */4 * * *"
+
+    def test_save_keeps_oauth_provider_configs_excluded(self, tmp_path):
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "agents": {"defaults": {"dream": {"cron": "0 */4 * * *"}}},
+                    "providers": {
+                        "openaiCodex": {"apiKey": "codex-secret"},
+                        "xaiGrok": {"apiKey": "xai-secret"},
+                        "githubCopilot": {"apiKey": "copilot-secret"},
+                        "groq": {"apiKey": "groq-secret"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = load_config(config_path)
+        save_config(config, config_path)
+
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        assert saved["agents"]["defaults"]["dream"]["cron"] == "0 */4 * * *"
+        assert "openaiCodex" not in saved["providers"]
+        assert "xaiGrok" not in saved["providers"]
+        assert "githubCopilot" not in saved["providers"]
+        assert saved["providers"]["groq"]["apiKey"] == "groq-secret"
+
+    def test_save_preserves_openai_codex_proxy_config(self, tmp_path):
+        config_path = tmp_path / "config.json"
+        proxy = "http://127.0.0.1:23458"
+        config = Config.model_validate(
+            {
+                "providers": {
+                    "openaiCodex": {
+                        "apiKey": "codex-secret",
+                        "proxy": proxy,
+                        "extraBody": {"service_tier": "priority"},
+                    },
+                    "groq": {"apiKey": "groq-secret"},
+                }
+            }
+        )
+
+        save_config(config, config_path)
+
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        assert saved["providers"]["openaiCodex"] == {
+            "extraBody": {"service_tier": "priority"},
+            "proxy": proxy,
+        }
+        assert saved["providers"]["groq"]["apiKey"] == "groq-secret"
+
+        reloaded = load_config(config_path)
+        assert reloaded.providers.openai_codex.proxy == proxy
+        assert reloaded.providers.openai_codex.extra_body == {"service_tier": "priority"}
+        assert reloaded.providers.openai_codex.api_key is None
+
+    def test_save_preserves_xai_grok_proxy_but_never_credentials(self, tmp_path):
+        config_path = tmp_path / "config.json"
+        proxy = "http://127.0.0.1:23458"
+        config = Config.model_validate(
+            {
+                "providers": {
+                    "xaiGrok": {
+                        "apiKey": "must-not-be-saved",
+                        "proxy": proxy,
+                        "extraBody": {"parallel_tool_calls": False},
+                    }
+                }
+            }
+        )
+
+        save_config(config, config_path)
+
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        assert saved["providers"]["xaiGrok"] == {
+            "extraBody": {"parallel_tool_calls": False},
+            "proxy": proxy,
+        }
+        assert "must-not-be-saved" not in config_path.read_text(encoding="utf-8")
+
+        reloaded = load_config(config_path)
+        assert reloaded.providers.xai_grok.proxy == proxy
+        assert reloaded.providers.xai_grok.extra_body == {"parallel_tool_calls": False}
+        assert reloaded.providers.xai_grok.api_key is None
+
+    def test_save_preserves_settings_across_oauth_provider_blocks(self, tmp_path):
+        config_path = tmp_path / "config.json"
+        config = Config.model_validate(
+            {
+                "providers": {
+                    "openaiCodex": {
+                        "apiKey": "codex-secret",
+                        "extraBody": {"service_tier": "${CODEX_SERVICE_TIER}"},
+                    },
+                    "xaiGrok": {
+                        "apiKey": "xai-secret",
+                        "proxy": "http://127.0.0.1:7890",
+                        "extraBody": {"parallel_tool_calls": False},
+                    },
+                }
+            }
+        )
+
+        save_config(config, config_path)
+
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        assert saved["providers"]["openaiCodex"] == {
+            "extraBody": {"service_tier": "${CODEX_SERVICE_TIER}"}
+        }
+        assert saved["providers"]["xaiGrok"] == {
+            "extraBody": {"parallel_tool_calls": False},
+            "proxy": "http://127.0.0.1:7890",
+        }
+        assert "codex-secret" not in config_path.read_text(encoding="utf-8")
+        assert "xai-secret" not in config_path.read_text(encoding="utf-8")
+
+    def test_preserves_excluded_fields_when_no_env_refs(self, tmp_path):
+        """Regression: fields with ``exclude=True`` (e.g. ProviderConfig.openai_codex)
+        must survive ``resolve_config_env_vars`` when the config has no
+        ``${VAR}`` references. Previously the unconditional dump→revalidate
+        roundtrip silently dropped them."""
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {"providers": {"openaiCodex": {"apiKey": "secret"}}}
+            ),
+            encoding="utf-8",
+        )
+
+        raw = load_config(config_path)
+        assert raw.providers.openai_codex.api_key == "secret"
+
+        resolved = resolve_config_env_vars(raw)
+        assert resolved.providers.openai_codex.api_key == "secret"
+
+    def test_preserves_excluded_fields_with_env_refs(self, tmp_path, monkeypatch):
+        """Excluded fields must also survive when the config contains
+        ``${VAR}`` refs elsewhere. An in-place walk preserves the excluded
+        field even as unrelated string fields are substituted."""
+        monkeypatch.setenv("TEST_API_KEY", "resolved-key")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "providers": {
+                        "openaiCodex": {"apiKey": "secret"},
+                        "groq": {"apiKey": "${TEST_API_KEY}"},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        raw = load_config(config_path)
+        resolved = resolve_config_env_vars(raw)
+
+        assert resolved.providers.groq.api_key == "resolved-key"
+        assert resolved.providers.openai_codex.api_key == "secret"

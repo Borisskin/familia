@@ -2,14 +2,37 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from contextlib import AbstractContextManager
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 if TYPE_CHECKING:
     from nanobot.bus.events import InboundMessage, OutboundMessage
     from nanobot.session.manager import Session
+    from nanobot.utils.llm_runtime import LLMRuntime
 
 Handler = Callable[["CommandContext"], Awaitable["OutboundMessage | None"]]
+_BOT_SUFFIX_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def normalize_command_text(text: str) -> str:
+    """Normalize slash-command transport variants before routing.
+
+    Telegram and Discord-style command dispatch can produce ``/cmd@bot args``.
+    The bot suffix belongs to the transport, not the command name, so strip it
+    once at the router boundary while preserving user arguments verbatim.
+    """
+    stripped = text.strip()
+    if not stripped.startswith("/"):
+        return stripped
+    first, sep, rest = stripped.partition(" ")
+    if "@" not in first:
+        return stripped
+    command, suffix = first.rsplit("@", 1)
+    if command and suffix and _BOT_SUFFIX_RE.fullmatch(suffix):
+        return f"{command}{sep}{rest}" if sep else command
+    return stripped
 
 
 @dataclass
@@ -22,6 +45,9 @@ class CommandContext:
     raw: str
     args: str = ""
     loop: Any = None
+    runtime: LLMRuntime | None = None
+    is_user_turn: bool = False
+    turn_scopes: list[AbstractContextManager[Any]] = field(default_factory=list)
 
 
 class CommandRouter:
@@ -32,14 +58,12 @@ class CommandRouter:
          (e.g. /stop, /restart).
       2. *exact* — exact-match commands handled inside the dispatch lock.
       3. *prefix* — longest-prefix-first match (e.g. "/team ").
-      4. *interceptors* — fallback predicates (e.g. team-mode active check).
     """
 
     def __init__(self) -> None:
         self._priority: dict[str, Handler] = {}
         self._exact: dict[str, Handler] = {}
         self._prefix: list[tuple[str, Handler]] = []
-        self._interceptors: list[Handler] = []
 
     def priority(self, cmd: str, handler: Handler) -> None:
         self._priority[cmd] = handler
@@ -51,19 +75,16 @@ class CommandRouter:
         self._prefix.append((pfx, handler))
         self._prefix.sort(key=lambda p: len(p[0]), reverse=True)
 
-    def intercept(self, handler: Handler) -> None:
-        self._interceptors.append(handler)
-
     def is_priority(self, text: str) -> bool:
-        return text.strip().lower() in self._priority
+        return normalize_command_text(text).lower() in self._priority
 
     def is_dispatchable_command(self, text: str) -> bool:
         """Check whether *text* matches any non-priority command tier (exact or prefix).
 
-        Does NOT check priority or interceptor tiers.
+        Does NOT check priority tier.
         If this returns True, ``dispatch()`` is guaranteed to match a handler.
         """
-        cmd = text.strip().lower()
+        cmd = normalize_command_text(text).lower()
         if cmd in self._exact:
             return True
         for pfx, _ in self._prefix:
@@ -73,13 +94,15 @@ class CommandRouter:
 
     async def dispatch_priority(self, ctx: CommandContext) -> OutboundMessage | None:
         """Dispatch a priority command. Called from run() without the lock."""
+        ctx.raw = normalize_command_text(ctx.raw)
         handler = self._priority.get(ctx.raw.lower())
         if handler:
             return await handler(ctx)
         return None
 
     async def dispatch(self, ctx: CommandContext) -> OutboundMessage | None:
-        """Try exact, prefix, then interceptors. Returns None if unhandled."""
+        """Try exact, then prefix handlers. Returns None if unhandled."""
+        ctx.raw = normalize_command_text(ctx.raw)
         cmd = ctx.raw.lower()
 
         if handler := self._exact.get(cmd):
@@ -89,10 +112,5 @@ class CommandRouter:
             if cmd.startswith(pfx):
                 ctx.args = ctx.raw[len(pfx):]
                 return await handler(ctx)
-
-        for interceptor in self._interceptors:
-            result = await interceptor(ctx)
-            if result is not None:
-                return result
 
         return None

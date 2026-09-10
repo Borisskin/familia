@@ -7,55 +7,179 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from nanobot.agent.tools.base import Tool, tool_parameters
-from nanobot.agent.tools.schema import BooleanSchema, IntegerSchema, StringSchema, tool_parameters_schema
-from nanobot.agent.tools import file_state
+from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
+from nanobot.agent.tools.file_state import FileStates, _hash_file, current_file_states
+from nanobot.agent.tools.path_utils import resolve_workspace_path
+from nanobot.agent.tools.schema import (
+    BooleanSchema,
+    IntegerSchema,
+    StringSchema,
+    tool_parameters_schema,
+)
+from nanobot.config_base import Base
+from nanobot.security.workspace_access import current_tool_workspace
 from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
-from nanobot.config.paths import get_media_dir
 
 
-def _resolve_path(
-    path: str,
-    workspace: Path | None = None,
-    allowed_dir: Path | None = None,
-    extra_allowed_dirs: list[Path] | None = None,
-) -> Path:
-    """Resolve path against workspace (if relative) and enforce directory restriction."""
-    p = Path(path).expanduser()
-    if not p.is_absolute() and workspace:
-        p = workspace / p
-    resolved = p.resolve()
-    if allowed_dir:
-        media_path = get_media_dir().resolve()
-        all_dirs = [allowed_dir] + [media_path] + (extra_allowed_dirs or []) 
-        if not any(_is_under(resolved, d) for d in all_dirs):
-            raise PermissionError(f"Path {path} is outside allowed directory {allowed_dir}")
-    return resolved
+class FileToolsConfig(Base):
+    """Filesystem tools configuration."""
 
-
-def _is_under(path: Path, directory: Path) -> bool:
-    try:
-        path.relative_to(directory.resolve())
-        return True
-    except ValueError:
-        return False
+    enable: bool = True  # built-in file tools on by default
 
 
 class _FsTool(Tool):
     """Shared base for filesystem tools — common init and path resolution."""
+
+    config_key = "file"
+
+    @classmethod
+    def config_cls(cls):
+        return FileToolsConfig
+
+    @classmethod
+    def enabled(cls, ctx: Any) -> bool:
+        return ctx.config.file.enable
 
     def __init__(
         self,
         workspace: Path | None = None,
         allowed_dir: Path | None = None,
         extra_allowed_dirs: list[Path] | None = None,
+        extra_read_allowed_dirs: list[Path] | None = None,
+        extra_write_allowed_dirs: list[Path] | None = None,
+        extra_write_allowed_files: list[Path] | None = None,
+        file_states: FileStates | None = None,
+        restrict_to_workspace: bool | None = None,
+        sandbox_restricts_workspace: bool = False,
+        extra_read_allowed_files: list[Path] | None = None,
     ):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
-        self._extra_allowed_dirs = extra_allowed_dirs
+        # Legacy alias: extra_allowed_dirs is read-only. Write-capable tools
+        # must opt in via extra_write_allowed_dirs.
+        self._extra_read_allowed_dirs = [
+            *(extra_allowed_dirs or []),
+            *(extra_read_allowed_dirs or []),
+        ]
+        self._extra_read_allowed_files = list(extra_read_allowed_files or [])
+        self._extra_write_allowed_dirs = list(extra_write_allowed_dirs or [])
+        self._extra_write_allowed_files = list(extra_write_allowed_files or [])
+        self._restrict_to_workspace = (
+            bool(restrict_to_workspace)
+            if restrict_to_workspace is not None
+            else allowed_dir is not None
+        )
+        self._sandbox_restricts_workspace = sandbox_restricts_workspace
+        # Explicit state is used by isolated runners like Dream/subagents.
+        # Main AgentLoop tools leave this unset and resolve state from the
+        # current async task, which keeps shared tool instances session-safe.
+        self._explicit_file_states = file_states
+        self._fallback_file_states = FileStates()
+
+    @classmethod
+    def create(cls, ctx: Any) -> Tool:
+        from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+
+        agent_workspace = Path(ctx.workspace)
+        resolved_agent_workspace = agent_workspace.expanduser().resolve(strict=False)
+        restrict = (
+            ctx.config.restrict_to_workspace
+            or ctx.config.exec.sandbox
+        )
+        sandbox_restricts = bool(ctx.config.exec.sandbox)
+        allowed_dir = agent_workspace if restrict else None
+        # Agent-owned skills stay available from project scopes. History is a narrower
+        # capability: expose only the append-only log, not the surrounding memory directory.
+        return cls(
+            workspace=agent_workspace,
+            allowed_dir=allowed_dir,
+            extra_read_allowed_dirs=[BUILTIN_SKILLS_DIR, resolved_agent_workspace / "skills"],
+            extra_read_allowed_files=[resolved_agent_workspace / "memory" / "history.jsonl"],
+            file_states=ctx.file_state_store,
+            restrict_to_workspace=ctx.config.restrict_to_workspace,
+            sandbox_restricts_workspace=sandbox_restricts,
+        )
+
+    @property
+    def _file_states(self) -> FileStates:
+        if self._explicit_file_states is not None:
+            return self._explicit_file_states
+        return current_file_states(self._fallback_file_states)
+
+    def _effective_allowed_root(self, access_allowed_root: Path | None) -> Path | None:
+        if self._allowed_dir is None or self._workspace is None:
+            return access_allowed_root
+        try:
+            allowed_dir = Path(self._allowed_dir).expanduser().resolve(strict=False)
+            workspace = Path(self._workspace).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return access_allowed_root if access_allowed_root is not None else self._allowed_dir
+        if allowed_dir == workspace:
+            return access_allowed_root
+        return allowed_dir
+
+    def _resolve_with_extra(
+        self,
+        path: str,
+        extra_allowed_dirs: list[Path] | None,
+        extra_allowed_files: list[Path] | None,
+        *,
+        include_media_dir: bool,
+        extra_files_require_allowed_root: bool = False,
+    ) -> Path:
+        access = current_tool_workspace(
+            self._workspace,
+            restrict_to_workspace=self._restrict_to_workspace,
+            sandbox_restricts_workspace=self._sandbox_restricts_workspace,
+        )
+        allowed_root = self._effective_allowed_root(access.allowed_root)
+        if access.scope is not None and not access.scope.allow_shared_extras:
+            # Keep only the packaged skills tree as an explicit public
+            # capability.  Workspace-level skills/history and global media
+            # belong to the standalone agent and must not cross actor roots.
+            from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+
+            builtin_root = BUILTIN_SKILLS_DIR.expanduser().resolve(strict=False)
+            extra_allowed_dirs = [
+                extra
+                for extra in (extra_allowed_dirs or [])
+                if Path(extra).expanduser().resolve(strict=False) == builtin_root
+            ]
+            extra_allowed_files = None
+            include_media_dir = False
+        if extra_files_require_allowed_root and allowed_root is None:
+            extra_allowed_files = None
+        return resolve_workspace_path(
+            path,
+            access.project_path,
+            allowed_root,
+            extra_allowed_dirs,
+            extra_allowed_files,
+            include_media_dir=include_media_dir,
+        )
+
+    def _resolve_read(self, path: str) -> Path:
+        return self._resolve_with_extra(
+            path,
+            self._extra_read_allowed_dirs,
+            self._extra_read_allowed_files,
+            include_media_dir=True,
+            extra_files_require_allowed_root=True,
+        )
+
+    def _resolve_write(self, path: str) -> Path:
+        return self._resolve_with_extra(
+            path,
+            self._extra_write_allowed_dirs,
+            self._extra_write_allowed_files,
+            include_media_dir=False,
+        )
 
     def _resolve(self, path: str) -> Path:
-        return _resolve_path(path, self._workspace, self._allowed_dir, self._extra_allowed_dirs)
+        return self._resolve_read(path)
+
+    def _display_workspace(self) -> Path | None:
+        return current_tool_workspace(self._workspace).project_path
 
 
 # ---------------------------------------------------------------------------
@@ -95,15 +219,21 @@ def _is_blocked_device(path: str | Path) -> bool:
     return False
 
 
-def _parse_page_range(pages: str, total: int) -> tuple[int, int]:
-    """Parse a page range like '2-5' into 0-based (start, end) inclusive."""
-    parts = pages.strip().split("-")
-    if len(parts) == 1:
-        p = int(parts[0])
-        return max(0, p - 1), min(p - 1, total - 1)
-    start = int(parts[0])
-    end = int(parts[1])
-    return max(0, start - 1), min(end - 1, total - 1)
+def _builtin_skill_read_path(path: str) -> Path | None:
+    """Map workspace-relative skills/<name>/... reads onto bundled skills."""
+    from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+
+    requested = Path(path)
+    if requested.is_absolute():
+        return None
+    parts = requested.parts
+    if len(parts) < 2 or parts[0] != "skills":
+        return None
+    root = BUILTIN_SKILLS_DIR.resolve()
+    candidate = (root / Path(*parts[1:])).resolve()
+    if candidate != root and root not in candidate.parents:
+        return None
+    return candidate if candidate.is_file() else None
 
 
 @tool_parameters(
@@ -120,13 +250,19 @@ def _parse_page_range(pages: str, total: int) -> tuple[int, int]:
             minimum=1,
         ),
         pages=StringSchema("Page range for PDF files, e.g. '1-5' (default: all, max 20 pages)"),
+        force=BooleanSchema(
+            description="Bypass same-file read deduplication and return content again.",
+            default=False,
+        ),
         required=["path"],
     )
 )
 class ReadFileTool(_FsTool):
     """Read file contents with optional line-based pagination."""
+    _scopes = {"core", "subagent", "memory"}
 
     _MAX_CHARS = 128_000
+    _MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024
     _DEFAULT_LIMIT = 2000
     _MAX_PDF_PAGES = 20
 
@@ -141,7 +277,11 @@ class ReadFileTool(_FsTool):
             "Text output format: LINE_NUM|CONTENT. "
             "Images return visual content for analysis. "
             "Supports PDF, DOCX, XLSX, PPTX documents. "
+            "Use find_files/list_dir first when the path is uncertain. "
+            "Read the relevant range before editing so replacements or patches "
+            "are based on current content. "
             "Use offset and limit for large text files. "
+            "Use force=true to re-read content even if unchanged. "
             "Reads exceeding ~128K chars are truncated."
         )
 
@@ -149,22 +289,43 @@ class ReadFileTool(_FsTool):
     def read_only(self) -> bool:
         return True
 
-    async def execute(self, path: str | None = None, offset: int = 1, limit: int | None = None, pages: str | None = None, **kwargs: Any) -> Any:
+    async def execute(
+        self,
+        path: str | None = None,
+        offset: int = 1,
+        limit: int | None = None,
+        pages: str | None = None,
+        force: bool = False,
+        **kwargs: Any,
+    ) -> Any:
         try:
             if not path:
-                return "Error reading file: Unknown path"
+                return ToolResult.error("Error reading file: Unknown path")
 
             # Device path blacklist
             if _is_blocked_device(path):
-                return f"Error: Reading {path} is blocked (device path that could hang or produce infinite output)."
+                return ToolResult.error(f"Error: Reading {path} is blocked (device path that could hang or produce infinite output).")
 
-            fp = self._resolve(path)
-            if _is_blocked_device(fp):
-                return f"Error: Reading {fp} is blocked (device path that could hang or produce infinite output)."
+            fp = self._resolve_read(path)
             if not fp.exists():
-                return f"Error: File not found: {path}"
+                # The fallback is confined to the packaged, public skills
+                # tree; workspace-level skills are filtered above.
+                fp = _builtin_skill_read_path(path) or fp
+            if _is_blocked_device(fp):
+                return ToolResult.error(f"Error: Reading {fp} is blocked (device path that could hang or produce infinite output).")
+            if not fp.exists():
+                return ToolResult.error(f"Error: File not found: {path}")
             if not fp.is_file():
-                return f"Error: Not a file: {path}"
+                return ToolResult.error(f"Error: Not a file: {path}")
+
+            file_size = fp.stat().st_size
+            if file_size > self._MAX_FILE_SIZE_BYTES:
+                size_mib = file_size / (1024 * 1024)
+                max_mib = self._MAX_FILE_SIZE_BYTES // (1024 * 1024)
+                return ToolResult.error(
+                    f"Error: File too large to read ({size_mib:.1f} MiB). "
+                    f"Maximum is {max_mib} MiB."
+                )
 
             # PDF support
             if fp.suffix.lower() == ".pdf":
@@ -184,30 +345,36 @@ class ReadFileTool(_FsTool):
 
             # Read dedup: same path + offset + limit + unchanged mtime → stub
             # Always check for external modifications before dedup
-            entry = file_state._state.get(str(fp.resolve()))
+            entry = self._file_states.get(fp)
             try:
                 current_mtime = os.path.getmtime(fp)
             except OSError:
                 current_mtime = 0.0
-            if entry and entry.can_dedup and entry.offset == offset and entry.limit == limit:
+            if (
+                not force
+                and entry
+                and entry.can_dedup
+                and entry.offset == offset
+                and entry.limit == limit
+            ):
                 if current_mtime != entry.mtime:
                     # File was modified externally - force full read and mark as not dedupable
                     entry.can_dedup = False
-                    file_state.record_read(fp, offset=offset, limit=limit)  # Update state with new mtime
+                    self._file_states.record_read(fp, offset=offset, limit=limit)  # Update state with new mtime
                     # Continue to read full content (don't return dedup message)
                 else:
                     # File unchanged - return dedup message
                     # But only if content is actually unchanged (not just mtime)
-                    current_hash = file_state._hash_file(str(fp))
+                    current_hash = _hash_file(str(fp))
                     if current_hash == entry.content_hash:
                         return f"[File unchanged since last read: {path}]"
                     else:
                         # Content changed despite same mtime - force full read
                         entry.can_dedup = False
-                        file_state.record_read(fp, offset=offset, limit=limit)
+                        self._file_states.record_read(fp, offset=offset, limit=limit)
             else:
                 # No previous state or marked as not dedupable - read full content
-                file_state.record_read(fp, offset=offset, limit=limit)
+                self._file_states.record_read(fp, offset=offset, limit=limit)
                 # Force full read by setting can_dedup to False for this read
                 if entry:
                     entry.can_dedup = False
@@ -221,7 +388,7 @@ class ReadFileTool(_FsTool):
                 mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
                 if mime and mime.startswith("image/"):
                     return build_image_content_blocks(raw, mime, str(fp), f"(Image file: {path})")
-                return f"Error: Cannot read binary file {path} (MIME: {mime or 'unknown'}). Only UTF-8 text and images are supported."
+                return ToolResult.error(f"Error: Cannot read binary file {path} (MIME: {mime or 'unknown'}). Only UTF-8 text and images are supported.")
 
             # Normalize CRLF -> LF before line-splitting. Primarily a Windows
             # concern (git checkouts with autocrlf, editors saving CRLF) but
@@ -235,7 +402,7 @@ class ReadFileTool(_FsTool):
             if offset < 1:
                 offset = 1
             if offset > total:
-                return f"Error: offset {offset} is beyond end of file ({total} lines)"
+                return ToolResult.error(f"Error: offset {offset} is beyond end of file ({total} lines)")
 
             start = offset - 1
             end = min(start + (limit or self._DEFAULT_LIMIT), total)
@@ -256,57 +423,41 @@ class ReadFileTool(_FsTool):
                 result += f"\n\n(Showing lines {offset}-{end} of {total}. Use offset={end + 1} to continue.)"
             else:
                 result += f"\n\n(End of file — {total} lines total)"
-            file_state.record_read(fp, offset=offset, limit=limit)
+            self._file_states.record_read(fp, offset=offset, limit=limit)
             return result
         except PermissionError as e:
-            return f"Error: {e}"
+            return ToolResult.error(f"Error: {e}")
         except Exception as e:
-            return f"Error reading file: {e}"
+            return ToolResult.error(f"Error reading file: {e}")
 
     def _read_pdf(self, fp: Path, pages: str | None) -> str:
-        try:
-            import fitz  # pymupdf
-        except ImportError:
-            return "Error: PDF reading requires pymupdf. Install with: pip install pymupdf"
+        from nanobot.utils.document import PdfPageRangeError, PdfSafetyError, extract_pdf_pages
 
         try:
-            doc = fitz.open(str(fp))
+            extraction = extract_pdf_pages(
+                fp,
+                pages=pages,
+                max_pages=self._MAX_PDF_PAGES,
+                max_chars=self._MAX_CHARS,
+            )
+        except PdfPageRangeError:
+            return ToolResult.error(f"Error: Invalid page range '{pages}'. Use format like '1-5'.")
+        except PdfSafetyError as e:
+            return ToolResult.error(f"Error reading PDF: {e}")
         except Exception as e:
-            return f"Error reading PDF: {e}"
+            return ToolResult.error(f"Error reading PDF: {e}")
 
-        total_pages = len(doc)
-        if pages:
-            try:
-                start, end = _parse_page_range(pages, total_pages)
-            except (ValueError, IndexError):
-                doc.close()
-                return f"Error: Invalid page range '{pages}'. Use format like '1-5'."
-            if start > end or start >= total_pages:
-                doc.close()
-                return f"Error: Page range '{pages}' is out of bounds (document has {total_pages} pages)."
-        else:
-            start = 0
-            end = min(total_pages - 1, self._MAX_PDF_PAGES - 1)
-
-        if end - start + 1 > self._MAX_PDF_PAGES:
-            end = start + self._MAX_PDF_PAGES - 1
-
-        parts: list[str] = []
-        for i in range(start, end + 1):
-            page = doc[i]
-            text = page.get_text().strip()
-            if text:
-                parts.append(f"--- Page {i + 1} ---\n{text}")
-        doc.close()
-
-        if not parts:
+        if not extraction.text:
             return f"(PDF has no extractable text: {fp})"
 
-        result = "\n\n".join(parts)
-        if end < total_pages - 1:
-            result += f"\n\n(Showing pages {start + 1}-{end + 1} of {total_pages}. Use pages='{end + 2}-{min(end + 1 + self._MAX_PDF_PAGES, total_pages)}' to continue.)"
-        if len(result) > self._MAX_CHARS:
-            result = result[:self._MAX_CHARS] + "\n\n(PDF text truncated at ~128K chars)"
+        result = extraction.text
+        if extraction.end_page < extraction.total_pages - 1:
+            next_start = extraction.end_page + 2
+            next_end = min(extraction.end_page + 1 + self._MAX_PDF_PAGES, extraction.total_pages)
+            result += (
+                f"\n\n(Showing pages {extraction.start_page + 1}-{extraction.end_page + 1} "
+                f"of {extraction.total_pages}. Use pages='{next_start}-{next_end}' to continue.)"
+            )
         return result
 
     def _read_office_doc(self, fp: Path) -> str:
@@ -315,10 +466,10 @@ class ReadFileTool(_FsTool):
         result = extract_text(fp)
 
         if result is None:
-            return f"Error: Unsupported file format: {fp.suffix}"
+            return ToolResult.error(f"Error: Unsupported file format: {fp.suffix}")
 
         if result.startswith("[error:"):
-            return f"Error reading {fp.suffix.upper()} file: {result}"
+            return ToolResult.error(f"Error reading {fp.suffix.upper()} file: {result}")
 
         if not result:
             return f"({fp.suffix.upper().lstrip('.')} has no extractable text: {fp})"
@@ -343,6 +494,7 @@ class ReadFileTool(_FsTool):
 )
 class WriteFileTool(_FsTool):
     """Write content to a file."""
+    _scopes = {"core", "subagent", "memory"}
 
     @property
     def name(self) -> str:
@@ -351,9 +503,10 @@ class WriteFileTool(_FsTool):
     @property
     def description(self) -> str:
         return (
-            "Write content to a file. Overwrites if the file already exists; "
-            "creates parent directories as needed. "
-            "For partial edits, prefer edit_file instead."
+            "Create a new file or intentionally replace an entire file with "
+            "the provided content. Overwrites existing files and creates parent "
+            "directories as needed. For code changes or partial edits, prefer "
+            "apply_patch; use edit_file only for small exact replacements."
         )
 
     async def execute(self, path: str | None = None, content: str | None = None, **kwargs: Any) -> str:
@@ -362,15 +515,15 @@ class WriteFileTool(_FsTool):
                 raise ValueError("Unknown path")
             if content is None:
                 raise ValueError("Unknown content")
-            fp = self._resolve(path)
+            fp = self._resolve_write(path)
             fp.parent.mkdir(parents=True, exist_ok=True)
             fp.write_text(content, encoding="utf-8")
-            file_state.record_write(fp)
+            self._file_states.record_write(fp)
             return f"Successfully wrote {len(content)} characters to {fp}"
         except PermissionError as e:
-            return f"Error: {e}"
+            return ToolResult.error(f"Error: {e}")
         except Exception as e:
-            return f"Error writing file: {e}"
+            return ToolResult.error(f"Error writing file: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +631,15 @@ class _MatchSpan:
     line: int
 
 
+def _match_end_line(match: _MatchSpan) -> int:
+    comparable = match.text[:-1] if match.text.endswith("\n") else match.text
+    return match.line + comparable.count("\n")
+
+
+def _match_covers_line(match: _MatchSpan, line: int) -> bool:
+    return match.line <= line <= _match_end_line(match)
+
+
 def _find_exact_matches(content: str, old_text: str) -> list[_MatchSpan]:
     matches: list[_MatchSpan] = []
     start = 0
@@ -580,11 +742,6 @@ def _find_matches(content: str, old_text: str) -> list[_MatchSpan]:
     return []
 
 
-def _find_match_line_numbers(content: str, old_text: str) -> list[int]:
-    """Return 1-based starting line numbers for the current matching strategies."""
-    return [match.line for match in _find_matches(content, old_text)]
-
-
 def _collapse_internal_whitespace(text: str) -> str:
     return "\n".join(" ".join(line.split()) for line in text.splitlines())
 
@@ -648,11 +805,33 @@ def _find_match(content: str, old_text: str) -> tuple[str | None, int]:
         old_text=StringSchema("The text to find and replace"),
         new_text=StringSchema("The text to replace with"),
         replace_all=BooleanSchema(description="Replace all occurrences (default false)"),
+        occurrence=IntegerSchema(
+            1,
+            description="Optional 1-based occurrence to replace when old_text appears multiple times.",
+            minimum=1,
+            nullable=True,
+        ),
+        line_hint=IntegerSchema(
+            1,
+            description=(
+                "Optional exact 1-based target line copied from read_file. "
+                "The selected old_text match must cover this line."
+            ),
+            minimum=1,
+            nullable=True,
+        ),
+        expected_replacements=IntegerSchema(
+            1,
+            description="Optional guard for the number of replacements that must be made.",
+            minimum=1,
+            nullable=True,
+        ),
         required=["path", "old_text", "new_text"],
     )
 )
 class EditFileTool(_FsTool):
     """Edit a file by replacing text with fallback matching."""
+    _scopes = {"core", "subagent", "memory"}
 
     _MAX_EDIT_FILE_SIZE = 1024 * 1024 * 1024  # 1 GiB
     _MARKDOWN_EXTS = frozenset({".md", ".mdx", ".markdown"})
@@ -664,10 +843,14 @@ class EditFileTool(_FsTool):
     @property
     def description(self) -> str:
         return (
-            "Edit a file by replacing old_text with new_text. "
-            "Tolerates minor whitespace/indentation differences and curly/straight quote mismatches. "
-            "If old_text matches multiple times, you must provide more context "
-            "or set replace_all=true. Shows a diff of the closest match on failure."
+            "Perform a small, exact replacement in one file by replacing "
+            "old_text with new_text. Use this for narrow text substitutions "
+            "with old_text copied from read_file. For multi-file, structural, "
+            "or generated code edits, prefer apply_patch. If old_text matches "
+            "multiple times, provide more context or set occurrence, line_hint, "
+            "replace_all, and expected_replacements. When editing from numbered "
+            "read_file output, set line_hint to the exact target line. "
+            "Shows closest-match diagnostics on failure."
         )
 
     @staticmethod
@@ -678,7 +861,8 @@ class EditFileTool(_FsTool):
     async def execute(
         self, path: str | None = None, old_text: str | None = None,
         new_text: str | None = None,
-        replace_all: bool = False, **kwargs: Any,
+        replace_all: bool = False, occurrence: int | None = None,
+        line_hint: int | None = None, expected_replacements: int | None = None, **kwargs: Any,
     ) -> str:
         try:
             if not path:
@@ -687,19 +871,21 @@ class EditFileTool(_FsTool):
                 raise ValueError("Unknown old_text")
             if new_text is None:
                 raise ValueError("Unknown new_text")
+            if occurrence is not None and occurrence < 1:
+                return ToolResult.error("Error: occurrence must be >= 1.")
+            if line_hint is not None and line_hint < 1:
+                return ToolResult.error("Error: line_hint must be >= 1.")
+            if expected_replacements is not None and expected_replacements < 1:
+                return ToolResult.error("Error: expected_replacements must be >= 1.")
 
-            # .ipynb detection
-            if path.endswith(".ipynb"):
-                return "Error: This is a Jupyter notebook. Use the notebook_edit tool instead of edit_file."
-
-            fp = self._resolve(path)
+            fp = self._resolve_write(path)
 
             # Create-file semantics: old_text='' + file doesn't exist → create
             if not fp.exists():
                 if old_text == "":
                     fp.parent.mkdir(parents=True, exist_ok=True)
                     fp.write_text(new_text, encoding="utf-8")
-                    file_state.record_write(fp)
+                    self._file_states.record_write(fp)
                     return f"Successfully created {fp}"
                 return self._file_not_found_msg(path, fp)
 
@@ -709,20 +895,20 @@ class EditFileTool(_FsTool):
             except OSError:
                 fsize = 0
             if fsize > self._MAX_EDIT_FILE_SIZE:
-                return f"Error: File too large to edit ({fsize / (1024**3):.1f} GiB). Maximum is 1 GiB."
+                return ToolResult.error(f"Error: File too large to edit ({fsize / (1024**3):.1f} GiB). Maximum is 1 GiB.")
 
             # Create-file: old_text='' but file exists and not empty → reject
             if old_text == "":
                 raw = fp.read_bytes()
                 content = raw.decode("utf-8")
                 if content.strip():
-                    return f"Error: Cannot create file — {path} already exists and is not empty."
+                    return ToolResult.error(f"Error: Cannot create file — {path} already exists and is not empty.")
                 fp.write_text(new_text, encoding="utf-8")
-                file_state.record_write(fp)
+                self._file_states.record_write(fp)
                 return f"Successfully edited {fp}"
 
             # Read-before-edit check
-            warning = file_state.check_read(fp)
+            warning = self._file_states.check_read(fp)
 
             raw = fp.read_bytes()
             uses_crlf = b"\r\n" in raw
@@ -733,7 +919,18 @@ class EditFileTool(_FsTool):
             if not matches:
                 return self._not_found_msg(old_text, content, path)
             count = len(matches)
-            if count > 1 and not replace_all:
+            if replace_all and occurrence is not None:
+                return ToolResult.error("Error: occurrence cannot be used with replace_all=true.")
+            if replace_all and line_hint is not None:
+                return ToolResult.error("Error: line_hint cannot be used with replace_all=true.")
+            if occurrence is not None and line_hint is not None:
+                return ToolResult.error("Error: line_hint cannot be used with occurrence.")
+            if occurrence is not None and occurrence > count:
+                return ToolResult.error(
+                    f"Error: occurrence {occurrence} is out of range; "
+                    f"old_text appears {count} time(s)."
+                )
+            if count > 1 and not replace_all and occurrence is None and line_hint is None:
                 line_numbers = [match.line for match in matches]
                 preview = ", ".join(f"line {n}" for n in line_numbers[:3])
                 if len(line_numbers) > 3:
@@ -741,7 +938,8 @@ class EditFileTool(_FsTool):
                 location_hint = f" at {preview}" if preview else ""
                 return (
                     f"Warning: old_text appears {count} times{location_hint}. "
-                    "Provide more context to make it unique, or set replace_all=true."
+                    "Provide more context, set occurrence to choose one match, "
+                    "or set replace_all=true."
                 )
 
             norm_new = new_text.replace("\r\n", "\n")
@@ -750,7 +948,34 @@ class EditFileTool(_FsTool):
             if fp.suffix.lower() not in self._MARKDOWN_EXTS:
                 norm_new = self._strip_trailing_ws(norm_new)
 
-            selected = matches if replace_all else matches[:1]
+            if replace_all:
+                selected = matches
+            elif occurrence is not None:
+                selected = [matches[occurrence - 1]]
+            elif line_hint is not None:
+                candidates = [match for match in matches if _match_covers_line(match, line_hint)]
+                if not candidates:
+                    locations = ", ".join(f"line {match.line}" for match in matches[:3])
+                    if len(matches) > 3:
+                        locations += ", ..."
+                    return ToolResult.error(
+                        f"Error: line_hint {line_hint} does not match the old_text location. "
+                        f"old_text appears at {locations}. Re-read the intended region and "
+                        "copy old_text that covers the target line."
+                    )
+                if len(candidates) > 1:
+                    return ToolResult.error(
+                        f"Error: line_hint {line_hint} is ambiguous; "
+                        f"old_text appears {len(candidates)} times on that line."
+                    )
+                selected = candidates
+            else:
+                selected = [matches[0]]
+            if expected_replacements is not None and len(selected) != expected_replacements:
+                return ToolResult.error(
+                    f"Error: expected {expected_replacements} replacements but "
+                    f"would make {len(selected)}."
+                )
             new_content = content
             for match in reversed(selected):
                 replacement = _preserve_quote_style(norm_old, match.text, norm_new)
@@ -767,15 +992,15 @@ class EditFileTool(_FsTool):
                 new_content = new_content.replace("\n", "\r\n")
 
             fp.write_bytes(new_content.encode("utf-8"))
-            file_state.record_write(fp)
+            self._file_states.record_write(fp)
             msg = f"Successfully edited {fp}"
             if warning:
                 msg = f"{warning}\n{msg}"
             return msg
         except PermissionError as e:
-            return f"Error: {e}"
+            return ToolResult.error(f"Error: {e}")
         except Exception as e:
-            return f"Error editing file: {e}"
+            return ToolResult.error(f"Error editing file: {e}")
 
     def _file_not_found_msg(self, path: str, fp: Path) -> str:
         """Build an error message with 'Did you mean ...?' suggestions."""
@@ -788,7 +1013,7 @@ class EditFileTool(_FsTool):
         parts = [f"Error: File not found: {path}"]
         if suggestions:
             parts.append("Did you mean: " + ", ".join(suggestions) + "?")
-        return "\n".join(parts)
+        return ToolResult.error("\n".join(parts))
 
     @staticmethod
     def _not_found_msg(old_text: str, content: str, path: str) -> str:
@@ -804,18 +1029,18 @@ class EditFileTool(_FsTool):
             hint_text = ""
             if hints:
                 hint_text = "\nPossible cause: " + ", ".join(hints) + "."
-            return (
+            return ToolResult.error(
                 f"Error: old_text not found in {path}."
                 f"{hint_text}\nBest match ({best_ratio:.0%} similar) at line {best_start + 1}:\n{diff}"
             )
 
         if hints:
-            return (
+            return ToolResult.error(
                 f"Error: old_text not found in {path}. "
                 f"Possible cause: {', '.join(hints)}. "
                 "Copy the exact text from read_file and try again."
             )
-        return f"Error: old_text not found in {path}. No similar text found. Verify the file content."
+        return ToolResult.error(f"Error: old_text not found in {path}. No similar text found. Verify the file content.")
 
 
 # ---------------------------------------------------------------------------
@@ -836,6 +1061,7 @@ class EditFileTool(_FsTool):
 )
 class ListDirTool(_FsTool):
     """List directory contents with optional recursion."""
+    _scopes = {"core", "subagent"}
 
     _DEFAULT_MAX = 200
     _IGNORE_DIRS = {
@@ -869,9 +1095,9 @@ class ListDirTool(_FsTool):
                 raise ValueError("Unknown path")
             dp = self._resolve(path)
             if not dp.exists():
-                return f"Error: Directory not found: {path}"
+                return ToolResult.error(f"Error: Directory not found: {path}")
             if not dp.is_dir():
-                return f"Error: Not a directory: {path}"
+                return ToolResult.error(f"Error: Not a directory: {path}")
 
             cap = max_entries or self._DEFAULT_MAX
             items: list[str] = []
@@ -902,6 +1128,6 @@ class ListDirTool(_FsTool):
                 result += f"\n\n(truncated, showing first {cap} of {total} entries)"
             return result
         except PermissionError as e:
-            return f"Error: {e}"
+            return ToolResult.error(f"Error: {e}")
         except Exception as e:
-            return f"Error listing directory: {e}"
+            return ToolResult.error(f"Error listing directory: {e}")

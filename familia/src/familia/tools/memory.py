@@ -27,6 +27,7 @@ from typing import Any
 import httpx
 from loguru import logger
 from nanobot.agent.tools.base import Tool, tool_parameters
+from nanobot.agent.tools.context import current_request_context
 from nanobot.agent.tools.schema import StringSchema, tool_parameters_schema
 
 from familia import audit
@@ -419,7 +420,12 @@ def _resolve_full_key(
 
 
 def _current_actor_and_key() -> tuple[str | None, str | None, str | None]:
-    actor_id = get_current_actor()
+    request_context = current_request_context()
+    actor_id = (
+        request_context.actor
+        if request_context is not None and request_context.actor
+        else get_current_actor()
+    )
     if not actor_id:
         return None, None, "Error: no actor in context — memory operations require a known principal"
     principal = get_registry().get(actor_id)
@@ -432,7 +438,7 @@ def _current_actor_and_key() -> tuple[str | None, str | None, str | None]:
 
 
 def _check_memory_write_policy(*, actor: str, full_key: str) -> str | None:
-    """Return a safe error when policy does not explicitly allow a write."""
+    """Return a safe error unless policy explicitly allows the write."""
     decision = get_engine().evaluate(
         PolicyContext(action="memory.write", actor=actor, to_chat=full_key)
     )

@@ -16,6 +16,7 @@ from contextvars import ContextVar
 from typing import Any
 
 from nanobot.agent.tools.base import Tool, tool_parameters
+from nanobot.agent.tools.context import RequestContext, current_request_context
 from nanobot.agent.tools.schema import (
     ArraySchema,
     BooleanSchema,
@@ -91,9 +92,18 @@ class SendButtonsTool(Tool):
             "send_buttons_default_chat_id", default=default_chat_id
         )
 
-    def set_context(self, channel: str, chat_id: str) -> None:
-        self._default_channel.set(channel)
-        self._default_chat_id.set(chat_id)
+    def set_context(
+        self,
+        context_or_channel: RequestContext | str,
+        chat_id: str | None = None,
+    ) -> None:
+        """Keep legacy setters working while accepting the trusted turn context."""
+        if isinstance(context_or_channel, RequestContext):
+            self._default_channel.set(context_or_channel.channel)
+            self._default_chat_id.set(context_or_channel.chat_id)
+            return
+        self._default_channel.set(context_or_channel)
+        self._default_chat_id.set(chat_id or "")
 
     def set_send_callback(
         self, callback: Callable[[OutboundMessage], Awaitable[None]]
@@ -139,8 +149,22 @@ class SendButtonsTool(Tool):
         from nanobot.utils.helpers import strip_think
         content = strip_think(content)
 
-        default_channel = self._default_channel.get()
-        default_chat_id = self._default_chat_id.get()
+        request_context = current_request_context()
+        default_channel = (
+            request_context.channel
+            if request_context is not None
+            else self._default_channel.get()
+        )
+        default_chat_id = (
+            request_context.chat_id
+            if request_context is not None
+            else self._default_chat_id.get()
+        )
+        if request_context is not None:
+            if channel and channel != default_channel:
+                return "Error: channel override does not match the admitted request"
+            if chat_id and chat_id != default_chat_id:
+                return "Error: chat_id override does not match the admitted request"
         channel = channel or default_channel
         chat_id = chat_id or default_chat_id
 

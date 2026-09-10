@@ -1,35 +1,90 @@
-# nanobot baseline: 0.1.5.post2
-# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+# nanobot baseline: 0.3.0
+# upstream commit: 3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec
 
-diff --git a/nanobot/nanobot/cron/types.py b/nanobot/nanobot/cron/types.py
-index c38542e..d395375 100644
---- a/nanobot/nanobot/cron/types.py
-+++ b/nanobot/nanobot/cron/types.py
-@@ -27,6 +27,20 @@ class CronPayload:
-     deliver: bool = False
-     channel: str | None = None  # e.g. "whatsapp"
-     to: str | None = None  # e.g. phone number
-+    # Principal id of the actor who scheduled this job. Used by ``cron list`` to
-+    # filter visibility so non-admin participants only see their own reminders
-+    # (created by them OR addressed to them). None on jobs predating the field
-+    # or on system jobs — they're treated as admin-only by the list filter.
+diff --git aa/nanobot/nanobot/cron/types.py bb/nanobot/nanobot/cron/types.py
+index 89a2d54..633f4d2 100644
+--- aa/nanobot/nanobot/cron/types.py
++++ bb/nanobot/nanobot/cron/types.py
+@@ -53,9 +53,58 @@ class CronPayload:
+     origin_channel: str | None = None
+     origin_chat_id: str | None = None
+     origin_metadata: dict[str, Any] = field(default_factory=dict)
++    # Typed ownership metadata survives cron save/load.  The runtime still
++    # validates these ids against the server registry before using them.
 +    created_by: str | None = None
-+    # Tag ids attached to this job. Integrations may define a tag namespace
-+    # and a per-viewer reachable set. When set, ``cron list`` filters by
-+    # intersection with that reachable set, in addition to the legacy
-+    # creator/addressee match.
 +    tags: list[str] = field(default_factory=list)
-+    # Neutral multi-principal identity fields. Standalone nanobot leaves them
-+    # unset; product adapters may require them and fail closed when absent.
 +    creator_actor: str | None = None
 +    target_actor: str | None = None
++    owner_actor: str | None = None
+ 
+     @classmethod
+     def from_store_dict(cls, data: dict[str, Any]) -> CronPayload:
++        raw_origin_metadata = get_camel_snake(
++            data, "originMetadata", "origin_metadata", {}
++        )
++        origin_metadata = (
++            dict(raw_origin_metadata) if isinstance(raw_origin_metadata, dict) else {}
++        )
++        created_by = get_camel_snake(data, "createdBy", "created_by")
++        if created_by is None:
++            created_by = get_camel_snake(origin_metadata, "createdBy", "created_by")
++        if not isinstance(created_by, str) or not created_by.strip():
++            created_by = None
++        else:
++            created_by = created_by.strip()
++        creator_actor = get_camel_snake(data, "creatorActor", "creator_actor")
++        if creator_actor is None:
++            creator_actor = get_camel_snake(
++                origin_metadata, "creatorActor", "creator_actor"
++            )
++        if not isinstance(creator_actor, str) or not creator_actor.strip():
++            creator_actor = created_by
++        else:
++            creator_actor = creator_actor.strip()
++        owner_actor = get_camel_snake(data, "ownerActor", "owner_actor")
++        if owner_actor is None:
++            owner_actor = get_camel_snake(origin_metadata, "ownerActor", "owner_actor")
++        if not isinstance(owner_actor, str) or not owner_actor.strip():
++            owner_actor = None
++        else:
++            owner_actor = owner_actor.strip()
++        raw_tags = get_camel_snake(data, "tags", "tags", [])
++        tags = (
++            [tag.strip() for tag in raw_tags if isinstance(tag, str) and tag.strip()]
++            if isinstance(raw_tags, list)
++            else []
++        )
++        target_actor = get_camel_snake(data, "targetActor", "target_actor")
++        if target_actor is None:
++            target_actor = get_camel_snake(origin_metadata, "targetActor", "target_actor")
++        if not isinstance(target_actor, str) or not target_actor.strip():
++            target_actor = None
++        else:
++            target_actor = target_actor.strip()
+         return cls(
+             kind=data.get("kind", "agent_turn"),
+             message=data.get("message", ""),
+@@ -68,9 +117,12 @@ class CronPayload:
+             session_key=get_camel_snake(data, "sessionKey", "session_key"),
+             origin_channel=get_camel_snake(data, "originChannel", "origin_channel"),
+             origin_chat_id=get_camel_snake(data, "originChatId", "origin_chat_id"),
+-            origin_metadata=dict(
+-                get_camel_snake(data, "originMetadata", "origin_metadata", {}) or {}
+-            ),
++            origin_metadata=origin_metadata,
++            created_by=created_by,
++            tags=tags,
++            creator_actor=creator_actor,
++            target_actor=target_actor,
++            owner_actor=owner_actor,
+         )
  
  
- @dataclass
-@@ -77,5 +91,5 @@ class CronJob:
+@@ -169,5 +221,5 @@ class CronJob:
  @dataclass
  class CronStore:
      """Persistent store for cron jobs."""
 -    version: int = 1
 +    version: int = 2
      jobs: list[CronJob] = field(default_factory=list)
+

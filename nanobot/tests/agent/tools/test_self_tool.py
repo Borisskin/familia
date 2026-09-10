@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from types import MappingProxyType
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import BaseModel
 
+from nanobot.agent.tools.context import RequestContext, request_context
 from nanobot.agent.tools.self import MyTool
-
+from nanobot.config.schema import ModelPresetConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -19,7 +21,7 @@ from nanobot.agent.tools.self import MyTool
 def _make_mock_loop(**overrides):
     """Build a lightweight mock AgentLoop with the attributes MyTool reads."""
     loop = MagicMock()
-    loop.model = "anthropic/claude-sonnet-4-20250514"
+    loop.model = "anthropic/claude-sonnet-4-6"
     loop.max_iterations = 40
     loop.context_window_tokens = 65_536
     loop.workspace = Path("/tmp/workspace")
@@ -35,6 +37,12 @@ def _make_mock_loop(**overrides):
     loop._concurrency_gate = None
     loop._unified_session = False
     loop._extra_hooks = []
+    loop.set_runtime_model.side_effect = lambda value: setattr(loop, "model", value)
+    loop.set_runtime_context_window.side_effect = lambda value: setattr(
+        loop,
+        "context_window_tokens",
+        value,
+    )
 
     # web_config mock — needed for check tests
     loop.web_config = MagicMock()
@@ -59,10 +67,10 @@ def _make_mock_loop(**overrides):
     return loop
 
 
-def _make_tool(loop=None):
-    if loop is None:
-        loop = _make_mock_loop()
-    return MyTool(loop=loop)
+def _make_tool(runtime_state=None):
+    if runtime_state is None:
+        runtime_state = _make_mock_loop()
+    return MyTool(runtime_state=runtime_state)
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +90,7 @@ class TestInspectSummary:
     async def test_inspect_includes_runtime_vars(self):
         loop = _make_mock_loop()
         loop._runtime_vars = {"task": "review"}
-        tool = _make_tool(loop)
+        tool = _make_tool(runtime_state=loop)
         result = await tool.execute(action="check")
         assert "task" in result
 
@@ -144,7 +152,7 @@ class TestInspectPathNavigation:
         loop = _make_mock_loop()
         loop.web_config = MagicMock()
         loop.web_config.enable = True
-        tool = _make_tool(loop)
+        tool = _make_tool(runtime_state=loop)
         result = await tool.execute(action="check", key="web_config.enable")
         assert "True" in result
 
@@ -152,7 +160,7 @@ class TestInspectPathNavigation:
     async def test_inspect_dict_key_via_dotpath(self):
         loop = _make_mock_loop()
         loop._last_usage = {"prompt_tokens": 100, "completion_tokens": 50}
-        tool = _make_tool(loop)
+        tool = _make_tool(runtime_state=loop)
         result = await tool.execute(action="check", key="_last_usage.prompt_tokens")
         assert "100" in result
 
@@ -201,14 +209,14 @@ class TestModifyRestricted:
         tool = _make_tool()
         result = await tool.execute(action="set", key="max_iterations", value=80)
         assert "Set max_iterations = 80" in result
-        assert tool._loop.max_iterations == 80
+        assert tool._runtime_state.max_iterations == 80
 
     @pytest.mark.asyncio
     async def test_modify_restricted_out_of_range(self):
         tool = _make_tool()
         result = await tool.execute(action="set", key="max_iterations", value=0)
         assert "Error" in result
-        assert tool._loop.max_iterations == 40
+        assert tool._runtime_state.max_iterations == 40
 
     @pytest.mark.asyncio
     async def test_modify_restricted_max_exceeded(self):
@@ -232,13 +240,17 @@ class TestModifyRestricted:
     async def test_modify_string_int_coerced(self):
         tool = _make_tool()
         result = await tool.execute(action="set", key="max_iterations", value="80")
-        assert tool._loop.max_iterations == 80
+        assert "Set max_iterations" in result
+        assert tool._runtime_state.max_iterations == 80
 
     @pytest.mark.asyncio
     async def test_modify_context_window_valid(self):
-        tool = _make_tool()
+        loop = _make_mock_loop()
+        tool = _make_tool(runtime_state=loop)
         result = await tool.execute(action="set", key="context_window_tokens", value=131072)
-        assert tool._loop.context_window_tokens == 131072
+        assert "Set context_window_tokens" in result
+        assert loop.context_window_tokens == 131072
+        loop.set_runtime_context_window.assert_called_once_with(131072)
 
     @pytest.mark.asyncio
     async def test_modify_none_value_for_restricted_int(self):
@@ -312,7 +324,7 @@ class TestModifyFree:
         tool = _make_tool()
         result = await tool.execute(action="set", key="provider_retry_mode", value="persistent")
         assert "Set provider_retry_mode" in result
-        assert tool._loop.provider_retry_mode == "persistent"
+        assert tool._runtime_state.provider_retry_mode == "persistent"
 
     @pytest.mark.asyncio
     async def test_modify_new_key_stores_in_runtime_vars(self):
@@ -320,7 +332,7 @@ class TestModifyFree:
         tool = _make_tool()
         result = await tool.execute(action="set", key="my_custom_var", value="hello")
         assert "my_custom_var" in result
-        assert tool._loop._runtime_vars["my_custom_var"] == "hello"
+        assert tool._runtime_state._runtime_vars["my_custom_var"] == "hello"
 
     @pytest.mark.asyncio
     async def test_modify_rejects_callable(self):
@@ -338,13 +350,15 @@ class TestModifyFree:
     async def test_modify_allows_list(self):
         tool = _make_tool()
         result = await tool.execute(action="set", key="items", value=[1, 2, 3])
-        assert tool._loop._runtime_vars["items"] == [1, 2, 3]
+        assert result == "Set scratchpad.items = [1, 2, 3]"
+        assert tool._runtime_state._runtime_vars["items"] == [1, 2, 3]
 
     @pytest.mark.asyncio
     async def test_modify_allows_dict(self):
         tool = _make_tool()
         result = await tool.execute(action="set", key="data", value={"a": 1})
-        assert tool._loop._runtime_vars["data"] == {"a": 1}
+        assert result == "Set scratchpad.data = {'a': 1}"
+        assert tool._runtime_state._runtime_vars["data"] == {"a": 1}
 
     @pytest.mark.asyncio
     async def test_modify_whitespace_key_rejected(self):
@@ -382,7 +396,7 @@ class TestModifyFree:
         result = await tool.execute(action="set", key="provider_retry_mode", value=42)
         assert "Error" in result
         assert "str" in result
-        assert tool._loop.provider_retry_mode == "standard"
+        assert tool._runtime_state.provider_retry_mode == "standard"
 
     @pytest.mark.asyncio
     async def test_modify_existing_int_attr_wrong_type_rejected(self):
@@ -390,7 +404,7 @@ class TestModifyFree:
         tool = _make_tool()
         result = await tool.execute(action="set", key="max_tool_result_chars", value="big")
         assert "Error" in result
-        assert tool._loop.max_tool_result_chars == 16000
+        assert tool._runtime_state.max_tool_result_chars == 16000
 
 
 # ---------------------------------------------------------------------------
@@ -579,7 +593,7 @@ class TestRuntimeVarsLimits:
     async def test_runtime_vars_rejects_at_max_keys(self):
         loop = _make_mock_loop()
         loop._runtime_vars = {f"key_{i}": i for i in range(64)}
-        tool = _make_tool(loop)
+        tool = _make_tool(runtime_state=loop)
         result = await tool.execute(action="set", key="overflow", value="data")
         assert "full" in result
         assert "overflow" not in loop._runtime_vars
@@ -588,7 +602,7 @@ class TestRuntimeVarsLimits:
     async def test_runtime_vars_allows_update_existing_key_at_max(self):
         loop = _make_mock_loop()
         loop._runtime_vars = {f"key_{i}": i for i in range(64)}
-        tool = _make_tool(loop)
+        tool = _make_tool(runtime_state=loop)
         result = await tool.execute(action="set", key="key_0", value="updated")
         assert "Error" not in result
         assert loop._runtime_vars["key_0"] == "updated"
@@ -689,8 +703,8 @@ class TestSubagentHookStatus:
     @pytest.mark.asyncio
     async def test_after_iteration_updates_status(self):
         """after_iteration should copy iteration, tool_events, usage to status."""
-        from nanobot.agent.subagent import SubagentStatus, _SubagentHook
         from nanobot.agent.hook import AgentHookContext
+        from nanobot.agent.subagent import SubagentStatus, _SubagentHook
 
         status = SubagentStatus(
             task_id="test",
@@ -716,8 +730,8 @@ class TestSubagentHookStatus:
     @pytest.mark.asyncio
     async def test_after_iteration_with_error(self):
         """after_iteration should set status.error when context has an error."""
-        from nanobot.agent.subagent import SubagentStatus, _SubagentHook
         from nanobot.agent.hook import AgentHookContext
+        from nanobot.agent.subagent import SubagentStatus, _SubagentHook
 
         status = SubagentStatus(
             task_id="test",
@@ -739,12 +753,15 @@ class TestSubagentHookStatus:
     @pytest.mark.asyncio
     async def test_after_iteration_no_status_is_noop(self):
         """after_iteration with no status should be a no-op."""
-        from nanobot.agent.subagent import _SubagentHook
         from nanobot.agent.hook import AgentHookContext
+        from nanobot.agent.subagent import _SubagentHook
 
         hook = _SubagentHook("test")
         context = AgentHookContext(iteration=1, messages=[])
-        await hook.after_iteration(context)  # should not raise
+        result = await hook.after_iteration(context)
+
+        assert result is None
+        assert context.iteration == 1
 
 
 # ---------------------------------------------------------------------------
@@ -756,8 +773,8 @@ class TestCheckpointCallback:
     @pytest.mark.asyncio
     async def test_checkpoint_updates_phase_and_iteration(self):
         """The _on_checkpoint callback should update status.phase and iteration."""
+
         from nanobot.agent.subagent import SubagentStatus
-        import asyncio
 
         status = SubagentStatus(
             task_id="cp",
@@ -827,7 +844,7 @@ class TestInspectTaskStatuses:
                 usage={"prompt_tokens": 500, "completion_tokens": 100},
             ),
         }
-        tool = _make_tool(loop)
+        tool = _make_tool(runtime_state=loop)
         result = await tool.execute(action="check", key="subagents._task_statuses")
         assert "abc12345" in result
         assert "read logs" in result
@@ -848,7 +865,7 @@ class TestInspectTaskStatuses:
             stop_reason="completed",
         )
         loop.subagents._task_statuses = {"xyz": status}
-        tool = _make_tool(loop)
+        tool = _make_tool(runtime_state=loop)
         result = await tool.execute(action="check", key="subagents._task_statuses.xyz")
         assert "search code" in result
         assert "completed" in result
@@ -862,7 +879,7 @@ class TestReadOnlyMode:
 
     def _make_readonly_tool(self):
         loop = _make_mock_loop()
-        return MyTool(loop=loop, modify_allowed=False)
+        return MyTool(runtime_state=loop, modify_allowed=False)
 
     @pytest.mark.asyncio
     async def test_inspect_allowed_in_readonly(self):
@@ -941,7 +958,7 @@ class TestSensitiveSubFieldBlocking:
         loop = _make_mock_loop()
         loop.some_config = MagicMock()
         loop.some_config.password = "hunter2"
-        tool = _make_tool(loop)
+        tool = _make_tool(runtime_state=loop)
         result = await tool.execute(action="check", key="some_config.password")
         assert "not accessible" in result
 
@@ -950,7 +967,7 @@ class TestSensitiveSubFieldBlocking:
         loop = _make_mock_loop()
         loop.vault = MagicMock()
         loop.vault.secret = "classified"
-        tool = _make_tool(loop)
+        tool = _make_tool(runtime_state=loop)
         result = await tool.execute(action="check", key="vault.secret")
         assert "not accessible" in result
 
@@ -959,7 +976,7 @@ class TestSensitiveSubFieldBlocking:
         loop = _make_mock_loop()
         loop.auth_data = MagicMock()
         loop.auth_data.token = "jwt-payload"
-        tool = _make_tool(loop)
+        tool = _make_tool(runtime_state=loop)
         result = await tool.execute(action="check", key="auth_data.token")
         assert "not accessible" in result
 
@@ -975,7 +992,7 @@ class TestSensitiveSubFieldBlocking:
     async def test_modify_password_blocked(self):
         loop = _make_mock_loop()
         loop.some_config = MagicMock()
-        tool = _make_tool(loop)
+        tool = _make_tool(runtime_state=loop)
         result = await tool.execute(action="set", key="some_config.password", value="evil")
         assert "not accessible" in result
 
@@ -1063,6 +1080,32 @@ class TestSecurityAttributeProtection:
         result = await tool.execute(action="set", key="web_config.enable", value=False)
         assert "read-only" in result
 
+    @pytest.mark.asyncio
+    async def test_modify_model_presets_dotpath_blocked(self):
+        """The config-derived model preset catalog is inspectable but not mutable."""
+        presets = {"fast": {"model": "fast-model"}}
+        tool = _make_tool(runtime_state=_make_mock_loop(model_presets=presets))
+
+        result = await tool.execute(
+            action="set",
+            key="model_presets.other",
+            value={"model": "other-model"},
+        )
+
+        assert "read-only" in result
+        assert presets == {"fast": {"model": "fast-model"}}
+
+    @pytest.mark.asyncio
+    async def test_inspect_read_only_model_preset_dotpath(self):
+        presets = MappingProxyType({
+            "fast": ModelPresetConfig(model="fast-model"),
+        })
+        tool = _make_tool(runtime_state=_make_mock_loop(model_presets=presets))
+
+        result = await tool.execute(action="check", key="model_presets.fast.model")
+
+        assert result == "model_presets.fast.model: 'fast-model'"
+
 
 # ---------------------------------------------------------------------------
 # current iteration count (Fix #2)
@@ -1107,19 +1150,68 @@ class TestLastUsageInSummary:
     async def test_last_usage_not_shown_when_empty(self):
         loop = _make_mock_loop()
         loop._last_usage = {}
-        tool = _make_tool(loop)
+        tool = _make_tool(runtime_state=loop)
         result = await tool.execute(action="check")
         assert "_last_usage" not in result
 
 
 # ---------------------------------------------------------------------------
-# set_context (audit session tracking)
+# request context (audit session tracking)
 # ---------------------------------------------------------------------------
 
-class TestSetContext:
+class TestRequestContext:
 
-    def test_set_context_stores_channel_and_chat_id(self):
+    @pytest.mark.asyncio
+    async def test_check_exposes_current_routing_metadata_on_demand(self):
         tool = _make_tool()
-        tool.set_context("feishu", "oc_abc123")
-        assert tool._channel == "feishu"
-        assert tool._chat_id == "oc_abc123"
+        ctx = RequestContext(
+            channel="feishu",
+            chat_id="oc_abc123",
+            sender_id="ou_user456",
+        )
+
+        with request_context(ctx):
+            assert await tool.execute(action="check", key="request.channel") == (
+                "request.channel: 'feishu'"
+            )
+            assert await tool.execute(action="check", key="request.chat_id") == (
+                "request.chat_id: 'oc_abc123'"
+            )
+            assert await tool.execute(action="check", key="request.sender_id") == (
+                "request.sender_id: 'ou_user456'"
+            )
+            summary = await tool.execute(action="check")
+
+        assert "oc_abc123" not in summary
+        assert "ou_user456" not in summary
+
+    @pytest.mark.asyncio
+    async def test_request_routing_metadata_is_read_only(self):
+        tool = _make_tool()
+
+        result = await tool.execute(
+            action="set",
+            key="request.chat_id",
+            value="replacement",
+        )
+
+        assert "read-only" in result
+
+    def test_audit_reads_bound_session(self):
+        tool = _make_tool()
+        ctx = RequestContext(
+            channel="feishu",
+            chat_id="oc_abc123",
+            session_key="feishu:oc_abc123",
+        )
+
+        with patch("nanobot.agent.tools.self.logger.info") as info:
+            with request_context(ctx):
+                tool._audit("modify", "temperature = 0.2")
+
+        info.assert_called_once_with(
+            "self.{} | {} | session:{}",
+            "modify",
+            "temperature = 0.2",
+            "feishu:oc_abc123",
+        )

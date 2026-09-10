@@ -3,19 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Collection
-from copy import deepcopy
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Callable, Coroutine
+from typing import TYPE_CHECKING, Callable, Coroutine
 
 from loguru import logger
+
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
     from nanobot.agent.memory import Consolidator
+    from nanobot.utils.llm_runtime import LLMRuntime
 
 
 class AutoCompact:
     _RECENT_SUFFIX_MESSAGES = 8
+    _INTERNAL_SESSION_PREFIXES = ("dream:",)
 
     def __init__(self, sessions: SessionManager, consolidator: Consolidator,
                  session_ttl_minutes: int = 0):
@@ -33,101 +35,76 @@ class AutoCompact:
             ts = datetime.fromisoformat(ts)
         return ((now or datetime.now()) - ts).total_seconds() >= self._ttl * 60
 
-    @staticmethod
-    def _format_summary(text: str, last_active: datetime) -> str:
-        idle_min = int((datetime.now() - last_active).total_seconds() / 60)
-        return f"Inactive for {idle_min} minutes.\nPrevious conversation summary: {text}"
-
-    def _split_unconsolidated(
-        self, session: Session,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Split live session tail into archiveable prefix and retained recent suffix."""
+    def _has_compactable_idle_tail(self, key: str) -> bool:
+        session = self.sessions.get_or_create(key)
         tail = list(session.messages[session.last_consolidated:])
         if not tail:
-            return [], []
-
+            return False
         probe = Session(
             key=session.key,
-            messages=tail.copy(),
+            messages=tail,
             created_at=session.created_at,
             updated_at=session.updated_at,
             metadata={},
             last_consolidated=0,
         )
-        probe.retain_recent_legal_suffix(self._RECENT_SUFFIX_MESSAGES)
-        kept = probe.messages
-        cut = len(tail) - len(kept)
-        return tail[:cut], kept
+        result = probe.retain_recent_legal_suffix(
+            self._RECENT_SUFFIX_MESSAGES,
+            extend_to_user=True,
+        )
+        messages_to_remove = result.dropped[result.already_consolidated_count:]
+        return bool(messages_to_remove)
 
-    def check_expired(self, schedule_background: Callable[[Coroutine], None],
-                      active_session_keys: Collection[str] = ()) -> None:
+    @staticmethod
+    def _format_summary(text: str, last_active: datetime) -> str:
+        return f"Previous conversation summary (last active {last_active.isoformat()}):\n{text}"
+
+    @classmethod
+    def _is_internal_session(cls, key: str) -> bool:
+        return key.startswith(cls._INTERNAL_SESSION_PREFIXES)
+
+    def check_expired(
+        self,
+        schedule_background: Callable[[Coroutine], None],
+        resolve_runtime: Callable[[Session], LLMRuntime],
+        active_session_keys: Collection[str] = (),
+    ) -> None:
         """Schedule archival for idle sessions, skipping those with in-flight agent tasks."""
         now = datetime.now()
         for info in self.sessions.list_sessions():
             key = info.get("key", "")
-            if not key or key in self._archiving:
+            if not key or self._is_internal_session(key) or key in self._archiving:
                 continue
             if key in active_session_keys:
                 continue
-            if self._is_expired(info.get("updated_at"), now):
-                self._archiving.add(key)
-                schedule_background(self._archive(key))
-
-    async def _archive(self, key: str) -> None:
-        try:
-            lock = self.consolidator.get_lock(key)
-            async with lock:
-                self.sessions.invalidate(key)
+            updated_at = info.get("updated_at")
+            if self._is_expired(updated_at, now) and self._has_compactable_idle_tail(key):
                 session = self.sessions.get_or_create(key)
-                original_messages = deepcopy(session.messages)
-                original_last_consolidated = session.last_consolidated
-                original_metadata = deepcopy(session.metadata)
-                original_updated_at = session.updated_at
                 try:
-                    archive_msgs, kept_msgs = self._split_unconsolidated(session)
-                    if not archive_msgs and not kept_msgs:
-                        session.updated_at = datetime.now()
-                        self.sessions.save(session)
-                        return
+                    runtime = resolve_runtime(session)
+                except (KeyError, ValueError):
+                    # Invalid session selections remain recoverable through /model.
+                    continue
+                self._archiving.add(key)
+                schedule_background(self._archive(key, runtime=runtime))
 
-                    last_active = session.updated_at
-                    summary = ""
-                    if archive_msgs:
-                        archive_kwargs: dict[str, Any] = {"session_key": key}
-                        route_context = session.metadata.get(
-                            "_private_session_route"
-                        )
-                        if route_context is not None:
-                            archive_kwargs["session_context"] = route_context
-                        summary = await self.consolidator.archive(
-                            archive_msgs,
-                            **archive_kwargs,
-                        ) or ""
-                    if summary and summary != "(nothing)":
-                        session.metadata["_last_summary"] = {
-                            "text": summary,
-                            "last_active": last_active.isoformat(),
-                        }
-                    session.messages = kept_msgs
-                    session.last_consolidated = 0
-                    session.updated_at = datetime.now()
-                    self.sessions.save(session)
-                except Exception:
-                    session.messages = original_messages
-                    session.last_consolidated = original_last_consolidated
-                    session.metadata = original_metadata
-                    session.updated_at = original_updated_at
-                    raise
-
-                if summary and summary != "(nothing)":
-                    self._summaries[key] = (summary, last_active)
-                if archive_msgs:
-                    logger.info(
-                        "Auto-compact: archived {} (archived={}, kept={}, summary={})",
-                        key,
-                        len(archive_msgs),
-                        len(kept_msgs),
-                        bool(summary),
+    async def _archive(self, key: str, *, runtime: LLMRuntime) -> None:
+        if self._is_internal_session(key):
+            self._archiving.discard(key)
+            return
+        try:
+            summary = await self.consolidator.compact_idle_session(
+                key,
+                runtime=runtime,
+                max_suffix=self._RECENT_SUFFIX_MESSAGES,
+            )
+            if summary and summary != "(nothing)":
+                session = self.sessions.get_or_create(key)
+                meta = session.metadata.get("_last_summary")
+                if isinstance(meta, dict):
+                    self._summaries[key] = (
+                        meta["text"],
+                        datetime.fromisoformat(meta["last_active"]),
                     )
         except Exception:
             logger.exception("Auto-compact: failed for {}", key)
@@ -135,17 +112,19 @@ class AutoCompact:
             self._archiving.discard(key)
 
     def prepare_session(self, session: Session, key: str) -> tuple[Session, str | None]:
+        if self._is_internal_session(key):
+            self._archiving.discard(key)
+            self._summaries.pop(key, None)
+            return session, None
         if key in self._archiving or self._is_expired(session.updated_at):
             logger.info("Auto-compact: reloading session {} (archiving={})", key, key in self._archiving)
             session = self.sessions.get_or_create(key)
         # Hot path: summary from in-memory dict (process hasn't restarted).
-        # Also clean metadata copy so stale _last_summary never leaks to disk.
         entry = self._summaries.pop(key, None)
         if entry:
-            session.metadata.pop("_last_summary", None)
             return session, self._format_summary(entry[0], entry[1])
-        if "_last_summary" in session.metadata:
-            meta = session.metadata.pop("_last_summary")
-            self.sessions.save(session)
+        # Cold path: summary persisted in session metadata (process restarted).
+        meta = session.metadata.get("_last_summary")
+        if isinstance(meta, dict):
             return session, self._format_summary(meta["text"], datetime.fromisoformat(meta["last_active"]))
         return session, None

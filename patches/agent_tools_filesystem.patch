@@ -1,0 +1,38 @@
+# nanobot baseline: 0.3.0
+# upstream commit: 3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec
+
+diff --git aa/nanobot/nanobot/agent/tools/filesystem.py bb/nanobot/nanobot/agent/tools/filesystem.py
+index f143e6d..434dea4 100644
+--- aa/nanobot/nanobot/agent/tools/filesystem.py
++++ bb/nanobot/nanobot/agent/tools/filesystem.py
+@@ -133,6 +133,20 @@ class _FsTool(Tool):
+             sandbox_restricts_workspace=self._sandbox_restricts_workspace,
+         )
+         allowed_root = self._effective_allowed_root(access.allowed_root)
++        if access.scope is not None and not access.scope.allow_shared_extras:
++            # Keep only the packaged skills tree as an explicit public
++            # capability.  Workspace-level skills/history and global media
++            # belong to the standalone agent and must not cross actor roots.
++            from nanobot.agent.skills import BUILTIN_SKILLS_DIR
++
++            builtin_root = BUILTIN_SKILLS_DIR.expanduser().resolve(strict=False)
++            extra_allowed_dirs = [
++                extra
++                for extra in (extra_allowed_dirs or [])
++                if Path(extra).expanduser().resolve(strict=False) == builtin_root
++            ]
++            extra_allowed_files = None
++            include_media_dir = False
+         if extra_files_require_allowed_root and allowed_root is None:
+             extra_allowed_files = None
+         return resolve_workspace_path(
+@@ -294,6 +308,8 @@ class ReadFileTool(_FsTool):
+ 
+             fp = self._resolve_read(path)
+             if not fp.exists():
++                # The fallback is confined to the packaged, public skills
++                # tree; workspace-level skills are filtered above.
+                 fp = _builtin_skill_read_path(path) or fp
+             if _is_blocked_device(fp):
+                 return ToolResult.error(f"Error: Reading {fp} is blocked (device path that could hang or produce infinite output).")
+

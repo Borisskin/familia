@@ -10,9 +10,12 @@ from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.inbound import InboundEnricher
-
-_ACTOR_UNRESOLVED = object()
+from nanobot.pairing import (
+    PAIRING_CODE_META_KEY,
+    format_pairing_reply,
+    generate_code,
+    is_approved,
+)
 
 
 class BaseChannel(ABC):
@@ -25,20 +28,9 @@ class BaseChannel(ABC):
 
     name: str = "base"
     display_name: str = "Base"
-    transcription_provider: str = "groq"
-    transcription_api_key: str = ""
-    transcription_api_base: str = ""
-    transcription_folder_id: str = ""  # yandex-only; ignored by openai/groq
-    # BCP-47 language hint passed to the STT provider. Empty = use
-    # provider default (Yandex falls back to ru-RU; OpenAI/Groq
-    # auto-detect). Configured globally via
-    # ``config.channels.transcriptionLang``.
-    transcription_lang: str = ""
-    # Per-turn STT seconds cap (set by ChannelManager from
-    # config.channels.transcriptionAudioBudgetS). Channels that
-    # support forward/reply re-processing share this budget across
-    # the inbound message + nested forwards/replies.
-    audio_budget_s: int = 300
+    send_progress: bool = True
+    send_tool_hints: bool = False
+    show_reasoning: bool = True
 
     def __init__(self, config: Any, bus: MessageBus):
         """
@@ -49,78 +41,23 @@ class BaseChannel(ABC):
             bus: The message bus for communication.
         """
         self.config = config
+        self.logger = logger.bind(channel=self.name)
         self.bus = bus
         self._running = False
-        self._inbound_enrichers: list[InboundEnricher] = []
-
-    def set_inbound_enrichers(self, enrichers: list[InboundEnricher]) -> None:
-        """Install channel-level enrichers owned by the runtime adapter."""
-        self._inbound_enrichers = list(enrichers)
 
     async def transcribe_audio(self, file_path: str | Path) -> str:
-        """Transcribe an audio file via Whisper (OpenAI/Groq) or Yandex SpeechKit.
-
-        Returns empty string on failure. A ``<file>.txt`` sidecar is
-        written next to the audio after a successful run; on subsequent
-        calls (forward / reply re-processing) we read the sidecar and
-        skip the API round-trip — saves STT quota for the same voice
-        being seen multiple times.
-        """
-        if not self.transcription_api_key:
-            return ""
-
-        path = Path(file_path)
-        cache_path = path.with_suffix(path.suffix + ".txt")
-        if cache_path.exists():
-            try:
-                cached = cache_path.read_text(encoding="utf-8").strip()
-                if cached:
-                    logger.debug("{}: transcript cache hit for {}", self.name, path.name)
-                    return cached
-            except OSError as e:
-                logger.warning(
-                    "{}: transcript cache read failed for {}: {}",
-                    self.name, path.name, e,
-                )
-
-        lang = self.transcription_lang or None
+        """Transcribe an audio file via Whisper (OpenAI or Groq). Returns empty string on failure."""
         try:
-            if self.transcription_provider == "openai":
-                from nanobot.providers.transcription import OpenAITranscriptionProvider
-                provider = OpenAITranscriptionProvider(
-                    api_key=self.transcription_api_key,
-                    api_base=self.transcription_api_base or None,
-                    language=lang,
-                )
-            elif self.transcription_provider == "yandex":
-                from nanobot.providers.transcription import YandexTranscriptionProvider
-                provider = YandexTranscriptionProvider(
-                    api_key=self.transcription_api_key,
-                    folder_id=self.transcription_folder_id or None,
-                    api_base=self.transcription_api_base or None,
-                    lang=lang,
-                )
-            else:
-                from nanobot.providers.transcription import GroqTranscriptionProvider
-                provider = GroqTranscriptionProvider(
-                    api_key=self.transcription_api_key,
-                    api_base=self.transcription_api_base or None,
-                    language=lang,
-                )
-            text = await provider.transcribe(file_path)
-        except Exception as e:
-            logger.warning("{}: audio transcription failed: {}", self.name, e)
-            return ""
+            from nanobot.audio.transcription import (
+                resolve_transcription_config,
+                transcribe_audio_file,
+            )
+            from nanobot.config.loader import load_config
 
-        if text:
-            try:
-                cache_path.write_text(text, encoding="utf-8")
-            except OSError as e:
-                logger.warning(
-                    "{}: transcript cache write failed for {}: {}",
-                    self.name, path.name, e,
-                )
-        return text
+            return await transcribe_audio_file(file_path, resolve_transcription_config(load_config()))
+        except Exception:
+            self.logger.exception("Audio transcription failed")
+            return ""
 
     async def login(self, force: bool = False) -> bool:
         """
@@ -164,17 +101,97 @@ class BaseChannel(ABC):
         """
         pass
 
-    async def send_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
+    async def send_delta(
+        self,
+        chat_id: str,
+        delta: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        stream_id: str | None = None,
+        stream_end: bool = False,
+        resuming: bool = False,
+    ) -> None:
         """Deliver a streaming text chunk.
 
         Override in subclasses to enable streaming. Implementations should
         raise on delivery failure so the channel manager can retry.
 
-        Streaming contract: ``_stream_delta`` is a chunk, ``_stream_end`` ends
-        the current segment, and stateful implementations must key buffers by
-        ``_stream_id`` rather than only by ``chat_id``.
+        Stateful implementations should key buffers by ``stream_id`` rather
+        than only by ``chat_id`` when it is provided.
         """
         pass
+
+    async def send_reasoning_delta(
+        self,
+        chat_id: str,
+        delta: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        stream_id: str | None = None,
+    ) -> None:
+        """Stream a chunk of model reasoning/thinking content.
+
+        Default is no-op. Channels with a native low-emphasis primitive
+        (Slack context block, Telegram expandable blockquote, Discord
+        subtext, WebUI italic bubble, ...) override to render reasoning
+        as a subordinate trace that updates in place as the model thinks.
+
+        Streaming contract mirrors :meth:`send_delta`: stateful implementations
+        should key buffers by ``stream_id`` rather than only by ``chat_id``.
+        """
+        return
+
+    async def send_reasoning_end(
+        self,
+        chat_id: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        stream_id: str | None = None,
+    ) -> None:
+        """Mark the end of a reasoning stream segment.
+
+        Default is no-op. Channels that buffer ``send_reasoning_delta``
+        chunks for in-place updates use this signal to flush and freeze
+        the rendered group; one-shot channels can ignore it entirely.
+        """
+        return
+
+    async def send_file_edit_events(
+        self,
+        chat_id: str,
+        edits: list[dict[str, Any]],
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Deliver structured live file-edit events.
+
+        Default is no-op. Channels with a rich activity surface can override
+        this to render editing progress without receiving empty text messages.
+        """
+        return
+
+    async def send_reasoning(self, msg: OutboundMessage) -> None:
+        """Deliver a complete reasoning block.
+
+        Default implementation reuses the streaming pair so plugins only
+        need to override the delta/end methods. Equivalent to one delta
+        with the full content followed immediately by an end marker —
+        keeps a single rendering path for both streamed and one-shot
+        reasoning (e.g. DeepSeek-R1's final-response ``reasoning_content``).
+        """
+        if not msg.content:
+            return
+        stream_id = getattr(msg.event, "stream_id", None)
+        await self.send_reasoning_delta(
+            msg.chat_id,
+            msg.content,
+            msg.metadata,
+            stream_id=stream_id,
+        )
+        await self.send_reasoning_end(
+            msg.chat_id,
+            msg.metadata,
+            stream_id=stream_id,
+        )
 
     @property
     def supports_streaming(self) -> bool:
@@ -183,60 +200,20 @@ class BaseChannel(ABC):
         streaming = cfg.get("streaming", False) if isinstance(cfg, dict) else getattr(cfg, "streaming", False)
         return bool(streaming) and type(self).send_delta is not BaseChannel.send_delta
 
-    async def should_drop_inbound(
-        self,
-        sender_id: str,
-        *,
-        actor: str | None | object = _ACTOR_UNRESOLVED,
-    ) -> bool:
-        """Channel-level inbound filter for the pending-principal flow.
-
-        Returns True iff the message should be silently dropped at the
-        channel adapter, BEFORE it reaches :meth:`_handle_message` or
-        the agent loop. The drop list is narrow on purpose:
-
-        * Known principal whose ``sender_id`` was removed from
-          ``allow_from`` — the operator's "kick out" gesture; we
-          honour it.
-        * Otherwise (unknown sender, or known principal still in
-          ``allow_from``) — let the message through. Unknown senders
-          land in the agent loop's pending hook with ``actor=None``
-          and get a templated "ждите подтверждения" reply.
-
-        Adapters that pre-filter inbound traffic before delegating to
-        ``_handle_message`` should call this instead of ``is_allowed``
-        directly, otherwise unknown senders are silently denied at
-        the channel layer and never reach the pending flow.
-        """
-        if actor is _ACTOR_UNRESOLVED:
-            msg = InboundMessage(
-                channel=self.name,
-                sender_id=str(sender_id),
-                chat_id=str(sender_id),
-                content="",
-            )
-            # Adapters that pre-filter before _handle_message still need the
-            # same actor resolution boundary as the main inbound path.
-            for enrich_inbound in self._inbound_enrichers:
-                await enrich_inbound(msg)
-            actor = msg.actor
-        return actor is not None and not self.is_allowed(sender_id)
-
     def is_allowed(self, sender_id: str) -> bool:
-        """Check if *sender_id* is permitted.  Empty list → deny all; ``"*"`` → allow all."""
+        """Check sender permission: star > allowlist > pairing store > deny."""
         if isinstance(self.config, dict):
-            if "allow_from" in self.config:
-                allow_list = self.config.get("allow_from")
-            else:
-                allow_list = self.config.get("allowFrom", [])
+            allow_list = self.config.get("allow_from") or self.config.get("allowFrom") or []
         else:
-            allow_list = getattr(self.config, "allow_from", [])
-        if not allow_list:
-            logger.warning("{}: allow_from is empty — all access denied", self.name)
-            return False
+            allow_list = getattr(self.config, "allow_from", None) or []
         if "*" in allow_list:
             return True
-        return str(sender_id) in allow_list
+        # allowFrom entries are opaque tokens — must match exactly.
+        if str(sender_id) in allow_list:
+            return True
+        if is_approved(self.name, str(sender_id)):
+            return True
+        return False
 
     async def _handle_message(
         self,
@@ -246,18 +223,40 @@ class BaseChannel(ABC):
         media: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
+        is_dm: bool = False,
+        authorization_id: str | None = None,
     ) -> None:
-        """
-        Handle an incoming message from the chat platform.
+        """Handle a message after checking its authorization subject.
 
-        Forwards to the bus unless the sender is a known principal that
-        the operator has explicitly removed from ``allow_from``. Truly
-        unknown senders (no enrichment sets ``actor``) are
-        forwarded with ``actor=None`` so the agent loop's pending-
-        approval hook can register them and send the templated reply —
-        the channel-layer ``allow_from`` check is no longer the gate
-        for newcomers.
+        ``sender_id`` is the identity recorded on the inbound message.  Channels
+        where access is scoped to another entity (for example, a group or room)
+        can pass that entity as ``authorization_id`` without changing the
+        sender's identity.  When omitted, authorization remains sender-based.
         """
+        permission_id = authorization_id if authorization_id is not None else sender_id
+        if not self.is_allowed(permission_id):
+            if is_dm:
+                code = generate_code(self.name, str(sender_id))
+                await self.send(
+                    OutboundMessage(
+                        channel=self.name,
+                        chat_id=str(chat_id),
+                        content=format_pairing_reply(code),
+                        metadata={PAIRING_CODE_META_KEY: code},
+                    )
+                )
+                self.logger.info(
+                    "Sent pairing code {} to sender {} in chat {}",
+                    code, sender_id, chat_id,
+                )
+            else:
+                self.logger.warning(
+                    "Access denied for sender {}. "
+                    "Add them to allowFrom list in config to grant access.",
+                    sender_id,
+                )
+            return
+
         meta = metadata or {}
         if self.supports_streaming:
             meta = {**meta, "_wants_stream": True}
@@ -272,26 +271,22 @@ class BaseChannel(ABC):
             session_key_override=session_key,
         )
 
-        # Runtime adapters can resolve actors or attach metadata before the
-        # channel decides whether a known principal was removed from allow_from.
-        for enrich_inbound in self._inbound_enrichers:
-            await enrich_inbound(msg)
-
-        if await self.should_drop_inbound(sender_id, actor=msg.actor):
-            logger.warning(
-                "Access denied at channel level for {} on channel {} "
-                "(known principal removed from allow_from); "
-                "delete the identity in the runtime registry to fully revoke.",
-                sender_id, self.name,
-            )
-            return
-
         await self.bus.publish_inbound(msg)
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
         """Return default config for onboard. Override in plugins to auto-populate config.json."""
         return {"enabled": False}
+
+    @classmethod
+    def refresh_feature_metadata(
+        cls,
+        config_path: Path,
+        *,
+        instance_id: str = "default",
+    ) -> bool:
+        """Refresh persisted display metadata after an explicit settings action."""
+        return False
 
     @property
     def is_running(self) -> bool:

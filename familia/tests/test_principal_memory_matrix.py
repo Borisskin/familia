@@ -487,3 +487,36 @@ def test_memory_get_private_missing_target_is_denied(monkeypatch):
         )
     )
     assert result.startswith("(no value stored")
+
+
+def test_profile_snapshot_rejects_record_missing_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from familia.acl import principal_memory
+
+    class Client:
+        async def __aenter__(self) -> "Client":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, *_args: Any, **_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                status_code=200,
+                json=lambda: {"ts": 1.0, "extra": True},
+            )
+
+    monkeypatch.setattr(
+        principal_memory.httpx,
+        "AsyncClient",
+        lambda **_kwargs: Client(),
+    )
+
+    with pytest.raises(principal_memory.GraphIOError, match="invalid record"):
+        asyncio.run(
+            principal_memory.PrincipalMemoryClient(
+                "alice",
+                "alice-key",
+            ).get_profile_snapshot()
+        )

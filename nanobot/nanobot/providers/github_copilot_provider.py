@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 import time
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
 
 import httpx
 from oauth_cli_kit.models import OAuthToken
@@ -28,7 +31,13 @@ _EXPIRY_SKEW_SECONDS = 60
 _LONG_LIVED_TOKEN_SECONDS = 315360000
 
 
-def _storage() -> FileTokenStorage:
+def _resolve(env_var: str, default: str) -> str:
+    """Allow GitHub Enterprise / Copilot for Business deployments to override defaults via env."""
+    value = os.environ.get(env_var)
+    return value.strip() if value and value.strip() else default
+
+
+def get_storage() -> FileTokenStorage:
     return FileTokenStorage(
         token_filename=TOKEN_FILENAME,
         app_name=TOKEN_APP_NAME,
@@ -47,7 +56,7 @@ def _copilot_headers(token: str) -> dict[str, str]:
 
 
 def _load_github_token() -> OAuthToken | None:
-    token = _storage().load()
+    token = get_storage().load()
     if not token or not token.access:
         return None
     return token
@@ -67,11 +76,16 @@ def login_github_copilot(
     printer = print_fn or print
     timeout = httpx.Timeout(20.0, connect=20.0)
 
+    client_id = _resolve("NANOBOT_GITHUB_COPILOT_CLIENT_ID", GITHUB_COPILOT_CLIENT_ID)
+    device_code_url = _resolve("NANOBOT_GITHUB_DEVICE_CODE_URL", DEFAULT_GITHUB_DEVICE_CODE_URL)
+    access_token_url = _resolve("NANOBOT_GITHUB_ACCESS_TOKEN_URL", DEFAULT_GITHUB_ACCESS_TOKEN_URL)
+    user_url = _resolve("NANOBOT_GITHUB_USER_URL", DEFAULT_GITHUB_USER_URL)
+
     with httpx.Client(timeout=timeout, follow_redirects=True, trust_env=True) as client:
         response = client.post(
-            DEFAULT_GITHUB_DEVICE_CODE_URL,
+            device_code_url,
             headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-            data={"client_id": GITHUB_COPILOT_CLIENT_ID, "scope": GITHUB_COPILOT_SCOPE},
+            data={"client_id": client_id, "scope": GITHUB_COPILOT_SCOPE},
         )
         response.raise_for_status()
         payload = response.json()
@@ -86,10 +100,8 @@ def login_github_copilot(
         printer(f"Open: {verify_url}")
         printer(f"Code: {user_code}")
         if verify_complete:
-            try:
+            with suppress(Exception):
                 webbrowser.open(verify_complete)
-            except Exception:
-                pass
 
         deadline = time.time() + expires_in
         current_interval = interval
@@ -97,10 +109,10 @@ def login_github_copilot(
         token_expires_in = _LONG_LIVED_TOKEN_SECONDS
         while time.time() < deadline:
             poll = client.post(
-                DEFAULT_GITHUB_ACCESS_TOKEN_URL,
+                access_token_url,
                 headers={"Accept": "application/json", "User-Agent": USER_AGENT},
                 data={
-                    "client_id": GITHUB_COPILOT_CLIENT_ID,
+                    "client_id": client_id,
                     "device_code": device_code,
                     "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                 },
@@ -133,7 +145,7 @@ def login_github_copilot(
             raise RuntimeError("GitHub device flow timed out.")
 
         user = client.get(
-            DEFAULT_GITHUB_USER_URL,
+            user_url,
             headers={
                 "Authorization": f"Bearer {access_token}",
                 "Accept": "application/vnd.github+json",
@@ -151,7 +163,7 @@ def login_github_copilot(
         expires=expires_ms,
         account_id=str(account_id) if account_id else None,
     )
-    _storage().save(token)
+    get_storage().save(token)
     return token
 
 
@@ -163,9 +175,10 @@ class GitHubCopilotProvider(OpenAICompatProvider):
 
         self._copilot_access_token: str | None = None
         self._copilot_expires_at: float = 0.0
+        self._copilot_token_lock: asyncio.Lock = asyncio.Lock()
         super().__init__(
             api_key="no-key",
-            api_base=DEFAULT_COPILOT_BASE_URL,
+            api_base=_resolve("NANOBOT_COPILOT_BASE_URL", DEFAULT_COPILOT_BASE_URL),
             default_model=default_model,
             extra_headers={
                 "Editor-Version": EDITOR_VERSION,
@@ -180,36 +193,46 @@ class GitHubCopilotProvider(OpenAICompatProvider):
         if self._copilot_access_token and now < self._copilot_expires_at - _EXPIRY_SKEW_SECONDS:
             return self._copilot_access_token
 
-        github_token = _load_github_token()
-        if not github_token or not github_token.access:
-            raise RuntimeError("GitHub Copilot is not logged in. Run: nanobot provider login github-copilot")
+        async with self._copilot_token_lock:
+            # Re-check after acquiring the lock: another task may have refreshed
+            # the token while we were waiting.
+            now = time.time()
+            if self._copilot_access_token and now < self._copilot_expires_at - _EXPIRY_SKEW_SECONDS:
+                return self._copilot_access_token
 
-        timeout = httpx.Timeout(20.0, connect=20.0)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, trust_env=True) as client:
-            response = await client.get(
-                DEFAULT_COPILOT_TOKEN_URL,
-                headers=_copilot_headers(github_token.access),
-            )
-            response.raise_for_status()
-            payload = response.json()
+            github_token = _load_github_token()
+            if not github_token or not github_token.access:
+                raise RuntimeError(
+                    "GitHub Copilot is not logged in. Run: nanobot provider login github-copilot"
+                )
 
-        token = payload.get("token")
-        if not token:
-            raise RuntimeError("GitHub Copilot token exchange returned no token.")
+            timeout = httpx.Timeout(20.0, connect=20.0)
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, trust_env=True) as client:
+                response = await client.get(
+                    _resolve("NANOBOT_COPILOT_TOKEN_URL", DEFAULT_COPILOT_TOKEN_URL),
+                    headers=_copilot_headers(github_token.access),
+                )
+                response.raise_for_status()
+                payload = response.json()
 
-        expires_at = payload.get("expires_at")
-        if isinstance(expires_at, (int, float)):
-            self._copilot_expires_at = float(expires_at)
-        else:
-            refresh_in = payload.get("refresh_in") or 1500
-            self._copilot_expires_at = time.time() + int(refresh_in)
-        self._copilot_access_token = str(token)
-        return self._copilot_access_token
+            token = payload.get("token")
+            if not token:
+                raise RuntimeError("GitHub Copilot token exchange returned no token.")
+
+            expires_at = payload.get("expires_at")
+            if isinstance(expires_at, (int, float)):
+                self._copilot_expires_at = float(expires_at)
+            else:
+                refresh_in = payload.get("refresh_in") or 1500
+                self._copilot_expires_at = time.time() + int(refresh_in)
+            self._copilot_access_token = str(token)
+            return self._copilot_access_token
 
     async def _refresh_client_api_key(self) -> str:
         token = await self._get_copilot_access_token()
+        client = await self._ensure_client()
         self.api_key = token
-        self._client.api_key = token
+        client.api_key = token
         return token
 
     async def chat(
@@ -243,6 +266,8 @@ class GitHubCopilotProvider(OpenAICompatProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, object] | None = None,
         on_content_delta: Callable[[str], None] | None = None,
+        on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_call_delta: Callable[[dict[str, object]], Awaitable[None]] | None = None,
     ):
         await self._refresh_client_api_key()
         return await super().chat_stream(
@@ -254,4 +279,6 @@ class GitHubCopilotProvider(OpenAICompatProvider):
             reasoning_effort=reasoning_effort,
             tool_choice=tool_choice,
             on_content_delta=on_content_delta,
+            on_thinking_delta=on_thinking_delta,
+            on_tool_call_delta=on_tool_call_delta,
         )

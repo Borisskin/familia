@@ -42,7 +42,7 @@ class TestMessageToolSuppressLogic:
         if isinstance(mt, MessageTool):
             mt.set_send_callback(AsyncMock(side_effect=lambda m: sent.append(m)))
 
-        msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Send", actor="test_actor")
+        msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Send")
         result = await loop._process_message(msg)
 
         assert len(sent) == 1
@@ -67,7 +67,7 @@ class TestMessageToolSuppressLogic:
         if isinstance(mt, MessageTool):
             mt.set_send_callback(AsyncMock(side_effect=lambda m: sent.append(m)))
 
-        msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Send email", actor="test_actor")
+        msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Send email")
         result = await loop._process_message(msg)
 
         assert len(sent) == 1
@@ -81,7 +81,7 @@ class TestMessageToolSuppressLogic:
         loop.provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Hello!", tool_calls=[]))
         loop.tools.get_definitions = MagicMock(return_value=[])
 
-        msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Hi", actor="test_actor")
+        msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Hi")
         result = await loop._process_message(msg)
 
         assert result is not None
@@ -113,10 +113,10 @@ class TestMessageToolSuppressLogic:
 
         pending_queue = asyncio.Queue()
         await pending_queue.put(
-            InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="follow-up", actor="test_actor")
+            InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="follow-up")
         )
 
-        msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Start", actor="test_actor")
+        msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Start")
         result = await loop._process_message(msg, pending_queue=pending_queue)
 
         assert len(sent) == 1
@@ -144,7 +144,9 @@ class TestMessageToolSuppressLogic:
         async def on_progress(content: str, *, tool_hint: bool = False) -> None:
             progress.append((content, tool_hint))
 
-        final_content, _, _, _, _ = await loop._run_agent_loop([], on_progress=on_progress)
+        final_content, _, _, _, _ = await loop._run_agent_loop(
+            [], runtime=loop.llm_runtime(), on_progress=on_progress
+        )
 
         assert final_content == "Done"
         assert progress == [
@@ -152,18 +154,29 @@ class TestMessageToolSuppressLogic:
             ('read foo.txt', True),
         ]
 
-
 class TestMessageToolTurnTracking:
 
     def test_sent_in_turn_tracks_same_target(self) -> None:
         tool = MessageTool()
-        tool.set_context("feishu", "chat1")
-        assert not tool._sent_in_turn
-        tool._sent_in_turn = True
-        assert tool._sent_in_turn
+        from nanobot.agent.tools.context import RequestContext, request_context
+
+        with request_context(RequestContext(channel="feishu", chat_id="chat1")):
+            assert not tool._sent_in_turn
+            tool._sent_in_turn = True
+            assert tool._sent_in_turn
 
     def test_start_turn_resets(self) -> None:
         tool = MessageTool()
         tool._sent_in_turn = True
         tool.start_turn()
         assert not tool._sent_in_turn
+
+    def test_schema_discourages_current_chat_replies(self) -> None:
+        tool = MessageTool()
+
+        assert "Do not use this for the normal reply in the current chat" in tool.description
+        assert "generate_image creates images in the current chat" in tool.description
+        assert (
+            "Do not use this for a normal reply in the current chat"
+            in tool.parameters["properties"]["content"]["description"]
+        )

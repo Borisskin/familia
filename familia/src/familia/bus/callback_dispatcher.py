@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from dataclasses import replace
 from typing import Any
 
 from loguru import logger
@@ -34,8 +35,17 @@ from nanobot.bus.events import CallbackEvent, InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 
 from familia import audit, pending_asks
-from familia.policy import get_pending_store
-from familia.principals import actor_display, resolve_identity
+from familia.policy import gate_outbound_send, get_pending_store
+from familia.principals import (
+    actor_display,
+    get_current_actor,
+    get_current_channel,
+    get_registry,
+    resolve_actor,
+    resolve_identity,
+    set_current_actor,
+    set_current_channel,
+)
 
 
 def _owner_actor() -> str:
@@ -113,13 +123,45 @@ class CallbackDispatcher:
                 )
 
     async def _handle(self, evt: CallbackEvent) -> None:
+        # Callback identity is resolved from the server-side channel mapping;
+        # an actor supplied by an adapter is only accepted when it agrees.
+        resolved_actor = resolve_actor(evt.channel, str(evt.sender_id))
+        if resolved_actor is None or (
+            evt.actor is not None and evt.actor != resolved_actor
+        ):
+            audit.log_event(
+                "callback_identity_denied",
+                channel=evt.channel,
+                chat_id=evt.chat_id,
+                sender_id=evt.sender_id,
+                supplied_actor=evt.actor,
+            )
+            return
+        evt = replace(evt, actor=resolved_actor)
+
         cid = (evt.metadata or {}).get("correlation_id")
         if isinstance(cid, str) and cid:
-            ask = pending_asks.pop(cid)
+            ask, found = pending_asks.take_for_callback(
+                cid,
+                actor=evt.actor,
+                channel=evt.channel,
+                chat_id=evt.chat_id,
+            )
             if ask is not None:
                 if ask.watchdog is not None:
                     ask.watchdog.cancel()
                 await self._deliver_ask_answer(ask, evt)
+                return
+            if found:
+                audit.log_event(
+                    "ask_callback_denied",
+                    cid=cid,
+                    attempted_by=evt.actor,
+                    channel=evt.channel,
+                    chat_id=evt.chat_id,
+                )
+                # Foreign and ambiguous legacy callbacks must not fall
+                # through as arbitrary agent input.
                 return
 
         payload_str = _format_payload(evt.payload)
@@ -209,8 +251,8 @@ class CallbackDispatcher:
     ) -> None:
         """Close the approval loop for an approve:/reject: button press."""
         store = get_pending_store()
-        pending = store.peek(token)
-        if pending is None:
+        taken, take_status = store.take_if_authorized(token, evt.actor)
+        if take_status == "missing":
             audit.log_event(
                 "policy_expired",
                 token=token,
@@ -226,44 +268,36 @@ class CallbackDispatcher:
             # eventually pop the PendingAsk and notify the requester.
             return
 
-        if not pending.allows_approver(evt.actor):
-            approvers = ", ".join(pending.approvers) if pending.approvers else "—"
+        if take_status == "unauthorized":
             audit.log_event(
                 "policy_approve_denied",
                 token=token,
                 attempted_by=evt.actor,
-                approvers=list(pending.approvers),
             )
             await self._reply_to_approver(
                 evt,
-                f"Ты не в списке утверждающих (требуется: {approvers}).",
+                "У тебя нет актуальных полномочий: ты не в списке действующих утверждающих.",
             )
             return
 
-        taken = store.take(token)
         if taken is None:
-            audit.log_event(
-                "policy_expired",
-                token=token,
-                attempted_by=evt.actor,
-                verb=verb,
-            )
-            await self._reply_to_approver(
-                evt, f"Действие истекло до нажатия (токен {token})."
-            )
-            # peek-then-take race: PendingApproval expired between the
-            # two calls. `pending` (from peek) still holds the parked
-            # outbound; use it to pop the ask_principal correlation so
-            # the extended watchdog stops holding state.
-            ask_cid = _ask_cid_from_outbound(pending.outbound)
-            if ask_cid:
-                pending_asks.pop(ask_cid)
+            # Defensive guard for an impossible status/result combination.
             return
 
         target = f"{taken.outbound.channel}:{taken.outbound.chat_id}"
         if verb == "approve":
             try:
-                await self.bus.publish_outbound(taken.outbound)
+                result = await self._publish_gated(
+                    action=taken.action,
+                    outbound=taken.outbound,
+                    actor=taken.requester_actor,
+                    inbound_channel=evt.channel,
+                    inbound_chat_id=evt.chat_id,
+                    already_approved=True,
+                )
+                if result.kind != "allow":
+                    reason = result.reason or "политика отклонила отправку"
+                    raise RuntimeError(reason)
             # Publishing crosses the channel-adapter boundary.
             except Exception as exc:  # noqa: BLE001
                 logger.exception("approval publish failed")
@@ -326,17 +360,79 @@ class CallbackDispatcher:
 
     async def _reply_to_approver(self, evt: CallbackEvent, text: str) -> None:
         """Short confirmation back into the approver's chat."""
+        if not self._trusted_actor(evt.actor):
+            # Never send a verdict to an unverified callback sender.  VK (and
+            # other adapters) resolve the actor server-side; ``None`` is not a
+            # usable identity for an outbound action.
+            return
         try:
-            await self.bus.publish_outbound(
-                OutboundMessage(
+            await self._publish_gated(
+                # Feedback is a self-reply to the authenticated presser;
+                # keep it on the normal message policy's self-reply path.
+                action="message.send",
+                outbound=OutboundMessage(
                     channel=evt.channel,
                     chat_id=evt.chat_id,
                     content=text,
-                )
+                ),
+                actor=evt.actor,
+                inbound_channel=evt.channel,
+                inbound_chat_id=evt.chat_id,
             )
         # A reply failure must not undo the already recorded approval decision.
         except Exception:  # noqa: BLE001
             logger.exception("approval: failed to reply to approver")
+
+    @staticmethod
+    def _trusted_actor(actor: str | None) -> str | None:
+        if not isinstance(actor, str) or not actor.strip():
+            return None
+        try:
+            return actor if get_registry().get(actor) is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _publish_gated(
+        self,
+        *,
+        action: str,
+        outbound: OutboundMessage,
+        actor: str | None,
+        inbound_channel: str | None,
+        inbound_chat_id: str | None,
+        already_approved: bool = False,
+    ) -> Any:
+        """Run callback-generated delivery through the one policy gate.
+
+        ``MessageBus._publish_unchecked`` is the narrow queue boundary used by
+        the gate itself.  Falling back to ``publish_outbound`` keeps the
+        legacy fake bus/tests working; real 0.3.0 buses expose the unchecked
+        publisher so approval prompts and an approved payload cannot recurse
+        into their own confirmation request.
+        """
+        previous_actor = get_current_actor()
+        previous_channel = get_current_channel()
+        trusted_actor = self._trusted_actor(actor)
+        set_current_actor(trusted_actor)
+        set_current_channel(inbound_channel)
+        publisher = getattr(self.bus, "_publish_unchecked", None)
+        if not callable(publisher):
+            publisher = self.bus.publish_outbound
+        try:
+            result = await gate_outbound_send(
+                action=action,
+                outbound=outbound,
+                inbound_channel=inbound_channel,
+                inbound_chat_id=inbound_chat_id,
+                publish_outbound=publisher,
+                already_approved=already_approved,
+            )
+            if result.kind == "allow":
+                await publisher(outbound)
+            return result
+        finally:
+            set_current_actor(previous_actor)
+            set_current_channel(previous_channel)
 
     async def _notify_requester(
         self, taken: Any, *, approved: bool, approver: str | None

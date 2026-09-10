@@ -1,67 +1,132 @@
-"""Voice transcription providers (Yandex SpeechKit, Groq, OpenAI Whisper).
+"""Provider-specific voice transcription adapters.
 
-All three providers cap the per-request payload size — Yandex's
-short-audio endpoint is the most aggressive at 1 MB (~50-60 s of
-Opus), OpenAI Whisper and Groq both cap at 25 MB (~25-30 minutes).
-For clips over the cap we transparently split the file via ffmpeg
-stream-copy (no re-encoding), transcribe each segment, and concatenate
-the results. The split helper lives at module level so all three
-providers share it; each provider declares its own
-``MAX_PAYLOAD_BYTES`` and the segmenter sizes chunks accordingly.
-
-Without chunking, long voice messages on Telegram / VK ended up
-forwarded to the LLM as raw ``[voice: /path/...]`` strings (the
-channel adapter's fallback when transcription returns ""), and the
-model dutifully replied "I can't transcribe voice" while the audio
-file sat in ``media/`` unread. The chunking path keeps the user
-experience identical for clips of any length, paying for n round-trips
-to the STT provider instead of one.
+This module only knows how to call external transcription APIs such as Groq,
+OpenAI Whisper, Yandex SpeechKit, OpenRouter, Xiaomi MiMo ASR, and AssemblyAI. Product-level config fallback,
+WebUI upload validation, and channel integration live in
+``nanobot.audio.transcription``.
 """
 
-from __future__ import annotations
-
 import asyncio
+import base64
+import json
+import mimetypes
 import os
 import shutil
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import httpx
 from loguru import logger
 
-# ---------------------------------------------------------------------------
-# Shared chunking helper
-# ---------------------------------------------------------------------------
+_CHAT_COMPLETIONS_PATH = "chat/completions"
+_TRANSCRIPTIONS_PATH = "audio/transcriptions"
+_STEPFUN_ASR_PATH = "audio/asr/sse"
+_YANDEX_DEFAULT_API_URL = "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize"
+_YANDEX_MAX_PAYLOAD_BYTES = 900 * 1024
+_YANDEX_CHUNK_DURATION_S = 30
+_WHISPER_MAX_PAYLOAD_BYTES = 24 * 1024 * 1024
+_WHISPER_CHUNK_DURATION_S = 600
+_ASSEMBLYAI_DEFAULT_API_BASE = "https://api.assemblyai.com/v2"
+_ASSEMBLYAI_POLL_ATTEMPTS = 60
+_ASSEMBLYAI_POLL_INTERVAL_S = 2.0
+_AUDIO_MIME_OVERRIDES = {
+    ".m4a": "audio/mp4",
+    ".mpga": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".wav": "audio/wav",
+    ".weba": "audio/webm",
+    ".webm": "audio/webm",
+}
+_FORMAT_ALIASES = {
+    "oga": "ogg",
+    "opus": "ogg",
+    "mpga": "mp3",
+    "mpeg": "mp3",
+    "mp4": "m4a",
+}
+
+
+def _resolve_transcription_url(api_base: str | None, default_url: str) -> str:
+    """Resolve the full transcription endpoint URL.
+
+    Accepts either a chat-style base (e.g. ``https://api.groq.com/openai/v1``)
+    or a complete URL already ending in ``/audio/transcriptions``. A chat-style
+    base — the form users naturally copy from their LLM provider config — gets
+    the path appended instead of being POSTed verbatim and 404ing (#3637).
+    """
+    if not api_base:
+        return default_url
+    base = api_base.rstrip("/")
+    if base.endswith(_TRANSCRIPTIONS_PATH):
+        return base
+    return f"{base}/{_TRANSCRIPTIONS_PATH}"
+
+
+def _resolve_chat_completions_url(api_base: str | None, default_url: str) -> str:
+    """Resolve a chat-completions endpoint for ASR providers using chat payloads."""
+    if not api_base:
+        return default_url
+    base = api_base.rstrip("/")
+    if base.endswith(_CHAT_COMPLETIONS_PATH):
+        return base
+    return f"{base}/{_CHAT_COMPLETIONS_PATH}"
+
+
+def _resolve_api_path(api_base: str | None, default_base: str, path: str) -> str:
+    base = (api_base or default_base).rstrip("/")
+    return f"{base}/{path.lstrip('/')}"
+
+
+def _resolve_stepfun_asr_url(api_base: str | None) -> str:
+    base = (api_base or "https://api.stepfun.com/v1").rstrip("/")
+    if base.endswith(_STEPFUN_ASR_PATH):
+        return base
+    return f"{base}/{_STEPFUN_ASR_PATH}"
+
+
+def _audio_mime_type(path: Path) -> str:
+    return (
+        _AUDIO_MIME_OVERRIDES.get(path.suffix.lower())
+        or mimetypes.guess_type(path.name)[0]
+        or "application/octet-stream"
+    )
+
+
+def _audio_format(path: Path) -> str:
+    """Map an audio file's extension to an OpenRouter ``format`` value."""
+    ext = path.suffix.lstrip(".").lower()
+    return _FORMAT_ALIASES.get(ext, ext)
+
 
 async def probe_audio_duration_s(path: Path) -> float | None:
-    """Return the audio file's duration in seconds via ``ffprobe``.
-
-    None on failure — caller falls back to size-only routing. The
-    extra subprocess is ~30 ms on a typical VM, negligible compared
-    to the network round-trip we're about to make to the STT API.
-    """
+    """Return an audio duration from ffprobe, or ``None`` when unavailable."""
     if shutil.which("ffprobe") is None:
         return None
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        str(path),
-    ]
     try:
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         out, _ = await proc.communicate()
-    except Exception:  # noqa: BLE001 — best-effort
+    except Exception as exc:  # noqa: BLE001 - best-effort probe
+        logger.debug("ffprobe failed for {}: {}", path, exc)
         return None
     if proc.returncode != 0:
         return None
     try:
         return float(out.decode("utf-8", "replace").strip())
-    except ValueError:
+    except (TypeError, ValueError):
         return None
 
 
@@ -72,62 +137,40 @@ async def split_audio_with_ffmpeg(
     duration_s: int,
     log_prefix: str = "STT",
 ) -> list[Path] | None:
-    """Split an audio file into ``duration_s``-second segments via ffmpeg.
-
-    Returns the list of segment paths inside a fresh temp dir, or None
-    on failure. The caller is responsible for cleaning the parent
-    directory of any returned path (use ``segments[0].parent`` and
-    ``shutil.rmtree``).
-
-    The split uses ``-c copy`` so we don't re-encode — fast, lossless,
-    preserves the input codec (Opus stays Opus, MP3 stays MP3, etc.).
-    ``-reset_timestamps 1`` makes each segment start at granule 0 so
-    a strict decoder doesn't choke on continuation pages.
-
-    ``target_bytes`` is the per-chunk size budget. We don't truncate
-    on size directly (ffmpeg-segment splits by time only), but we log
-    a warning when a chunk exceeds the budget so the operator can
-    drop ``duration_s`` if they're seeing oversize segments
-    consistently. At Telegram's typical Opus bitrate ~17 KB/s, 30 s
-    ≈ 510 KB which sits comfortably under the strictest provider
-    (Yandex 1 MB).
-    """
+    """Split an oversized audio file into stream-copy segments."""
     if shutil.which("ffmpeg") is None:
-        logger.warning(
-            "{}: ffmpeg unavailable — cannot split audio. Install "
-            "ffmpeg in the gateway image to enable long-clip "
-            "transcription.",
-            log_prefix,
-        )
+        logger.warning("{}: ffmpeg unavailable; cannot split long audio", log_prefix)
         return None
 
     segdir = Path(tempfile.mkdtemp(prefix="stt_chunks_"))
     ext = path.suffix or ".ogg"
-    segment_pattern = str(segdir / f"seg_%05d{ext}")
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-y",
-        "-i", str(path),
-        "-f", "segment",
-        "-segment_time", str(duration_s),
-        "-reset_timestamps", "1",
-        "-c", "copy",
-        segment_pattern,
-    ]
+    pattern = str(segdir / f"seg_%05d{ext}")
     try:
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(path),
+            "-f",
+            "segment",
+            "-segment_time",
+            str(duration_s),
+            "-reset_timestamps",
+            "1",
+            "-c",
+            "copy",
+            pattern,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         _, err = await proc.communicate()
-    except Exception as exc:  # noqa: BLE001 — best-effort, keep diagnostic
+    except Exception as exc:  # noqa: BLE001 - provider returns an empty result on media errors
         logger.error("{}: ffmpeg launch failed: {}", log_prefix, exc)
         shutil.rmtree(segdir, ignore_errors=True)
         return None
-
     if proc.returncode != 0:
         logger.warning(
             "{}: ffmpeg split failed (rc={}): {}",
@@ -140,167 +183,619 @@ async def split_audio_with_ffmpeg(
 
     chunks = sorted(segdir.glob(f"seg_*{ext}"))
     if not chunks:
-        logger.warning(
-            "{}: ffmpeg produced no segments for {}", log_prefix, path,
-        )
+        logger.warning("{}: ffmpeg produced no segments for {}", log_prefix, path)
         shutil.rmtree(segdir, ignore_errors=True)
         return None
-
-    # Telemetry only — oversize chunks still go through (the provider
-    # will reject them and we'll log the actual error there).
-    oversize = [c for c in chunks if c.stat().st_size > target_bytes]
+    oversize = [chunk for chunk in chunks if chunk.stat().st_size > target_bytes]
     if oversize:
         logger.warning(
-            "{}: {}/{} segments exceed target {}B "
-            "(consider lowering segment_time)",
-            log_prefix, len(oversize), len(chunks), target_bytes,
+            "{}: {}/{} segments exceed target {}B",
+            log_prefix,
+            len(oversize),
+            len(chunks),
+            target_bytes,
         )
-    logger.info(
-        "{}: split {} into {} segments (target {}s, ~{}B each)",
-        log_prefix, path.name, len(chunks),
-        duration_s, target_bytes,
-    )
     return chunks
 
 
 def _cleanup_chunks(chunks: list[Path] | None) -> None:
-    """Delete the temp dir holding ``chunks`` (no-op on None / empty)."""
-    if not chunks:
-        return
-    parent = chunks[0].parent
-    shutil.rmtree(parent, ignore_errors=True)
+    if chunks:
+        shutil.rmtree(chunks[0].parent, ignore_errors=True)
 
 
-# ---------------------------------------------------------------------------
-# OpenAI Whisper
-# ---------------------------------------------------------------------------
+# Up to 3 retries (4 attempts total) with exponential backoff on transient
+# failures. Whisper endpoints occasionally return 502/503 under load, and
+# mobile-network transcription callers hit sporadic connect/read errors.
+# Without this, a voice message silently becomes the empty string.
+_MAX_RETRIES = 3
+_BACKOFF_S = (1.0, 2.0, 4.0)
+_RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+_RETRYABLE_EXCEPTIONS = (
+    httpx.TimeoutException,
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+)
 
-class OpenAITranscriptionProvider:
-    """Voice transcription via OpenAI's Whisper API.
 
-    OpenAI caps the file upload at 25 MB. At Telegram's typical Opus
-    bitrate that's ~25-30 minutes — most chats fit in one shot. For
-    longer clips the transcribe() call splits via ffmpeg.
+async def _request_json_with_retry(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    provider_label: str,
+    **kwargs: object,
+) -> dict[str, Any] | None:
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            request = getattr(client, method.lower(), None)
+            if request is None:
+                response = await client.request(method, url, **kwargs)
+            else:
+                response = await request(url, **kwargs)
+        except _RETRYABLE_EXCEPTIONS as e:
+            if attempt < _MAX_RETRIES:
+                logger.warning(
+                    "{} transcription transient error (attempt {}/{}): {}",
+                    provider_label,
+                    attempt + 1,
+                    _MAX_RETRIES + 1,
+                    e,
+                )
+                await asyncio.sleep(_BACKOFF_S[attempt])
+                continue
+            logger.exception(
+                "{} transcription error after {} attempts: {}",
+                provider_label,
+                _MAX_RETRIES + 1,
+                e,
+            )
+            return None
+        except Exception as e:
+            logger.exception("{} transcription error: {}", provider_label, e)
+            return None
+
+        if response.status_code in _RETRYABLE_STATUS and attempt < _MAX_RETRIES:
+            logger.warning(
+                "{} transcription transient HTTP {} (attempt {}/{})",
+                provider_label,
+                response.status_code,
+                attempt + 1,
+                _MAX_RETRIES + 1,
+            )
+            await asyncio.sleep(_BACKOFF_S[attempt])
+            continue
+
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            body = response.text.strip().replace("\n", " ")[:500]
+            logger.error(
+                "{} transcription HTTP {}{}{}",
+                provider_label,
+                response.status_code,
+                f" {response.reason_phrase}" if response.reason_phrase else "",
+                f": {body}" if body else "",
+            )
+            return None
+        except Exception as e:
+            logger.exception("{} transcription error: {}", provider_label, e)
+            return None
+
+        try:
+            payload = response.json()
+        except Exception as e:
+            logger.exception(
+                "{} transcription error: malformed response body: {}",
+                provider_label,
+                e,
+            )
+            return None
+        if not isinstance(payload, dict):
+            logger.error(
+                "{} transcription error: unexpected response shape: {!r}",
+                provider_label,
+                type(payload).__name__,
+            )
+            return None
+        return payload
+    return None
+
+
+async def _post_transcription_with_retry(
+    url: str,
+    *,
+    api_key: str | None,
+    path: Path,
+    model: str,
+    provider_label: str,
+    language: str | None = None,
+) -> str:
+    """POST an audio file for transcription, retrying on transient errors.
+
+    Retries on connect/read/timeout failures and on 408/429/5xx responses.
+    Other errors (including 4xx such as 401/403) return "" immediately — the
+    caller's config is wrong and retrying only wastes quota.
+
+    When ``language`` is provided, it is forwarded as the ``language``
+    multipart field on every attempt (the dict is rebuilt per attempt so the
+    same field is present on retries).
     """
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        logger.exception("{} transcription error: cannot read audio file: {}", provider_label, e)
+        return ""
+    headers = {"Authorization": f"Bearer {api_key}"}
 
-    # Real cap is 25 MB; aim for 24 MB so we don't lose to a margin
-    # rounding error at the boundary.
-    MAX_PAYLOAD_BYTES = 24 * 1024 * 1024
-    # OpenAI handles ~25 min in one call comfortably; 600 s segments
-    # leave headroom and limit per-chunk re-encode if we ever need it.
-    CHUNK_DURATION_S = 600
+    def build_request() -> dict[str, Any]:
+        files = {
+            "file": (path.name, data, _audio_mime_type(path)),
+            "model": (None, model),
+        }
+        if language:
+            files["language"] = (None, language)
+        return {"url": url, "headers": headers, "files": files, "timeout": 60.0}
+
+    return await _post_with_retry(build_request, provider_label, _text_from_transcription_payload)
+
+
+async def _post_yandex_transcription_with_retry(
+    url: str,
+    *,
+    api_key: str | None,
+    folder_id: str,
+    path: Path,
+    language: str,
+    audio_format: str,
+) -> str:
+    """POST raw audio to Yandex SpeechKit short-audio STT."""
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        logger.exception("Yandex transcription error: cannot read audio file: {}", exc)
+        return ""
+
+    params = {
+        "folderId": folder_id,
+        "lang": language,
+        "format": audio_format,
+    }
+    headers = {"Authorization": f"Api-Key {api_key}"}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
+        payload = await _request_json_with_retry(
+            client,
+            "POST",
+            url,
+            provider_label="Yandex",
+            headers=headers,
+            params=params,
+            content=data,
+            timeout=30.0,
+        )
+    if not payload:
+        return ""
+    if payload.get("error_code") or payload.get("error_message"):
+        logger.warning("Yandex STT error: {}", payload)
+        return ""
+    text = payload.get("result")
+    return text.strip() if isinstance(text, str) else ""
+
+
+async def _post_json_transcription_with_retry(
+    url: str,
+    *,
+    api_key: str | None,
+    path: Path,
+    model: str,
+    provider_label: str,
+    language: str | None = None,
+) -> str:
+    """POST base64 JSON audio for providers that do not accept multipart uploads."""
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        logger.exception("{} transcription error: cannot read audio file: {}", provider_label, e)
+        return ""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    def build_request() -> dict[str, Any]:
+        body: dict[str, object] = {
+            "model": model,
+            "input_audio": {
+                "data": base64.b64encode(data).decode(),
+                "format": _audio_format(path),
+            },
+        }
+        if language:
+            body["language"] = language
+        return {"url": url, "headers": headers, "json": body, "timeout": 60.0}
+
+    return await _post_with_retry(build_request, provider_label, _text_from_transcription_payload)
+
+
+async def _post_xiaomi_mimo_asr_with_retry(
+    url: str,
+    *,
+    api_key: str | None,
+    path: Path,
+    model: str,
+    provider_label: str,
+    language: str | None = None,
+) -> str:
+    """POST audio to Xiaomi MiMo ASR's chat-completions transcription API."""
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        logger.exception("{} transcription error: cannot read audio file: {}", provider_label, e)
+        return ""
+
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": (
+                                f"data:{_audio_mime_type(path)};base64,"
+                                f"{base64.b64encode(data).decode('ascii')}"
+                            ),
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    if language:
+        body["asr_options"] = {"language": language}
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    def build_request() -> dict[str, Any]:
+        return {"url": url, "headers": headers, "json": body, "timeout": 60.0}
+
+    return await _post_with_retry(build_request, provider_label, _text_from_chat_payload)
+
+
+async def _post_stepfun_asr_with_retry(
+    url: str,
+    *,
+    api_key: str | None,
+    path: Path,
+    model: str,
+    provider_label: str,
+    language: str | None = None,
+) -> str:
+    """POST audio to StepFun ASR SSE endpoint and collect final text."""
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        logger.exception("{} transcription error: cannot read audio file: {}", provider_label, e)
+        return ""
+
+    suffix = path.suffix.lstrip(".").lower()
+    audio_type = suffix if suffix in ("ogg", "mp3", "wav", "pcm") else "wav"
+
+    body: dict[str, Any] = {
+        "audio": {
+            "data": base64.b64encode(data).decode("ascii"),
+            "input": {
+                "transcription": {
+                    "model": model,
+                    "enable_itn": True,
+                },
+                "format": {"type": audio_type},
+            },
+        },
+    }
+    if language:
+        body["audio"]["input"]["transcription"]["language"] = language
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    }
+
+    async with httpx.AsyncClient() as client:
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                async with client.stream(
+                    "POST", url, headers=headers, json=body, timeout=60.0
+                ) as resp:
+                    if resp.status_code in _RETRYABLE_STATUS and attempt < _MAX_RETRIES:
+                        logger.warning(
+                            "{} transcription transient HTTP {} (attempt {}/{})",
+                            provider_label,
+                            resp.status_code,
+                            attempt + 1,
+                            _MAX_RETRIES + 1,
+                        )
+                        await asyncio.sleep(_BACKOFF_S[attempt])
+                        continue
+                    resp.raise_for_status()
+                    final_text = None
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        payload_str = line[len("data:") :].strip()
+                        if not payload_str:
+                            continue
+                        try:
+                            payload = json.loads(payload_str)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        event_type = payload.get("type", "")
+                        if event_type == "error":
+                            msg = payload.get("message", "unknown error")
+                            logger.error("{} ASR error: {}", provider_label, msg)
+                            return ""
+                        if event_type == "transcript.text.done":
+                            final_text = payload.get("text", "")
+                            break
+                    if final_text is not None:
+                        return final_text
+                    # Stream ended without a final event — retry if attempts remain
+                    if attempt < _MAX_RETRIES:
+                        logger.warning(
+                            "{} transcription: no final event (attempt {}/{})",
+                            provider_label,
+                            attempt + 1,
+                            _MAX_RETRIES + 1,
+                        )
+                        await asyncio.sleep(_BACKOFF_S[attempt])
+                        continue
+                    logger.error(
+                        "{} transcription: stream ended without final text after {} attempts",
+                        provider_label,
+                        _MAX_RETRIES + 1,
+                    )
+                    return ""
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in _RETRYABLE_STATUS and attempt < _MAX_RETRIES:
+                    await asyncio.sleep(_BACKOFF_S[attempt])
+                    continue
+                logger.error(
+                    "{} transcription HTTP {}{}",
+                    provider_label,
+                    e.response.status_code,
+                    f" {e.response.reason_phrase}" if e.response.reason_phrase else "",
+                )
+                return ""
+            except (httpx.RequestError, Exception):
+                if attempt < _MAX_RETRIES:
+                    await asyncio.sleep(_BACKOFF_S[attempt])
+                    continue
+                logger.exception("{} transcription request error", provider_label)
+                return ""
+    return ""
+
+
+async def _post_with_retry(
+    build_request: Callable[[], dict[str, Any]],
+    provider_label: str,
+    extract_text: Callable[[dict[str, Any]], str],
+) -> str:
+    async with httpx.AsyncClient() as client:
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                response = await client.post(**build_request())
+            except _RETRYABLE_EXCEPTIONS as e:
+                if attempt < _MAX_RETRIES:
+                    logger.warning(
+                        "{} transcription transient error (attempt {}/{}): {}",
+                        provider_label,
+                        attempt + 1,
+                        _MAX_RETRIES + 1,
+                        e,
+                    )
+                    await asyncio.sleep(_BACKOFF_S[attempt])
+                    continue
+                logger.exception(
+                    "{} transcription error after {} attempts: {}",
+                    provider_label,
+                    _MAX_RETRIES + 1,
+                    e,
+                )
+                return ""
+            except Exception as e:
+                logger.exception("{} transcription error: {}", provider_label, e)
+                return ""
+
+            if response.status_code in _RETRYABLE_STATUS and attempt < _MAX_RETRIES:
+                logger.warning(
+                    "{} transcription transient HTTP {} (attempt {}/{})",
+                    provider_label,
+                    response.status_code,
+                    attempt + 1,
+                    _MAX_RETRIES + 1,
+                )
+                await asyncio.sleep(_BACKOFF_S[attempt])
+                continue
+
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError:
+                body = response.text.strip().replace("\n", " ")[:500]
+                logger.error(
+                    "{} transcription HTTP {}{}{}",
+                    provider_label,
+                    response.status_code,
+                    f" {response.reason_phrase}" if response.reason_phrase else "",
+                    f": {body}" if body else "",
+                )
+                return ""
+            except Exception as e:
+                logger.exception("{} transcription error: {}", provider_label, e)
+                return ""
+
+            try:
+                payload = response.json()
+            except Exception as e:
+                logger.exception(
+                    "{} transcription error: malformed response body: {}",
+                    provider_label,
+                    e,
+                )
+                return ""
+            if not isinstance(payload, dict):
+                logger.error(
+                    "{} transcription error: unexpected response shape: {!r}",
+                    provider_label,
+                    type(payload).__name__,
+                )
+                return ""
+            return extract_text(payload)
+    return ""
+
+
+def _text_from_transcription_payload(payload: dict[str, Any]) -> str:
+    text = payload.get("text")
+    return text if isinstance(text, str) else ""
+
+
+def _text_from_chat_payload(payload: dict[str, Any]) -> str:
+    try:
+        text = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return ""
+    return text if isinstance(text, str) else ""
+
+
+def _assemblyai_speech_models(model: str | None) -> list[str]:
+    return [part for part in (part.strip() for part in (model or "").split(",")) if part]
+
+
+class AssemblyAITranscriptionProvider:
+    """Voice transcription provider using AssemblyAI's asynchronous REST API."""
 
     def __init__(
         self,
         api_key: str | None = None,
         api_base: str | None = None,
         language: str | None = None,
+        model: str | None = None,
     ):
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
-        self.api_url = (
-            api_base
-            or os.environ.get("OPENAI_TRANSCRIPTION_BASE_URL")
-            or "https://api.openai.com/v1/audio/transcriptions"
-        )
-        # Whisper takes a 2-letter ISO-639-1 hint via ``language``;
-        # ``None`` lets it auto-detect. Caller passes BCP-47 like
-        # ``ru-RU`` which we normalise to the leading subtag.
-        self.language = (language or os.environ.get("STT_LANG") or "").split("-")[0] or None
+        base = api_base or os.environ.get("ASSEMBLYAI_BASE_URL")
+        self.api_key = api_key or os.environ.get("ASSEMBLYAI_API_KEY")
+        self.upload_url = _resolve_api_path(base, _ASSEMBLYAI_DEFAULT_API_BASE, "upload")
+        self.transcript_url = _resolve_api_path(base, _ASSEMBLYAI_DEFAULT_API_BASE, "transcript")
+        self.language = language or None
+        self.model = model or "universal-3-pro,universal-2"
+        logger.debug("AssemblyAI transcription endpoint: {}", self.transcript_url)
 
     async def transcribe(self, file_path: str | Path) -> str:
         if not self.api_key:
-            logger.warning("OpenAI API key not configured for transcription")
+            logger.warning("AssemblyAI API key not configured for transcription")
             return ""
         path = Path(file_path)
         if not path.exists():
             logger.error("Audio file not found: {}", file_path)
             return ""
         try:
-            size = path.stat().st_size
+            data = path.read_bytes()
         except OSError as e:
-            logger.error("OpenAI STT: stat failed: {}", e)
+            logger.exception("AssemblyAI transcription error: cannot read audio file: {}", e)
             return ""
 
-        if size <= self.MAX_PAYLOAD_BYTES:
-            return await self._transcribe_one(path)
+        headers = {"Authorization": self.api_key}
+        async with httpx.AsyncClient() as client:
+            upload = await _request_json_with_retry(
+                client,
+                "POST",
+                self.upload_url,
+                provider_label="AssemblyAI",
+                headers={**headers, "Content-Type": "application/octet-stream"},
+                content=data,
+                timeout=60.0,
+            )
+            upload_url = upload.get("upload_url") if upload else None
+            if not isinstance(upload_url, str) or not upload_url:
+                logger.error("AssemblyAI transcription error: upload_url missing")
+                return ""
 
-        chunks = await split_audio_with_ffmpeg(
-            path,
-            target_bytes=self.MAX_PAYLOAD_BYTES,
-            duration_s=self.CHUNK_DURATION_S,
-            log_prefix="OpenAI STT",
-        )
-        if not chunks:
-            return ""
-        try:
-            parts: list[str] = []
-            for chunk in chunks:
-                text = await self._transcribe_one(chunk)
-                if text:
-                    parts.append(text)
-            return " ".join(parts).strip()
-        finally:
-            _cleanup_chunks(chunks)
+            body: dict[str, object] = {"audio_url": upload_url}
+            speech_models = _assemblyai_speech_models(self.model)
+            if speech_models:
+                body["speech_models"] = speech_models
+            if self.language:
+                body["language_code"] = self.language
 
-    async def _transcribe_one(self, path: Path) -> str:
-        try:
-            async with httpx.AsyncClient() as client:
-                with open(path, "rb") as f:
-                    files = {
-                        "file": (path.name, f),
-                        "model": (None, "whisper-1"),
-                    }
-                    if self.language:
-                        files["language"] = (None, self.language)
-                    headers = {"Authorization": f"Bearer {self.api_key}"}
-                    response = await client.post(
-                        self.api_url, headers=headers, files=files, timeout=60.0,
+            transcript = await _request_json_with_retry(
+                client,
+                "POST",
+                self.transcript_url,
+                provider_label="AssemblyAI",
+                headers=headers,
+                json=body,
+                timeout=30.0,
+            )
+            transcript_id = transcript.get("id") if transcript else None
+            if not isinstance(transcript_id, str) or not transcript_id:
+                logger.error("AssemblyAI transcription error: transcript id missing")
+                return ""
+
+            poll_url = f"{self.transcript_url.rstrip('/')}/{transcript_id}"
+            for attempt in range(_ASSEMBLYAI_POLL_ATTEMPTS):
+                payload = await _request_json_with_retry(
+                    client,
+                    "GET",
+                    poll_url,
+                    provider_label="AssemblyAI",
+                    headers=headers,
+                    timeout=30.0,
+                )
+                if not payload:
+                    return ""
+                status = str(payload.get("status") or "").lower()
+                if status == "completed":
+                    text = payload.get("text")
+                    return text if isinstance(text, str) else ""
+                if status in {"error", "failed"}:
+                    logger.error(
+                        "AssemblyAI transcription failed: {}",
+                        payload.get("error") or payload,
                     )
-                    response.raise_for_status()
-                    return (response.json().get("text") or "").strip()
-        except Exception as e:
-            logger.error("OpenAI transcription error: {}", e)
+                    return ""
+                if attempt < _ASSEMBLYAI_POLL_ATTEMPTS - 1:
+                    await asyncio.sleep(_ASSEMBLYAI_POLL_INTERVAL_S)
+            logger.error("AssemblyAI transcription timed out while polling transcript")
             return ""
 
-
-# ---------------------------------------------------------------------------
-# Yandex SpeechKit (short-audio v1)
-# ---------------------------------------------------------------------------
 
 class YandexTranscriptionProvider:
-    """Voice transcription via Yandex Cloud SpeechKit (short-audio STT v1).
+    """Voice transcription via Yandex Cloud SpeechKit short-audio API."""
 
-    Requires an Api-Key and folder_id from Yandex Cloud. Input is sent
-    as raw bytes; ``oggopus`` is the native VK / Telegram voice format
-    so no conversion is needed for chat audio.
-
-    Yandex's short-audio endpoint refuses payloads >1 MB
-    (``BAD_REQUEST: audio should be less than 1 mb``) — at Telegram's
-    typical Opus bitrate that's ~50-60 seconds. Long clips get split
-    via the shared ``split_audio_with_ffmpeg`` helper.
-    """
-
-    DEFAULT_URL = "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize"
-
-    # Aim well below the 1 MB cap so a chunk landing exactly on the
-    # boundary doesn't waste a round-trip on BAD_REQUEST.
-    MAX_PAYLOAD_BYTES = 900 * 1024
-    # ~30 s ≈ 500 KB at Telegram bitrate, comfortably under cap.
-    CHUNK_DURATION_S = 30
+    MAX_PAYLOAD_BYTES = _YANDEX_MAX_PAYLOAD_BYTES
+    CHUNK_DURATION_S = _YANDEX_CHUNK_DURATION_S
+    DEFAULT_URL = _YANDEX_DEFAULT_API_URL
 
     def __init__(
         self,
         api_key: str | None = None,
-        folder_id: str | None = None,
         api_base: str | None = None,
+        language: str | None = None,
+        model: str | None = None,
+        *,
+        folder_id: str | None = None,
         lang: str | None = None,
         audio_format: str = "oggopus",
     ):
         self.api_key = api_key or os.environ.get("YANDEX_API_KEY")
         self.folder_id = folder_id or os.environ.get("YC_FOLDER_ID")
         self.api_url = api_base or os.environ.get("YANDEX_STT_URL") or self.DEFAULT_URL
-        self.lang = lang or os.environ.get("STT_LANG") or "ru-RU"
+        self.language = language or lang or os.environ.get("STT_LANG") or "ru-RU"
         self.audio_format = audio_format
+        self.model = model or ""
 
     async def transcribe(self, file_path: str | Path) -> str:
         if not self.api_key or not self.folder_id:
@@ -312,22 +807,23 @@ class YandexTranscriptionProvider:
             return ""
         try:
             size = path.stat().st_size
-        except OSError as e:
-            logger.error("Yandex STT: stat failed: {}", e)
+        except OSError as exc:
+            logger.error("Yandex STT: stat failed: {}", exc)
             return ""
 
-        # Yandex enforces TWO independent limits: 1 MB payload AND 30 s
-        # duration. A low-bitrate Opus voice (e.g. 124 s @ ~5 KB/s in
-        # Spanish) easily fits the byte cap but trips the duration
-        # check — server replies BAD_REQUEST without ever decoding the
-        # audio. Probe duration up-front and force a split when EITHER
-        # limit would be exceeded.
         duration = await probe_audio_duration_s(path)
         needs_split = size > self.MAX_PAYLOAD_BYTES or (
             duration is not None and duration > self.CHUNK_DURATION_S
         )
         if not needs_split:
-            return await self._transcribe_bytes(path.read_bytes())
+            return await _post_yandex_transcription_with_retry(
+                self.api_url,
+                api_key=self.api_key,
+                folder_id=self.folder_id,
+                path=path,
+                language=self.language,
+                audio_format=self.audio_format,
+            )
 
         chunks = await split_audio_with_ffmpeg(
             path,
@@ -340,125 +836,227 @@ class YandexTranscriptionProvider:
         try:
             parts: list[str] = []
             for chunk in chunks:
-                # Hard-skip a segment Yandex would reject anyway —
-                # logged in split helper but not enforced there.
-                if chunk.stat().st_size > self.MAX_PAYLOAD_BYTES:
+                try:
+                    if chunk.stat().st_size > self.MAX_PAYLOAD_BYTES:
+                        continue
+                except OSError:
                     continue
-                text = await self._transcribe_bytes(chunk.read_bytes())
+                text = await _post_yandex_transcription_with_retry(
+                    self.api_url,
+                    api_key=self.api_key,
+                    folder_id=self.folder_id,
+                    path=chunk,
+                    language=self.language,
+                    audio_format=self.audio_format,
+                )
                 if text:
                     parts.append(text)
             return " ".join(parts).strip()
         finally:
             _cleanup_chunks(chunks)
 
-    async def _transcribe_bytes(self, audio: bytes) -> str:
-        try:
-            params = {
-                "folderId": self.folder_id,
-                "lang": self.lang,
-                "format": self.audio_format,
-            }
-            headers = {"Authorization": f"Api-Key {self.api_key}"}
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(30.0, connect=10.0),
-            ) as client:
-                r = await client.post(
-                    self.api_url, params=params, headers=headers, content=audio,
-                )
-            data = r.json()
-            if "error_code" in data or "error_message" in data:
-                logger.warning("Yandex STT error: {}", data)
-                return ""
-            return (data.get("result") or "").strip()
-        except Exception as e:
-            logger.error("Yandex transcription error: {}", e)
-            return ""
 
-
-# ---------------------------------------------------------------------------
-# Groq Whisper
-# ---------------------------------------------------------------------------
-
-class GroqTranscriptionProvider:
-    """Voice transcription via Groq's Whisper API.
-
-    Groq offers fast Whisper with the same 25 MB upload cap as OpenAI.
-    Long clips get split via the shared ffmpeg helper.
-    """
-
-    MAX_PAYLOAD_BYTES = 24 * 1024 * 1024
-    CHUNK_DURATION_S = 600
+class OpenAITranscriptionProvider:
+    """Voice transcription provider using OpenAI's Whisper API."""
 
     def __init__(
         self,
         api_key: str | None = None,
         api_base: str | None = None,
         language: str | None = None,
+        model: str | None = None,
     ):
-        self.api_key = api_key or os.environ.get("GROQ_API_KEY")
-        self.api_url = (
-            api_base
-            or os.environ.get("GROQ_BASE_URL")
-            or "https://api.groq.com/openai/v1/audio/transcriptions"
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        self.api_url = _resolve_transcription_url(
+            api_base or os.environ.get("OPENAI_TRANSCRIPTION_BASE_URL"),
+            "https://api.openai.com/v1/audio/transcriptions",
         )
-        # Whisper takes a 2-letter ISO-639-1 hint via ``language``; we
-        # accept BCP-47 (``ru-RU``) and strip to the leading subtag.
-        self.language = (language or os.environ.get("STT_LANG") or "").split("-")[0] or None
+        self.language = language or None
+        self.model = model or "whisper-1"
+        logger.debug("OpenAI transcription endpoint: {}", self.api_url)
 
     async def transcribe(self, file_path: str | Path) -> str:
         if not self.api_key:
-            logger.warning("Groq API key not configured for transcription")
+            logger.warning("OpenAI API key not configured for transcription")
             return ""
         path = Path(file_path)
         if not path.exists():
             logger.error("Audio file not found: {}", file_path)
             return ""
-        try:
-            size = path.stat().st_size
-        except OSError as e:
-            logger.error("Groq STT: stat failed: {}", e)
-            return ""
-
-        if size <= self.MAX_PAYLOAD_BYTES:
-            return await self._transcribe_one(path)
-
-        chunks = await split_audio_with_ffmpeg(
-            path,
-            target_bytes=self.MAX_PAYLOAD_BYTES,
-            duration_s=self.CHUNK_DURATION_S,
-            log_prefix="Groq STT",
+        return await _post_transcription_with_retry(
+            self.api_url,
+            api_key=self.api_key,
+            path=path,
+            model=self.model,
+            provider_label="OpenAI",
+            language=self.language,
         )
-        if not chunks:
-            return ""
-        try:
-            parts: list[str] = []
-            for chunk in chunks:
-                text = await self._transcribe_one(chunk)
-                if text:
-                    parts.append(text)
-            return " ".join(parts).strip()
-        finally:
-            _cleanup_chunks(chunks)
 
-    async def _transcribe_one(self, path: Path) -> str:
-        try:
-            async with httpx.AsyncClient() as client:
-                with open(path, "rb") as f:
-                    files = {
-                        "file": (path.name, f),
-                        "model": (None, "whisper-large-v3"),
-                    }
-                    if self.language:
-                        files["language"] = (None, self.language)
-                    headers = {"Authorization": f"Bearer {self.api_key}"}
-                    response = await client.post(
-                        self.api_url,
-                        headers=headers,
-                        files=files,
-                        timeout=60.0,
-                    )
-                    response.raise_for_status()
-                    return (response.json().get("text") or "").strip()
-        except Exception as e:
-            logger.error("Groq transcription error: {}", e)
+
+class GroqTranscriptionProvider:
+    """
+    Voice transcription provider using Groq's Whisper API.
+
+    Groq offers extremely fast transcription with a generous free tier.
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        api_base: str | None = None,
+        language: str | None = None,
+        model: str | None = None,
+    ):
+        self.api_key = api_key or os.environ.get("GROQ_API_KEY")
+        self.api_url = _resolve_transcription_url(
+            api_base or os.environ.get("GROQ_BASE_URL"),
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+        )
+        self.language = language or None
+        self.model = model or "whisper-large-v3"
+        logger.debug("Groq transcription endpoint: {}", self.api_url)
+
+    async def transcribe(self, file_path: str | Path) -> str:
+        """
+        Transcribe an audio file using Groq.
+
+        Args:
+            file_path: Path to the audio file.
+
+        Returns:
+            Transcribed text.
+        """
+        if not self.api_key:
+            logger.warning("Groq API key not configured for transcription")
             return ""
+
+        path = Path(file_path)
+        if not path.exists():
+            logger.error("Audio file not found: {}", file_path)
+            return ""
+
+        return await _post_transcription_with_retry(
+            self.api_url,
+            api_key=self.api_key,
+            path=path,
+            model=self.model,
+            provider_label="Groq",
+            language=self.language,
+        )
+
+
+class OpenRouterTranscriptionProvider:
+    """Voice transcription provider using OpenRouter's speech-to-text endpoint."""
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        api_base: str | None = None,
+        language: str | None = None,
+        model: str | None = None,
+    ):
+        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        self.api_url = _resolve_transcription_url(
+            api_base or os.environ.get("OPENROUTER_BASE_URL"),
+            "https://openrouter.ai/api/v1/audio/transcriptions",
+        )
+        self.language = language or None
+        self.model = model or "openai/whisper-1"
+        logger.debug("OpenRouter transcription endpoint: {}", self.api_url)
+
+    async def transcribe(self, file_path: str | Path) -> str:
+        if not self.api_key:
+            logger.warning("OpenRouter API key not configured for transcription")
+            return ""
+
+        path = Path(file_path)
+        if not path.exists():
+            logger.error("Audio file not found: {}", file_path)
+            return ""
+
+        return await _post_json_transcription_with_retry(
+            self.api_url,
+            api_key=self.api_key,
+            path=path,
+            model=self.model,
+            provider_label="OpenRouter",
+            language=self.language,
+        )
+
+
+class XiaomiMiMoTranscriptionProvider:
+    """Voice transcription provider using Xiaomi MiMo ASR."""
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        api_base: str | None = None,
+        language: str | None = None,
+        model: str | None = None,
+    ):
+        self.api_key = api_key or os.environ.get("MIMO_API_KEY")
+        self.api_url = _resolve_chat_completions_url(
+            api_base or os.environ.get("MIMO_API_BASE"),
+            "https://api.xiaomimimo.com/v1/chat/completions",
+        )
+        self.language = language or None
+        self.model = model or "mimo-v2.5-asr"
+        logger.debug("Xiaomi MiMo transcription endpoint: {}", self.api_url)
+
+    async def transcribe(self, file_path: str | Path) -> str:
+        if not self.api_key:
+            logger.warning("Xiaomi MiMo API key not configured for transcription")
+            return ""
+
+        path = Path(file_path)
+        if not path.exists():
+            logger.error("Audio file not found: {}", file_path)
+            return ""
+
+        return await _post_xiaomi_mimo_asr_with_retry(
+            self.api_url,
+            api_key=self.api_key,
+            path=path,
+            model=self.model,
+            provider_label="Xiaomi MiMo",
+            language=self.language,
+        )
+
+
+class StepFunTranscriptionProvider:
+    """Voice transcription provider using StepFun ASR SSE endpoint."""
+
+    _DEFAULT_URL = "https://api.stepfun.com/v1/audio/asr/sse"
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        api_base: str | None = None,
+        language: str | None = None,
+        model: str | None = None,
+    ):
+        self.api_key = api_key or os.environ.get("STEPFUN_API_KEY")
+        # api_base accepts either a StepFun base URL or the full SSE endpoint.
+        self.api_url = _resolve_stepfun_asr_url(api_base)
+        self.language = language or None
+        self.model = model or "stepaudio-2.5-asr"
+        logger.debug("StepFun transcription endpoint: {}", self.api_url)
+
+    async def transcribe(self, file_path: str | Path) -> str:
+        if not self.api_key:
+            logger.warning("StepFun API key not configured for transcription")
+            return ""
+
+        path = Path(file_path)
+        if not path.exists():
+            logger.error("Audio file not found: {}", file_path)
+            return ""
+
+        return await _post_stepfun_asr_with_retry(
+            self.api_url,
+            api_key=self.api_key,
+            path=path,
+            model=self.model,
+            provider_label="StepFun",
+            language=self.language,
+        )

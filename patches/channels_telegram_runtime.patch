@@ -1,0 +1,174 @@
+# nanobot baseline: 0.3.0
+# upstream commit: 3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec
+
+diff --git aa/nanobot/nanobot/channels/telegram/runtime.py bb/nanobot/nanobot/channels/telegram/runtime.py
+index 3a80207..ad5b585 100644
+--- aa/nanobot/nanobot/channels/telegram/runtime.py
++++ bb/nanobot/nanobot/channels/telegram/runtime.py
+@@ -25,7 +25,7 @@ from telegram.error import BadRequest, NetworkError, TimedOut
+ from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+ from telegram.request import HTTPXRequest
+ 
+-from nanobot.bus.events import OutboundMessage
++from nanobot.bus.events import CallbackEvent, OutboundMessage
+ from nanobot.bus.outbound_events import ProgressEvent
+ from nanobot.bus.queue import MessageBus
+ from nanobot.channels.base import BaseChannel
+@@ -42,6 +42,7 @@ TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
+ # boundary so the final rendered message never overflows.
+ TELEGRAM_HTML_MAX_LEN = 4096
+ TELEGRAM_REPLY_CONTEXT_MAX_LEN = TELEGRAM_MAX_MESSAGE_LEN  # Max length for reply context in user message
++_STRUCTURED_CALLBACK_PREFIX = "f1:"
+ 
+ 
+ def _split_telegram_markdown(content: str, max_len: int) -> list[str]:
+@@ -820,12 +821,19 @@ class TelegramChannel(BaseChannel):
+         # Send text content
+         if msg.content and msg.content != "[empty message]":
+             render_as_blockquote = bool(progress_event and progress_event.tool_hint)
++            keyboard_spec = (msg.metadata or {}).get("keyboard")
+             buttons = getattr(msg, "buttons", None) or []
+-            reply_markup = self._build_keyboard(buttons) if buttons else None
++            render_buttons = keyboard_spec if isinstance(keyboard_spec, dict) else buttons
++            rows = (
++                keyboard_spec.get("rows") or []
++                if isinstance(keyboard_spec, dict)
++                else buttons
++            )
++            reply_markup = self._build_keyboard(render_buttons) if rows else None
+             text = msg.content
+             # Fallback: no native keyboard → splice labels into the message so the choices survive.
+-            if buttons and reply_markup is None:
+-                text = f"{text}\n\n{self._buttons_as_text(buttons)}"
++            if rows and reply_markup is None:
++                text = f"{text}\n\n{self._buttons_as_text(rows)}"
+ 
+             # Bot API 10.1 rich fast-path: send raw markdown via sendRichMessage.
+             # All non-blockquote content tries rich first; _rich_send_disabled
+@@ -1677,14 +1685,51 @@ class TelegramChannel(BaseChannel):
+ 
+         return ""
+ 
+-    def _build_keyboard(self, buttons: list) -> InlineKeyboardMarkup | None:
++    def _build_keyboard(self, buttons: list | dict) -> InlineKeyboardMarkup | None:
+         """Build inline keyboard markup if inline_keyboards is enabled."""
+         if not buttons or not self.config.inline_keyboards:
+             return None
+-        keyboard = [
+-            [InlineKeyboardButton(label, callback_data=self._safe_callback_data(label)) for label in row]
+-            for row in buttons
+-        ]
++        spec = buttons if isinstance(buttons, dict) else {}
++        rows = spec.get("rows") if spec else buttons
++        if not isinstance(rows, list):
++            return None
++        correlation_id = spec.get("correlation_id")
++        keyboard: list[list[InlineKeyboardButton]] = []
++        for row in rows:
++            if not isinstance(row, list):
++                return None
++            rendered: list[InlineKeyboardButton] = []
++            for button in row:
++                if isinstance(button, dict):
++                    label = str(button.get("label") or "")
++                    link = button.get("link")
++                    payload = button.get("payload")
++                    if link:
++                        rendered.append(InlineKeyboardButton(label, url=str(link)))
++                        continue
++                    if payload is not None:
++                        payload_text = (
++                            payload if isinstance(payload, str) else str(payload)
++                        )
++                        callback_data = (
++                            f"{_STRUCTURED_CALLBACK_PREFIX}"
++                            f"{correlation_id or ''}|{payload_text}"
++                        )
++                        if len(callback_data.encode("utf-8")) > 64:
++                            self.logger.warning(
++                                "Telegram: structured callback is too long for {}",
++                                label,
++                            )
++                            return None
++                    else:
++                        callback_data = self._safe_callback_data(label)
++                else:
++                    label = str(button)
++                    callback_data = self._safe_callback_data(label)
++                rendered.append(
++                    InlineKeyboardButton(label, callback_data=callback_data)
++                )
++            keyboard.append(rendered)
+         return InlineKeyboardMarkup(keyboard)
+ 
+     @staticmethod
+@@ -1696,9 +1741,36 @@ class TelegramChannel(BaseChannel):
+         return encoded[:64].decode("utf-8", errors="ignore")
+ 
+     @staticmethod
+-    def _buttons_as_text(buttons: list[list[str]]) -> str:
++    def _buttons_as_text(buttons: list[list]) -> str:
+         # Buttons are semantic options; when we can't render a keyboard, the user still needs to see them.
+-        return "\n".join(" ".join(f"[{label}]" for label in row) for row in buttons if row)
++        return "\n".join(
++            " ".join(
++                f"[{button.get('label', '') if isinstance(button, dict) else button}]"
++                for button in row
++            )
++            for row in buttons
++            if row
++        )
++
++    @staticmethod
++    def _decode_structured_callback(data: str) -> tuple[str, str | None] | None:
++        if not data.startswith(_STRUCTURED_CALLBACK_PREFIX):
++            return None
++        correlation_id, separator, payload = data[
++            len(_STRUCTURED_CALLBACK_PREFIX):
++        ].partition("|")
++        if not separator:
++            return None
++        return payload, correlation_id or None
++
++    @staticmethod
++    def _callback_button_label(query: Any, data: str) -> str:
++        markup = getattr(getattr(query, "message", None), "reply_markup", None)
++        for row in getattr(markup, "inline_keyboard", ()) or ():
++            for button in row:
++                if getattr(button, "callback_data", None) == data:
++                    return str(getattr(button, "text", "") or "")
++        return ""
+ 
+     async def _on_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+         """Handle inline keyboard button clicks (callback queries)."""
+@@ -1714,11 +1786,29 @@ class TelegramChannel(BaseChannel):
+         if not self.is_allowed(sender_id):
+             return
+         button_label = query.data or ""
++        structured = self._decode_structured_callback(button_label)
++        pressed_label = self._callback_button_label(query, button_label)
+         await query.answer()
+         if query.message:
+             with suppress(Exception):
+                 await query.message.edit_reply_markup(reply_markup=None)
+         self.logger.debug("Inline button tap from {}: {}", sender_id, button_label)
++        if structured is not None:
++            payload, correlation_id = structured
++            await self.bus.publish_callback(
++                CallbackEvent(
++                    channel=self.name,
++                    sender_id=sender_id,
++                    chat_id=str(chat_id),
++                    payload=payload,
++                    metadata={
++                        "callback_query_id": query.id,
++                        "pressed_label": pressed_label,
++                        "correlation_id": correlation_id,
++                    },
++                )
++            )
++            return
+         self._start_typing(str(chat_id))
+         await self._handle_message(
+             sender_id=sender_id,
+

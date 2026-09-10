@@ -5,9 +5,9 @@ baseline to the current vendored nanobot tree in this repository.
 
 Baseline:
 
-- upstream version: `0.1.5.post2`;
+- upstream version: `0.3.0`;
 - upstream repo: sibling `../nanobot` next to this repository by default;
-- upstream commit: `950dddec499fbbe0353e997158c99808f0bb41e1`.
+- upstream commit: `3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec`.
 
 The upstream package layout is `nanobot/...`. This repository vendors the
 package under `nanobot/nanobot/...`, so patch paths are normalized to the
@@ -23,8 +23,8 @@ Optional overrides:
 
 ```bash
 UPSTREAM_REPO=../nanobot \
-UPSTREAM=950dddec499fbbe0353e997158c99808f0bb41e1 \
-UPSTREAM_VERSION=0.1.5.post2 \
+UPSTREAM=3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec \
+UPSTREAM_VERSION=0.3.0 \
 bash patches/regenerate.sh
 ```
 
@@ -58,13 +58,13 @@ Phase 10 must still do hunk-by-hunk review:
 
 ## Notable baseline deltas
 
-| Patch area | Meaning against `0.1.5.post2` |
+| Patch area | Meaning against `0.3.0` |
 | --- | --- |
-| `command___init__.patch` | Disables package-level slash-command re-exports while keeping upstream command implementation modules physically present. |
-| `runtime_adapters.patch` | Current familia tree adds neutral runtime adapter discovery for optional product wiring. |
-| `agent_outbound.patch`, `channels_inbound.patch`, `bus_callbacks.patch` | Current familia tree adds neutral extension point modules that are absent in upstream `0.1.5.post2`. |
-| `agent_context.patch`, `agent_loop.patch`, `agent_memory.patch`, `agent_tools_message.patch`, `channels_base.patch`, `cli_commands.patch` | Core behavioral deltas that need Phase 10 hunk-by-hunk audit. |
-| `pyproject.patch` | Fork/version/dependency delta against upstream `0.1.5.post2`; audit before changing package metadata. |
+| `agent___init__.patch`, `runtime_adapters.patch` | Current Familia tree keeps neutral runtime extension points without product imports. |
+| `agent_loop.patch`, `agent_memory.patch`, `session_manager.patch` | Core lifecycle, persistence, and identity deltas against nanobot `0.3.0`. |
+| `channels_telegram_runtime.patch`, `channels_manager.patch`, `channels_registry.patch` | Channel discovery and Telegram runtime integration remain explicit. |
+| `agent_tools_*.patch`, `audio_*.patch`, `security_workspace_access.patch` | Neutral tool, transcription, and workspace boundaries owned by Familia. |
+| `pyproject.patch` | Fork/version/dependency delta against upstream `0.3.0`; audit before changing package metadata. |
 
 `command_builtin.patch` records the synchronized `/new` archive-and-clear flow,
 save rollback, and the injected Dream restore policy in
