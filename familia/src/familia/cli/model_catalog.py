@@ -297,7 +297,7 @@ def _dynamic_chat_pair(name: str) -> tuple[Any, _ProviderMeta] | None:
         from nanobot.providers.registry import create_dynamic_spec
 
         spec = create_dynamic_spec(name)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
     return spec, _meta_from_spec(spec, kind="chat")
 
