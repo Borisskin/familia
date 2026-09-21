@@ -47,6 +47,13 @@ from familia.acl.schema import (
     ALLOWED_RELATIONS,
     TOPIC_KINDS,
 )
+from familia.cli.model_catalog import (
+    CatalogRequest,
+    CatalogSnapshot,
+    list_providers,
+    load_catalog,
+    provider_key_for_model,
+)
 
 FAMILY_KEY = "shared:family.graph"
 TOPICS_KEY = "shared:topics.graph"
@@ -63,14 +70,6 @@ POLL_CHANNEL_KINDS = frozenset({
     "telegram", "vk", "discord", "slack", "matrix",
     "email", "dingtalk", "feishu", "qq", "wecom", "mochat",
 })
-
-# Speech-to-Text providers we support. ``off`` and ``inherit`` are
-# control words used by the per-channel override (see ``channels set-stt``).
-# Only the names in ``STT_CRED_PROVIDERS`` actually own credentials in
-# config.providers — ``off`` and ``inherit`` are bookkeeping values.
-STT_CRED_PROVIDERS = frozenset({"groq", "openai", "yandex"})
-STT_PROVIDER_CHOICES = frozenset({"off", "inherit", *STT_CRED_PROVIDERS})
-
 
 # Mapping channel kind → import-name + pip-spec for runtime extras
 # install. Channels not listed here ship with no extras (use stdlib /
@@ -1464,6 +1463,26 @@ def build_parser() -> argparse.ArgumentParser:
                               help="health snapshot for admin dashboard")
     p_health.set_defaults(func=cmd_health)
 
+    # models ...  provider and selected-catalog JSON seam for admin clients
+    p_models = sub.add_parser("models", help="model provider catalogs")
+    p_models_sub = p_models.add_subparsers(dest="models_cmd", required=True)
+    p_models_providers = p_models_sub.add_parser(
+        "providers", parents=[json_parent], help="list providers without network"
+    )
+    p_models_providers.add_argument("--kind", choices=["chat", "transcription"], required=True)
+    p_models_providers.set_defaults(func=cmd_models_providers)
+    p_models_catalog = p_models_sub.add_parser(
+        "catalog", parents=[json_parent], help="load one provider catalog"
+    )
+    p_models_catalog.add_argument("--kind", choices=["chat", "transcription"], required=True)
+    p_models_catalog.add_argument("--provider", required=True)
+    p_models_catalog.add_argument("--refresh", action="store_true")
+    p_models_catalog.add_argument(
+        "--request-stdin", action="store_true",
+        help="read one JSON object with unsaved credentials from stdin",
+    )
+    p_models_catalog.set_defaults(func=cmd_models_catalog)
+
     # graph ...
     pg = sub.add_parser("graph", help="graph admin")
     pg_sub = pg.add_subparsers(dest="graph_cmd", required=True)
@@ -1729,8 +1748,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ch_stt = pch_sub.add_parser("set-stt",
                                   help="pick the STT (voice transcription) provider for a channel")
     p_ch_stt.add_argument("name")
-    p_ch_stt.add_argument("provider",
-                          choices=sorted(STT_PROVIDER_CHOICES))
+    p_ch_stt.add_argument("provider")
     p_ch_stt.set_defaults(func=cmd_channels_set_stt)
 
     # ``stt`` ... configure STT (voice transcription) providers globally.
@@ -1743,17 +1761,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_stt_set = pst_sub.add_parser("set",
                                    help="store credentials for a STT provider")
-    p_stt_set.add_argument("provider", choices=sorted(STT_CRED_PROVIDERS))
+    p_stt_set.add_argument("provider")
     p_stt_set.add_argument("--api-key", default="", dest="api_key")
     p_stt_set.add_argument("--api-base", default="", dest="api_base")
     p_stt_set.add_argument("--folder-id", default="", dest="folder_id",
                            help="Yandex Cloud folder id (yandex only)")
     p_stt_set.set_defaults(func=cmd_stt_set)
 
+    p_stt_model = pst_sub.add_parser(
+        "set-model", help="store the selected speech model for a provider"
+    )
+    p_stt_model.add_argument("provider")
+    p_stt_model.add_argument("--model", default="")
+    p_stt_model.set_defaults(func=cmd_stt_set_model)
+
     p_stt_default = pst_sub.add_parser("set-default",
                                        help="set the global STT default that channels inherit when they have no override")
-    p_stt_default.add_argument("provider",
-                               choices=sorted(STT_PROVIDER_CHOICES))
+    p_stt_default.add_argument("provider")
     p_stt_default.set_defaults(func=cmd_stt_set_default)
 
     p_stt_budget = pst_sub.add_parser(
@@ -1807,12 +1831,6 @@ def build_parser() -> argparse.ArgumentParser:
                                     help="check whether an OAuth provider is logged in")
     p_ag_oauth.add_argument("provider")
     p_ag_oauth.set_defaults(func=cmd_agents_oauth_status)
-
-    p_ag_refresh = pag_sub.add_parser("refresh-models", parents=[json_parent],
-                                      help="pull /v1/models from each configured provider into a local cache")
-    p_ag_refresh.add_argument("--provider", default="",
-                              help="refresh only this provider (default: all configured)")
-    p_ag_refresh.set_defaults(func=cmd_agents_refresh_models)
 
     return p
 
@@ -2974,33 +2992,7 @@ def cmd_channels_test(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def _provider_for_model(model: str) -> str:
-    """Best-effort provider key from a model string. Mirrors nanobot's
-    keyword detection, but we keep it simple."""
-    m = (model or "").lower()
-    table = [
-        ("openai-codex/", "openai_codex"),
-        ("github_copilot/", "github_copilot"),
-        ("anthropic/",     "anthropic"),
-        ("claude",         "anthropic"),
-        ("openai/",        "openai"),
-        ("gpt-",           "openai"),
-        ("openrouter/",    "openrouter"),
-        ("deepseek",       "deepseek"),
-        ("gemini",         "gemini"),
-        ("groq/",          "groq"),
-        ("yandex",         "yandex"),
-        ("qwen",           "dashscope"),
-        ("zhipu",          "zhipu"),
-        ("glm",            "zhipu"),
-        ("moonshot",       "moonshot"),
-        ("kimi",           "moonshot"),
-        ("mistral",        "mistral"),
-        ("step",           "stepfun"),
-    ]
-    for kw, prov in table:
-        if kw in m:
-            return prov
-    return ""
+    return provider_key_for_model(model)
 
 
 def _redact(s: str | None) -> str | None:
@@ -3034,100 +3026,11 @@ def cmd_agents_get(args: argparse.Namespace) -> int:
             "context_window_tokens": d.get("context_window_tokens"),
         }
 
-    # Models from the periodic /v1/models pull. Merged into the curated
-    # supported_providers.models list below, so the admin dropdown shows
-    # provider-current model ids without needing manual edits. If the
-    # cache is older than 24h, fire a background refresh so the next
-    # call sees fresh data (subprocess returns immediately).
-    import time as _time
-    cache = _load_models_cache()
-    cache_max_age_ms = 24 * 60 * 60 * 1000
-    now_ms = int(_time.time() * 1000)
-    stale = any(
-        (now_ms - int((cache.get(n) or {}).get("updated_at_ms") or 0)) > cache_max_age_ms
-        for n, c in (providers.items() if isinstance(providers, dict) else [])
-        if isinstance(c, dict) and (c.get("api_key") or "").strip()
-    )
-    if stale:
-        try:
-            import subprocess
-            subprocess.Popen(
-                [sys.executable, "-m", "familia.cli.graph_admin", "agents",
-                 "refresh-models", "--json"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            # Refresh is opportunistic; the current cached response remains valid.
-            logger.debug("model cache background refresh failed to start: {}", exc)
-
     out = {
         "schema_version": 1,
         "main":      _slot(main),
         "fallback":  _slot(fallback) if fallback else None,
-        "providers": sorted([
-            n for n, c in (providers.items() if isinstance(providers, dict) else [])
-            if isinstance(c, dict) and (c.get("api_key") or c.get("api_base"))
-        ]),
-        "models_cache": {
-            n: {
-                "count": len((c or {}).get("models") or []),
-                "updated_at_ms": (c or {}).get("updated_at_ms"),
-            }
-            for n, c in (cache.items() if isinstance(cache, dict) else [])
-        },
-        # Hardcoded list of provider keys we expose in the UI dropdown.
-        # Mirrors nanobot.providers.registry but flat. ``models`` is a
-        # short curated list of well-known model ids; the UI shows them
-        # as a dropdown with a free-text fallback for anything else.
-        "supported_providers": [
-            {"key": "openai",         "label": "OpenAI",        "is_oauth": False,
-             "models": ["openai/gpt-5", "openai/gpt-5-mini", "openai/gpt-4o", "openai/gpt-4o-mini", "openai/o3", "openai/o3-mini"]},
-            {"key": "anthropic",      "label": "Anthropic",     "is_oauth": False,
-             "models": ["anthropic/claude-opus-4-7", "anthropic/claude-opus-4-6", "anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-5", "anthropic/claude-haiku-4-5"]},
-            {"key": "openai_codex",   "label": "OpenAI Codex (ChatGPT subscription)", "is_oauth": True,
-             "models": ["openai-codex/gpt-5.4", "openai-codex/gpt-5.1-codex", "openai-codex/gpt-5-codex"]},
-            {"key": "github_copilot", "label": "GitHub Copilot", "is_oauth": True,
-             "models": ["github_copilot/gpt-5", "github_copilot/claude-opus-4-7", "github_copilot/claude-sonnet-4-6"]},
-            {"key": "openrouter",     "label": "OpenRouter",    "is_oauth": False,
-             "models": ["openrouter/anthropic/claude-opus-4-7", "openrouter/openai/gpt-5", "openrouter/deepseek/deepseek-chat"]},
-            {"key": "deepseek",       "label": "DeepSeek",      "is_oauth": False,
-             "models": ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"]},
-            {"key": "gemini",         "label": "Google Gemini", "is_oauth": False,
-             "models": ["gemini/gemini-2.5-pro", "gemini/gemini-2.5-flash", "gemini/gemini-2.0-flash"]},
-            {"key": "groq",           "label": "Groq",          "is_oauth": False,
-             "models": ["groq/llama-3.3-70b-versatile", "groq/qwen/qwen3-32b", "groq/openai/gpt-oss-120b"]},
-            {"key": "moonshot",       "label": "Moonshot Kimi", "is_oauth": False,
-             "models": ["moonshot/kimi-k2-turbo-preview", "moonshot/kimi-latest"]},
-            {"key": "mistral",        "label": "Mistral",       "is_oauth": False,
-             "models": ["mistral/mistral-large-latest", "mistral/mistral-medium-latest", "mistral/codestral-latest"]},
-            {"key": "dashscope",      "label": "DashScope (Qwen)", "is_oauth": False,
-             "models": ["dashscope/qwen3-coder-plus", "dashscope/qwen-max", "dashscope/qwen3-max"]},
-            {"key": "zhipu",          "label": "Zhipu GLM",     "is_oauth": False,
-             "models": ["zhipu/glm-4.6", "zhipu/glm-4.5"]},
-            {"key": "yandex",         "label": "Yandex (STT only)", "is_oauth": False, "models": []},
-            {"key": "custom",         "label": "Custom (OpenAI-compatible)", "is_oauth": False, "models": []},
-        ],
     }
-
-    # Merge cache models with curated. Cache ids come from /v1/models
-    # raw, e.g. "gpt-5", but nanobot expects "openai/gpt-5". Prefix
-    # with provider key when the id doesn't already contain a slash.
-    for sp in out["supported_providers"]:
-        key = sp["key"]
-        cached = (cache.get(key) or {}).get("models") or []
-        if not cached:
-            continue
-        prefix_key = key.replace("_", "-") if key in (
-            "openai_codex", "github_copilot",
-        ) else key
-        normalized = []
-        for m in cached:
-            normalized.append(m if "/" in m else f"{prefix_key}/{m}")
-        merged = list(dict.fromkeys([*normalized, *sp.get("models", [])]))
-        sp["models"] = merged
-        sp["models_updated_at_ms"] = (cache.get(key) or {}).get("updated_at_ms")
 
     if args.json:
         print(json.dumps(out, ensure_ascii=False))
@@ -3369,147 +3272,6 @@ def cmd_agents_test(args: argparse.Namespace) -> int:
 # manual edits.
 # ---------------------------------------------------------------------------
 
-def _models_cache_path() -> Path:
-    return _principals_path().parent / "models_cache.json"
-
-
-def _load_models_cache() -> dict[str, Any]:
-    p = _models_cache_path()
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-
-
-def _save_models_cache(cache: dict[str, Any]) -> None:
-    p = _models_cache_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, p)
-
-
-# Per-provider /v1/models endpoint shape. Returns (url, headers, parser).
-# parser receives the JSON body and returns a list of model id strings.
-def _models_fetcher_for(provider: str, api_key: str, api_base: str | None
-                        ) -> tuple[str, dict[str, str], Any] | None:
-    bearer = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
-
-    def _data_id(d: dict[str, Any]) -> list[str]:
-        items = d.get("data") or d.get("models") or []
-        out: list[str] = []
-        for it in items:
-            if isinstance(it, dict):
-                mid = it.get("id") or it.get("name")
-                if mid:
-                    out.append(str(mid))
-            elif isinstance(it, str):
-                out.append(it)
-        return out
-
-    bases = {
-        "openai":      "https://api.openai.com/v1",
-        "openrouter":  "https://openrouter.ai/api/v1",
-        "deepseek":    "https://api.deepseek.com",
-        "gemini":      "https://generativelanguage.googleapis.com/v1beta/openai",
-        "groq":        "https://api.groq.com/openai/v1",
-        "moonshot":    "https://api.moonshot.cn/v1",
-        "mistral":     "https://api.mistral.ai/v1",
-        "dashscope":   "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "zhipu":       "https://open.bigmodel.cn/api/paas/v4",
-    }
-    if provider == "anthropic":
-        return (
-            (api_base or "https://api.anthropic.com").rstrip("/") + "/v1/models",
-            {"x-api-key": api_key, "anthropic-version": "2023-06-01", "Accept": "application/json"},
-            _data_id,
-        )
-    if provider in bases:
-        base = (api_base or bases[provider]).rstrip("/")
-        return (f"{base}/models", bearer, _data_id)
-    return None
-
-
-def _refresh_one_provider(name: str, api_key: str, api_base: str | None,
-                          ) -> tuple[bool, list[str], str]:
-    """Call /v1/models for *name*. Returns (ok, models, err_msg)."""
-    if not api_key:
-        return False, [], "no api_key configured"
-    spec = _models_fetcher_for(name, api_key, api_base)
-    if spec is None:
-        return False, [], f"models endpoint not known for {name!r}"
-    url, headers, parser = spec
-    try:
-        import httpx
-        r = httpx.get(url, headers=headers, timeout=15)
-        if r.status_code != 200:
-            return False, [], f"HTTP {r.status_code}: {r.text[:200]}"
-        ids = parser(r.json())
-        return True, sorted(set(ids)), ""
-    except Exception as exc:  # noqa: BLE001
-        return False, [], f"error: {exc}"
-
-
-def cmd_agents_refresh_models(args: argparse.Namespace) -> int:
-    """Pull /v1/models for every configured provider with an api_key and
-    write the result into ``models_cache.json``. Prints a per-provider
-    summary in JSON when --json, plain otherwise."""
-    import time
-
-    _, raw = _load_config_json()
-    providers = raw.get("providers") or {}
-    cache = _load_models_cache()
-    now_ms = int(time.time() * 1000)
-
-    targets: list[str]
-    if args.provider:
-        targets = [args.provider]
-    else:
-        targets = sorted([
-            n for n, c in providers.items()
-            if isinstance(c, dict) and (c.get("api_key") or "").strip()
-        ])
-
-    summary: dict[str, dict[str, Any]] = {}
-    for name in targets:
-        cfg = providers.get(name) if isinstance(providers, dict) else None
-        api_key = (cfg or {}).get("api_key", "")
-        api_base = (cfg or {}).get("api_base") or None
-        ok, models, err = _refresh_one_provider(name, api_key, api_base)
-        if ok:
-            cache[name] = {
-                "models": models,
-                "updated_at_ms": now_ms,
-            }
-            summary[name] = {"ok": True, "count": len(models)}
-        else:
-            summary[name] = {"ok": False, "error": err}
-
-    _save_models_cache(cache)
-    if targets:
-        audit.log_event(
-            "models_refreshed",
-            actor=None,
-            reason=f"providers={','.join(targets)}",
-        )
-
-    if args.json:
-        print(json.dumps({"schema_version": 1, "summary": summary},
-                         ensure_ascii=False))
-        return 0
-    if not summary:
-        print("(no providers with api_key configured)")
-        return 0
-    for name, s in sorted(summary.items()):
-        if s.get("ok"):
-            print(f"  ✓ {name:<14} {s['count']} models")
-        else:
-            print(f"  ✗ {name:<14} {s.get('error')}")
-    return 0
-
-
 def cmd_agents_oauth_status(args: argparse.Namespace) -> int:
     """Check if an OAuth provider has a stored, usable token.
 
@@ -3632,6 +3394,10 @@ def cmd_channels_set_stt(args: argparse.Namespace) -> int:
     is stored on the section.
     """
     path, raw = _load_config_json()
+    valid = {"off", "inherit", *(item.key for item in list_providers(raw, "transcription"))}
+    if args.provider not in valid:
+        print(f"error: invalid STT provider {args.provider!r}; choose from {sorted(valid)}", file=sys.stderr)
+        return 2
     channels = raw.get("channels") or {}
     section = channels.get(args.name)
     if not isinstance(section, dict):
@@ -3723,13 +3489,29 @@ def cmd_stt_get(args: argparse.Namespace) -> int:
         or ""
     )
 
+    provider_rows = []
+    for provider in list_providers(raw, "transcription"):
+        section = providers_raw.get(provider.key) or {}
+        if not isinstance(section, dict):
+            section = {}
+        api_key = section.get("apiKey") or section.get("api_key") or ""
+        provider_rows.append({
+            **provider.to_dict(),
+            "api_key": f"***{api_key[-4:]}" if api_key else "",
+            "api_base": section.get("apiBase") or section.get("api_base") or "",
+            "folder_id": section.get("folderId") or section.get("folder_id") or "",
+            "configured": bool(api_key),
+        })
+    transcription = raw.get("transcription") or {}
+    if not isinstance(transcription, dict):
+        transcription = {}
     payload = {
         "global_default": global_default,
-        "providers": [_provider_view(k) for k in sorted(STT_CRED_PROVIDERS)],
+        "providers": provider_rows,
         "channels": overrides,
-        "supported_choices": sorted(STT_PROVIDER_CHOICES),
         "audio_budget_s": audio_budget_s,
         "lang": lang,
+        "model": transcription.get("model") or "",
     }
     if args.json:
         print(json.dumps(payload, ensure_ascii=False))
@@ -3740,9 +3522,11 @@ def cmd_stt_get(args: argparse.Namespace) -> int:
 
 def cmd_stt_set(args: argparse.Namespace) -> int:
     """Persist creds for a STT provider into ``config.providers.<provider>``."""
-    if args.provider not in STT_CRED_PROVIDERS:
+    _path, current = _load_config_json()
+    valid = {item.key for item in list_providers(current, "transcription")}
+    if args.provider not in valid:
         print(f"error: provider {args.provider!r} doesn't own credentials "
-              f"(choose from {sorted(STT_CRED_PROVIDERS)})", file=sys.stderr)
+              f"(choose from {sorted(valid)})", file=sys.stderr)
         return 2
     if args.provider == "yandex" and args.api_key and not args.folder_id:
         print(
@@ -3796,6 +3580,29 @@ def cmd_stt_set_audio_budget(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stt_set_model(args: argparse.Namespace) -> int:
+    """Persist transcription.provider/model without validating catalog membership."""
+    path, raw = _load_config_json()
+    valid = {item.key for item in list_providers(raw, "transcription")}
+    if args.provider not in valid:
+        print(f"error: invalid STT provider {args.provider!r}", file=sys.stderr)
+        return 2
+    transcription = raw.setdefault("transcription", {})
+    if not isinstance(transcription, dict):
+        transcription = {}
+        raw["transcription"] = transcription
+    transcription["provider"] = args.provider
+    transcription["model"] = "" if args.provider == "yandex" else (args.model or "").strip()
+    _save_config_json(path, raw)
+    audit.log_event(
+        "stt_model_set",
+        actor=None,
+        reason=f"provider={args.provider};reload-required",
+    )
+    print(f"stt model updated in {path} (gateway reload required)")
+    return 0
+
+
 def cmd_stt_set_lang(args: argparse.Namespace) -> int:
     """Persist the BCP-47 STT language hint into config.channels."""
     lang = (args.lang or "").strip()
@@ -3819,6 +3626,10 @@ def cmd_stt_set_lang(args: argparse.Namespace) -> int:
 def cmd_stt_set_default(args: argparse.Namespace) -> int:
     """Set the global default STT provider that channels inherit."""
     path, raw = _load_config_json()
+    valid = {"off", *(item.key for item in list_providers(raw, "transcription"))}
+    if args.provider not in valid and args.provider != "inherit":
+        print(f"error: invalid STT provider {args.provider!r}; choose from {sorted(valid)}", file=sys.stderr)
+        return 2
     channels = raw.setdefault("channels", {})
     if args.provider == "inherit":
         # Bookkeeping value isn't valid here — global default has to be a
@@ -3828,6 +3639,20 @@ def cmd_stt_set_default(args: argparse.Namespace) -> int:
         provider = args.provider
     channels["transcriptionProvider"] = provider
     channels.pop("transcription_provider", None)
+    transcription = raw.setdefault("transcription", {})
+    if not isinstance(transcription, dict):
+        transcription = {}
+        raw["transcription"] = transcription
+    if provider == "off":
+        transcription["provider"] = ""
+        transcription["model"] = ""
+    else:
+        provider_spec = next(
+            (item for item in list_providers(raw, "transcription") if item.key == provider),
+            None,
+        )
+        transcription["provider"] = provider
+        transcription["model"] = provider_spec.default_model if provider_spec else ""
     _save_config_json(path, raw)
     audit.log_event(
         "stt_default_set",
@@ -3836,6 +3661,54 @@ def cmd_stt_set_default(args: argparse.Namespace) -> int:
     )
     print(f"global stt default = {provider!r} in {path} "
           f"(gateway restart required)")
+    return 0
+
+
+def cmd_models_providers(args: argparse.Namespace) -> int:
+    """Return provider metadata without making a network request."""
+    _path, raw = _load_config_json()
+    payload = list_providers(raw, args.kind).to_dict()
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_models_catalog(args: argparse.Namespace) -> int:
+    """Load one selected catalog; optional credentials are stdin-only."""
+    _path, raw = _load_config_json()
+    request: dict[str, Any] = {
+        "kind": args.kind,
+        "provider": args.provider,
+        "refresh": bool(args.refresh),
+    }
+    if args.request_stdin:
+        try:
+            supplied = json.load(sys.stdin)
+        except (ValueError, TypeError) as exc:
+            if args.json:
+                _emit_error_json(f"invalid request JSON ({type(exc).__name__})", code="BAD_REQUEST")
+            else:
+                print("error: invalid request JSON", file=sys.stderr)
+            return 2
+        if not isinstance(supplied, dict):
+            if args.json:
+                _emit_error_json("request JSON must be an object", code="BAD_REQUEST")
+            else:
+                print("error: request JSON must be an object", file=sys.stderr)
+            return 2
+        for key in ("api_key", "api_base", "current_model"):
+            if key in supplied:
+                request[key] = supplied[key]
+        if "refresh" in supplied:
+            request["refresh"] = bool(supplied["refresh"])
+    snapshot = load_catalog(raw, CatalogRequest.from_value(request))
+    payload = snapshot.to_dict()
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -3925,10 +3798,18 @@ def _rpc_server_loop(parser: argparse.ArgumentParser) -> int:
 
         req_id = req.get("id")
         argv = req.get("argv") or []
+        request_stdin = req.get("stdin")
         if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
             sys.stdout.write(_json.dumps(
                 {"id": req_id, "exit": 2, "stdout": "",
                  "stderr": "rpc-server: argv must be list of strings"}
+            ) + "\n")
+            sys.stdout.flush()
+            continue
+        if request_stdin is not None and not isinstance(request_stdin, str):
+            sys.stdout.write(_json.dumps(
+                {"id": req_id, "exit": 2, "stdout": "",
+                 "stderr": "rpc-server: stdin must be a string"}
             ) + "\n")
             sys.stdout.flush()
             continue
@@ -3937,9 +3818,11 @@ def _rpc_server_loop(parser: argparse.ArgumentParser) -> int:
         # its JSON payload to stdout on success, or a structured error
         # envelope to stdout/stderr on failure — same wire as the
         # one-shot CLI mode, so admin's parser stays the same.
-        old_stdout, old_stderr = sys.stdout, sys.stderr
+        old_stdout, old_stderr, old_stdin = sys.stdout, sys.stderr, sys.stdin
         out_buf, err_buf = io.StringIO(), io.StringIO()
         sys.stdout, sys.stderr = out_buf, err_buf
+        if request_stdin is not None:
+            sys.stdin = io.StringIO(request_stdin)
         try:
             try:
                 args = parser.parse_args(argv)
@@ -3974,7 +3857,7 @@ def _rpc_server_loop(parser: argparse.ArgumentParser) -> int:
                         "stdout": out_buf.getvalue(),
                         "stderr": err_buf.getvalue()}
         finally:
-            sys.stdout, sys.stderr = old_stdout, old_stderr
+            sys.stdout, sys.stderr, sys.stdin = old_stdout, old_stderr, old_stdin
 
         try:
             sys.stdout.write(_json.dumps(resp, ensure_ascii=False) + "\n")
