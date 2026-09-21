@@ -61,7 +61,7 @@ def _requirement_name(requirement: str) -> str | None:
 def check(backend_version: str, release_tag: str) -> list[str]:
     errors: list[str] = []
     expected_tag = f"image-v{backend_version}"
-    _error(errors, backend_version == "0.4.2", "backend version must be exactly 0.4.2")
+    _error(errors, backend_version == "0.4.3", "backend version must be exactly 0.4.3")
     _error(errors, release_tag == expected_tag, f"release tag must be {expected_tag}")
 
     familia = _toml("familia/pyproject.toml")
