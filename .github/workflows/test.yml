@@ -63,10 +63,9 @@ jobs:
             nanobot/tests/agent/test_loop_consolidation_tokens.py \
             nanobot/tests/agent/test_loop_cron_timezone.py \
             nanobot/tests/agent/test_loop_save_turn.py \
-            nanobot/tests/agent/test_memory_boundary_async.py \
             nanobot/tests/agent/test_memory_store.py \
-            nanobot/tests/agent/test_runtime_wiring_regressions.py \
-            nanobot/tests/agent/test_consolidate_offset.py \
+            nanobot/tests/agent/test_new_command_archival.py \
+            nanobot/tests/session/test_consolidated_offset_clamp.py \
             nanobot/tests/cli/test_commands.py \
             nanobot/tests/cron/test_cron_tool_list.py \
             nanobot/tests/cron/test_cron_tool_schema_contract.py
