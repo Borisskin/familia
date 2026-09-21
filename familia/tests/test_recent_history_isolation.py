@@ -6,7 +6,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from nanobot.agent.context import ContextBuilder
+from nanobot.agent.context import ContextBuilder, TranscriptInput
 from nanobot.agent.tools.context import RequestContext
 
 from familia import bootstrap
@@ -54,7 +54,6 @@ def test_familia_context_messages_use_request_context_owner_scope(tmp_path: Path
             history=history,
             current_message="A_CURRENT",
             channel="telegram",
-            chat_id="chat-owner_a",
         )
 
     contents = "\n".join(str(message.get("content", "")) for message in messages)
@@ -182,11 +181,14 @@ def test_missing_actor_fails_closed(tmp_path: Path, monkeypatch) -> None:
     assert "B_PRIVATE" not in contents
 
 
-def test_explicit_standalone_actorless_compatibility(tmp_path: Path) -> None:
+def test_explicit_standalone_actorless_history_is_transcript_message(tmp_path: Path) -> None:
     builder = ContextBuilder(tmp_path)
-    builder.memory.append_history("LOCAL_ACTORLESS")
+    messages = builder.build_transcript(
+        TranscriptInput(
+            history=[{"role": "user", "content": "LOCAL_ACTORLESS"}],
+            current_message=None,
+        )
+    )
 
-    prompt = builder.build_system_prompt()
-
-    assert "# Recent History" in prompt
-    assert "LOCAL_ACTORLESS" in prompt
+    assert "# Recent History" not in messages[0]["content"]
+    assert messages[1] == {"role": "user", "content": "LOCAL_ACTORLESS"}

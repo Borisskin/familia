@@ -1,3 +1,4 @@
+# pyright: reportConstantRedefinition=false, reportMissingTypeStubs=false, reportUnusedFunction=false
 """WhatsApp channel implementation using neonize."""
 
 from __future__ import annotations
@@ -8,10 +9,13 @@ import re
 import secrets
 import time
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, Literal, NamedTuple
+from typing import Any, Literal, NamedTuple, cast
+from urllib.parse import urlparse
 
+import httpx
 from pydantic import Field
 
 from nanobot.bus.events import OutboundMessage
@@ -19,6 +23,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir, get_runtime_subdir
 from nanobot.config.schema import Base
+from nanobot.security.network import PinnedDNSAsyncTransport
 
 
 class WhatsAppConfig(Base):
@@ -28,6 +33,7 @@ class WhatsAppConfig(Base):
     allow_from: list[str] = Field(default_factory=list)
     group_policy: Literal["open", "mention"] = "open"
     database_path: str = ""
+    proxy: str = ""
     lid_mappings: dict[str, str] = Field(default_factory=dict)
 
 
@@ -38,6 +44,8 @@ class _NeonizeAPI(NamedTuple):
     MessageEv: Any
     PairStatusEv: Any
     build_jid: Any
+    detect_mime: Any
+    detect_buffer: Any
 
 
 class _MediaInfo(NamedTuple):
@@ -51,6 +59,15 @@ class _MediaInfo(NamedTuple):
 _NEONIZE_API: _NeonizeAPI | None = None
 _JID_RE = re.compile(r"^(?P<user>[^@]+)@(?P<server>[^@]+)$")
 _LEGACY_BRIDGE_CONFIG_FIELDS = ("bridgeUrl", "bridgeToken", "bridge_url", "bridge_token")
+_REMOTE_MEDIA_MAX_BYTES = 32 * 1024 * 1024
+_REMOTE_MEDIA_MAX_REDIRECTS = 5
+_REMOTE_MEDIA_TIMEOUT_SECONDS = 120.0
+# OGG is intentionally excluded: WhatsApp accepts only mono Opus, which MIME sniffing cannot prove.
+_DIRECT_AUDIO_MIMETYPES = {"audio/aac", "audio/amr", "audio/mp4", "audio/mpeg"}
+_MIMETYPE_ALIASES = {
+    "audio/x-hx-aac-adts": "audio/aac",
+    "audio/x-m4a": "audio/mp4",
+}
 
 
 def _default_database_path() -> Path:
@@ -67,9 +84,15 @@ def _load_neonize() -> _NeonizeAPI:
         return _NEONIZE_API
 
     try:
+        import magic
         from neonize.aioze.client import NewAClient
         from neonize.aioze.events import ConnectedEv, DisconnectedEv, MessageEv, PairStatusEv
         from neonize.utils.jid import build_jid
+
+        detect_mime = getattr(magic, "from_file", None)
+        detect_buffer = getattr(magic, "from_buffer", None)
+        if not callable(detect_mime) or not callable(detect_buffer):
+            raise ImportError("python-magic does not expose from_file/from_buffer")
     except ImportError as exc:
         raise RuntimeError(
             "WhatsApp dependencies not installed. Run: nanobot plugins enable whatsapp"
@@ -82,6 +105,8 @@ def _load_neonize() -> _NeonizeAPI:
         MessageEv=MessageEv,
         PairStatusEv=PairStatusEv,
         build_jid=build_jid,
+        detect_mime=detect_mime,
+        detect_buffer=detect_buffer,
     )
     return _NEONIZE_API
 
@@ -100,7 +125,8 @@ def _has_field(message: Any, name: str) -> bool:
     list_fields = getattr(message, "ListFields", None)
     if callable(list_fields):
         try:
-            return any(getattr(field, "name", "") == name for field, _ in list_fields())
+            fields = cast(list[tuple[Any, Any]], list_fields())
+            return any(getattr(field, "name", "") == name for field, _ in fields)
         except Exception:
             pass
 
@@ -277,7 +303,10 @@ class WhatsAppChannel(BaseChannel):
         return WhatsAppConfig().model_dump(by_alias=True)
 
     def __init__(self, config: Any, bus: MessageBus):
-        legacy_bridge_fields = _legacy_bridge_config_fields(config) if isinstance(config, dict) else []
+        legacy_bridge_fields = (
+            _legacy_bridge_config_fields(cast(dict[str, Any], config))
+            if isinstance(config, dict) else []
+        )
         if isinstance(config, dict):
             config = WhatsAppConfig.model_validate(config)
         super().__init__(config, bus)
@@ -298,6 +327,10 @@ class WhatsAppChannel(BaseChannel):
         configured = self.config.database_path.strip()
         return Path(configured).expanduser() if configured else _default_database_path()
 
+    def connect_database_path(self) -> Path:
+        """Return the session database target used by package-owned setup flows."""
+        return self._database_path()
+
     def _load_lid_mappings(self) -> dict[str, str]:
         mapping: dict[str, str] = {}
         for lid, phone in self.config.lid_mappings.items():
@@ -312,19 +345,52 @@ class WhatsAppChannel(BaseChannel):
         db_path.parent.mkdir(parents=True, exist_ok=True)
         return api.NewAClient(str(db_path))
 
+    async def _connect_client(self, client: Any) -> Any:
+        proxy = self.config.proxy.strip()
+        if not proxy:
+            return await client.connect()
+        if "://" not in proxy:
+            proxy = f"http://{proxy}"
+        from neonize._binder import ProxySettings
+
+        return await client.connect(ProxySettings(proxy_address=proxy))
+
+    def connect_open_client(
+        self,
+        qr_handler: Callable[[bytes], Awaitable[None]] | None = None,
+    ) -> tuple[Any, asyncio.Future[None]]:
+        """Create a login-only client for CLI or package-owned WebUI setup."""
+        client = self._new_client()
+        result = asyncio.get_running_loop().create_future()
+        self._register_handlers(
+            client,
+            login_result=result,
+            handle_messages=False,
+            qr_handler=qr_handler,
+        )
+        return client, result
+
+    async def connect_start_client(
+        self,
+        client: Any,
+        result: asyncio.Future[None],
+    ) -> asyncio.Task[Any] | None:
+        """Start a login client and watch neonize's optional background task."""
+        connect_task = await self._connect_client(client)
+        self._fail_login_on_connect_task_done(connect_task, result)
+        return connect_task
+
     async def login(self, force: bool = False) -> bool:
         db_path = self._database_path()
         if force:
             self._reset_database(db_path)
 
-        client = self._new_client()
-        login_result = asyncio.get_running_loop().create_future()
-        self._register_handlers(client, login_result=login_result, handle_messages=False)
+        client, login_result = self.connect_open_client()
 
+        connect_task: asyncio.Task[Any] | None = None
         try:
             self.logger.info("Starting WhatsApp login with neonize...")
-            connect_task = await client.connect()
-            self._fail_login_on_connect_task_done(connect_task, login_result)
+            connect_task = await self.connect_start_client(client, login_result)
             await login_result
             self.logger.info("WhatsApp login complete")
             return True
@@ -332,6 +398,10 @@ class WhatsAppChannel(BaseChannel):
             self.logger.error("WhatsApp login failed: {}", exc)
             return False
         finally:
+            if connect_task is not None and not connect_task.done():
+                connect_task.cancel()
+                with suppress(Exception, asyncio.CancelledError):
+                    await connect_task
             with suppress(Exception):
                 await client.stop()
 
@@ -344,7 +414,7 @@ class WhatsAppChannel(BaseChannel):
 
         try:
             self.logger.info("Connecting WhatsApp channel with neonize...")
-            await client.connect()
+            await self._connect_client(client)
             await client.idle()
         except asyncio.CancelledError:
             raise
@@ -412,22 +482,83 @@ class WhatsAppChannel(BaseChannel):
         return api.build_jid(user, server)
 
     async def _send_media(self, client: Any, to: Any, media_path: str) -> None:
-        path = str(Path(media_path).expanduser())
-        mime, _ = mimetypes.guess_type(path)
-        mimetype = mime or "application/octet-stream"
+        source: str | bytes
+        if media_path.startswith(("http://", "https://")):
+            source = await self._fetch_remote_media(media_path)
+            filename = Path(urlparse(media_path).path).name or "attachment"
+        else:
+            source = str(Path(media_path).expanduser())
+            filename = Path(source).name
+
+        mimetype = self._detect_mimetype(source)
         if mimetype.startswith("image/"):
-            await client.send_image(to, path)
+            await client.send_image(to, source)
         elif mimetype.startswith("video/"):
-            await client.send_video(to, path)
-        elif mimetype.startswith("audio/"):
-            await client.send_audio(to, path)
+            await client.send_video(to, source)
+        elif mimetype in _DIRECT_AUDIO_MIMETYPES:
+            await client.send_audio(to, source)
         else:
             await client.send_document(
                 to,
-                path,
-                filename=Path(path).name,
+                source,
+                filename=filename,
                 mimetype=mimetype,
             )
+
+    async def _fetch_remote_media(self, url: str) -> bytes:
+        timeout = httpx.Timeout(_REMOTE_MEDIA_TIMEOUT_SECONDS, connect=10.0)
+        async with httpx.AsyncClient(
+            transport=PinnedDNSAsyncTransport(),
+            follow_redirects=True,
+            max_redirects=_REMOTE_MEDIA_MAX_REDIRECTS,
+            timeout=timeout,
+            trust_env=False,
+        ) as http:
+            async with http.stream("GET", url) as response:
+                response.raise_for_status()
+                declared_size = response.headers.get("content-length")
+                if (
+                    declared_size
+                    and declared_size.isdigit()
+                    and int(declared_size) > _REMOTE_MEDIA_MAX_BYTES
+                ):
+                    raise ValueError(
+                        f"Remote WhatsApp media exceeds the {_REMOTE_MEDIA_MAX_BYTES}-byte limit"
+                    )
+
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > _REMOTE_MEDIA_MAX_BYTES:
+                        raise ValueError(
+                            f"Remote WhatsApp media exceeds the {_REMOTE_MEDIA_MAX_BYTES}-byte limit"
+                        )
+                    chunks.append(chunk)
+        return b"".join(chunks)
+
+    def _detect_mimetype(self, source: str | bytes) -> str:
+        try:
+            api = _load_neonize()
+            detected = (
+                api.detect_buffer(source, mime=True)
+                if isinstance(source, bytes)
+                else api.detect_mime(source, mime=True)
+            )
+        except Exception as exc:
+            label = f"{len(source)} downloaded bytes" if isinstance(source, bytes) else source
+            self.logger.debug("Failed to inspect WhatsApp media {}: {}", label, exc)
+            detected = None
+
+        if isinstance(detected, str) and "/" in detected:
+            mimetype = detected.partition(";")[0].strip().lower()
+            return _MIMETYPE_ALIASES.get(mimetype, mimetype)
+
+        if isinstance(source, bytes):
+            return "application/octet-stream"
+
+        guessed, _ = mimetypes.guess_type(source)
+        return guessed or "application/octet-stream"
 
     def _register_handlers(
         self,
@@ -435,11 +566,15 @@ class WhatsAppChannel(BaseChannel):
         *,
         login_result: asyncio.Future[None] | None = None,
         handle_messages: bool,
+        qr_handler: Callable[[bytes], Awaitable[None]] | None = None,
     ) -> None:
         api = _load_neonize()
 
         @client.qr
         async def _on_qr(_: Any, qr_data: bytes) -> None:
+            if qr_handler is not None:
+                await qr_handler(qr_data)
+                return
             import segno
 
             self.logger.info("Scan the WhatsApp QR code with Linked Devices")
@@ -649,12 +784,13 @@ class WhatsAppChannel(BaseChannel):
         if not self._self_jids:
             return False
         for context in _context_infos(message):
-            mentioned = (
+            raw_mentioned: Any = (
                 _safe_attr(context, "mentionedJID")
                 or _safe_attr(context, "mentionedJid")
                 or _safe_attr(context, "mentioned_jid")
                 or []
             )
+            mentioned: list[Any] = cast(list[Any], raw_mentioned)
             for jid in mentioned:
                 normalized = _normalize_jid(jid)
                 if normalized in self._self_jids or _bare_jid(normalized) in self._self_jids:

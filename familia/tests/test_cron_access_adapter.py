@@ -116,32 +116,17 @@ def test_familia_loader_preserves_cron_access_and_bound_owner_on_restart(tmp_pat
     job = service.list_jobs()[0]
 
     assert job.id in created
-    assert (
-        job.payload.created_by,
-        job.payload.creator_actor,
-        job.payload.owner_actor,
-        job.payload.target_actor,
-    ) == ("owner", "owner", "owner", "owner")
+    assert job.payload.session_key == owner_telegram.session_key
+    assert job.payload.origin_channel == "telegram"
+    assert job.payload.origin_chat_id == "100"
     assert job.id in _execute(tool, _request("owner", "vk", "owner-vk"), action="list")
-    telegram_legacy = service.add_job(
-        name="telegram legacy recipient",
-        schedule=CronSchedule(kind="every", every_ms=60_000),
-        message="recipient route",
-        session_key="telegram:100",
-        origin_channel="telegram",
-        origin_chat_id="100",
-    )
-    assert telegram_legacy.id in _execute(tool, owner_telegram, action="list")
 
     restarted = CronService(tmp_path / "cron" / "jobs.json")
     loaded = restarted.get_job(job.id)
     assert loaded is not None
-    assert (
-        loaded.payload.created_by,
-        loaded.payload.creator_actor,
-        loaded.payload.owner_actor,
-        loaded.payload.target_actor,
-    ) == ("owner", "owner", "owner", "owner")
+    assert loaded.payload.session_key == owner_telegram.session_key
+    assert loaded.payload.origin_channel == "telegram"
+    assert loaded.payload.origin_chat_id == "100"
     restored_tool = CronTool(restarted, job_access=tool._job_access)
     assert job.id in _execute(restored_tool, _request("owner", "vk", "owner-vk"), action="list")
 
@@ -151,15 +136,6 @@ def test_familia_cron_access_hides_foreign_and_system_jobs_without_leaks(tmp_pat
     owner = _request("owner", "telegram", "100")
     _execute(tool, owner, action="add", message="private", every_seconds=60)
     private = service.list_jobs()[0]
-    service.add_job(
-        name="tagged legacy",
-        schedule=CronSchedule(kind="every", every_ms=60_000),
-        message="legacy",
-        session_key="familia:owner:telegram:100",
-        origin_channel="telegram",
-        origin_chat_id="100",
-        tags=["shared"],
-    )
     service.register_system_job(
         CronJob(
             id="system",
@@ -172,26 +148,18 @@ def test_familia_cron_access_hides_foreign_and_system_jobs_without_leaks(tmp_pat
     member = _request("member", "discord", "100", metadata={"actor": "owner"})
     member_jobs = _execute(tool, member, action="list")
     assert private.id not in member_jobs
-    assert "tagged legacy" in member_jobs
     assert "dream" not in member_jobs
     assert _execute(tool, member, action="remove", job_id=private.id) == f"Job {private.id} not found"
     assert service.get_job(private.id) is not None
     assert _execute(tool, member, action="remove", job_id="system") == "Job system not found"
 
-    from familia.nanobot_extension.cron import make_cron_job_access
+    def fail_access(_job, _request):
+        raise RuntimeError("ACL down")
 
-    tag_lookups: list[str | None] = []
-
-    def unexpected_tag_lookup(actor):
-        tag_lookups.append(actor)
-        return set()
-
-    empty_tags_access = make_cron_job_access(
-        is_admin=lambda _actor: False,
-        reachable_tags=unexpected_tag_lookup,
-    )
-    assert not empty_tags_access(private, member)
-    assert tag_lookups == []
+    failing_tool = CronTool(service, job_access=fail_access)
+    assert failing_tool._list_jobs() == "No scheduled jobs."
+    assert failing_tool._remove_job(private.id) == f"Job {private.id} not found"
+    assert service.get_job(private.id) is not None
 
     unknown = _request("unknown", "telegram", "100")
     assert _execute(tool, unknown, action="list") == "No scheduled jobs."
@@ -204,6 +172,63 @@ def test_familia_cron_access_hides_foreign_and_system_jobs_without_leaks(tmp_pat
         "This is a system-managed Dream memory consolidation job for long-term memory.\n"
         "It remains visible so you can inspect it, but it cannot be removed."
     )
+
+
+def test_invalid_cron_access_configuration_fails_closed(tmp_path) -> None:
+    service = CronService(tmp_path / "cron" / "jobs.json")
+    service._running = True
+    service._arm_timer = lambda: None
+    job = service.add_job(
+        name="private",
+        schedule=CronSchedule(kind="every", every_ms=60_000),
+        message="private reminder",
+        session_key="telegram:100",
+        origin_channel="telegram",
+        origin_chat_id="100",
+    )
+    context = ToolContext(
+        config=SimpleNamespace(workspace_path=tmp_path),
+        workspace=str(tmp_path),
+        cron_service=service,
+    )
+    context.cron_job_access = object()  # type: ignore[assignment]
+
+    tool = CronTool.create(context)
+
+    assert isinstance(tool, CronTool)
+    assert tool._job_access is not None
+    assert tool._list_jobs() == "No scheduled jobs."
+    assert tool._remove_job(job.id) == f"Job {job.id} not found"
+    assert service.get_job(job.id) is not None
+
+
+def test_familia_cron_tags_require_reachable_actor_and_persist(tmp_path, monkeypatch) -> None:
+    service, tool = _familia_cron_tool(tmp_path, monkeypatch)
+    member = _request("member", "discord", "100")
+
+    created = _execute(
+        tool,
+        member,
+        action="add",
+        message="shared reminder",
+        every_seconds=60,
+        tags=["shared"],
+    )
+    job = service.list_jobs()[0]
+
+    assert job.id in created
+    assert job.payload.tags == ["shared"]
+    assert job.id in _execute(tool, member, action="list")
+    rejected = _execute(
+        tool,
+        _request("owner", "telegram", "100"),
+        action="add",
+        message="foreign tag",
+        every_seconds=60,
+        tags=["shared"],
+    )
+    assert "tags not reachable" in rejected
+    assert len(service.list_jobs()) == 1
 
 
 def test_standalone_cron_tool_stays_unfiltered(tmp_path) -> None:

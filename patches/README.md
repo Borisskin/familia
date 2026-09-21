@@ -5,9 +5,9 @@ baseline to the current vendored nanobot tree in this repository.
 
 Baseline:
 
-- upstream version: `0.3.0`;
+- upstream version: `0.3.5`;
 - upstream repo: sibling `../nanobot` next to this repository by default;
-- upstream commit: `3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec`.
+- upstream commit: `1bb712d3488915ca4ed9ccc1a93067ff722f5ab9`.
 
 The upstream package layout is `nanobot/...`. This repository vendors the
 package under `nanobot/nanobot/...`, so patch paths are normalized to the
@@ -23,8 +23,8 @@ Optional overrides:
 
 ```bash
 UPSTREAM_REPO=../nanobot \
-UPSTREAM=3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec \
-UPSTREAM_VERSION=0.3.0 \
+UPSTREAM=1bb712d3488915ca4ed9ccc1a93067ff722f5ab9 \
+UPSTREAM_VERSION=0.3.5 \
 bash patches/regenerate.sh
 ```
 
@@ -36,18 +36,18 @@ bash patches/validate_baseline.sh
 
 ## Scope
 
-Patch files are generated for runtime nanobot package deltas and
-`nanobot/pyproject.toml`; `nanobot/README.md` is also inside the declared
-comparison scope and currently matches the pinned baseline. The checker proves
-that the sorted patch set reconstructs the current non-ignored worktree scope
-with the exact path set, blob bytes, and Git modes. Patch applicability alone is
-reported separately and is not accepted as equality.
+Patch files cover the complete vendored `nanobot/**` product tree. The checker
+proves that the sorted patch set reconstructs every included path with the exact
+path set, blob bytes, and Git modes; the five upstream-only AI-agent guidance
+files are explicit exclusions in `ownership.yaml`, not silent omissions. Patch
+applicability alone is reported separately and is not accepted as equality.
 
-`ownership.yaml` is JSON-compatible YAML with one row per current delta path.
-Every patch hunk has a category (`familia-invariant`, `upstream-alignment`,
-`generated-noise`, or `unknown`) and an explicit release decision owner. The
-checker rejects missing/stale paths, missing hunk coverage, filename drift, and
-direct imports of Familia from nanobot core.
+`ownership.yaml` is JSON-compatible YAML with one row per current delta path
+and a reviewed record for every upstream-only exclusion. Every patch hunk has a
+category (`familia-invariant`, `upstream-alignment`, `generated-noise`, or
+`unknown`) and an explicit release decision owner. The checker rejects
+missing/stale paths, missing hunk coverage, filename drift, and direct imports
+of Familia from nanobot core.
 
 Phase 10 must still do hunk-by-hunk review:
 

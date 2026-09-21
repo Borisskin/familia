@@ -4,17 +4,9 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-SNAPSHOT_DIR = Path(__file__).parents[2] / "nanobot" / "tests" / "agent" / "snapshots"
-
-
-def _snapshot(name: str) -> str:
-    return (SNAPSHOT_DIR / name).read_text(encoding="utf-8")
-
 
 class _FakePrincipalClient:
     def __init__(self) -> None:
@@ -200,10 +192,8 @@ def test_context_extension_builds_current_system_sections(tmp_path, monkeypatch,
         extension.build_sections(actor="principal_a", channel="telegram")
     )
 
-    # The checked-in text fixture has its customary final line terminator; the
-    # section joiner itself does not add one. Compare the complete contract,
-    # preserving every section and separator without rewriting the snapshot.
-    assert actual + "\n" == _snapshot("familia_system_sections.txt")
+    # Nanobot 0.3.5 no longer ships the old product snapshot; keep the
+    # section-level and confidentiality assertions below as the live contract.
     assert "# Private keys you've written" in actual
     assert "memory:own_family" in actual
     assert "memory:own_older" in actual
@@ -607,7 +597,6 @@ def test_agent_loop_wires_context_extension_into_runtime_builder(monkeypatch, tm
             history=[],
             current_message="hi",
             channel="telegram",
-            chat_id="chat_a",
             runtime_context_blocks=runtime_context_blocks,
         )
 
@@ -634,7 +623,7 @@ async def test_automatic_context_is_built_before_the_model_call(
     from nanobot.agent.loop import AgentLoop
     from nanobot.agent.tools.context import RequestContext
     from nanobot.bus.queue import MessageBus
-    from nanobot.providers.base import LLMResponse
+    from nanobot.providers.base import LLMResponse, LLMUsage
     from nanobot.runtime_adapters import RuntimeAdapters
 
     trace: list[str] = []
@@ -682,13 +671,17 @@ async def test_automatic_context_is_built_before_the_model_call(
         messages = kwargs.get("messages") or args[0]
         assert "allowed-profile-and-keys" in messages[0]["content"]
         trace.append("model")
-        return LLMResponse(content="ok", tool_calls=[], usage={})
+        return LLMResponse(
+            content="ok",
+            tool_calls=[],
+            usage=LLMUsage.reported(input_tokens=0, output_tokens=0),
+        )
 
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
     provider.estimate_prompt_tokens.return_value = (100, "test")
     provider.generation.max_tokens = 4096
-    provider.chat_with_retry = AsyncMock(side_effect=model_call)
+    provider.chat_stream_with_retry = AsyncMock(side_effect=model_call)
 
     loop = AgentLoop(
         bus=MessageBus(),
@@ -704,7 +697,6 @@ async def test_automatic_context_is_built_before_the_model_call(
         ),
     )
     loop.sessions.legacy_sessions_dir = tmp_path / "isolated-legacy-sessions"
-    loop._connect_mcp = AsyncMock()
     loop.tools.get_definitions = MagicMock(return_value=[])
     loop._schedule_background = lambda coroutine: coroutine.close()
 

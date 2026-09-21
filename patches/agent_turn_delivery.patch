@@ -1,108 +1,129 @@
-# nanobot baseline: 0.3.0
-# upstream commit: 3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
-diff --git aa/nanobot/nanobot/agent/turn_delivery.py bb/nanobot/nanobot/agent/turn_delivery.py
-index 2eeb5aa..044db2c 100644
---- aa/nanobot/nanobot/agent/turn_delivery.py
-+++ bb/nanobot/nanobot/agent/turn_delivery.py
-@@ -8,6 +8,8 @@ from collections.abc import Awaitable, Callable
+diff --git a/nanobot/nanobot/agent/turn_delivery.py b/nanobot/nanobot/agent/turn_delivery.py
+index 3a035da..4a9230b 100644
+--- a/nanobot/nanobot/agent/turn_delivery.py
++++ b/nanobot/nanobot/agent/turn_delivery.py
+@@ -4,10 +4,10 @@
+ 
+ import dataclasses
+ import time
+-from collections.abc import Callable
++from collections.abc import Awaitable, Callable
+ from copy import deepcopy
  from dataclasses import dataclass, field
- from typing import Any
+-from typing import TYPE_CHECKING, Any, cast
++from typing import TYPE_CHECKING, Any, Protocol, cast
  
-+from nanobot.agent.outbound import RUNTIME_REQUEST_CONTEXT_KEY
-+from nanobot.agent.tools.context import RequestContext
  from nanobot.bus.events import InboundMessage, OutboundMessage
- from nanobot.bus.outbound_events import (
-     RetryWaitEvent,
-@@ -128,11 +130,31 @@ class TurnDelivery:
-     _stream_segment: int = field(init=False, default=0)
+ from nanobot.bus.notification_delivery import notification_is_deliverable
+@@ -41,6 +41,17 @@
+ TurnRoutePolicy = Callable[[InboundMessage, str, TurnRoute], TurnRoute]
  
-     def __post_init__(self) -> None:
-+        route_metadata = dict(self.route.metadata)
-+        for key in (
-+            RUNTIME_REQUEST_CONTEXT_KEY,
-+            "_runtime_actor",
-+            "_runtime_action",
-+            "_runtime_inbound_channel",
-+            "_runtime_inbound_chat_id",
-+        ):
-+            route_metadata.pop(key, None)
-+        if self.input_message.actor:
-+            route_metadata[RUNTIME_REQUEST_CONTEXT_KEY] = RequestContext(
-+                channel=self.input_message.channel,
-+                chat_id=self.input_message.chat_id,
-+                message_id=(self.input_message.metadata or {}).get("message_id"),
-+                session_key=self.session_key,
-+                original_user_text=self.input_message.content,
-+                metadata={"actor": self.input_message.actor},
-+                sender_id=self.input_message.sender_id,
-+                actor=self.input_message.actor,
-+            )
-         self.delivery_message = dataclasses.replace(
-             self.input_message,
-             channel=self.route.channel,
-             chat_id=self.route.chat_id,
--            metadata=dict(self.route.metadata),
-+            metadata=route_metadata,
+ 
++class OutboundPublisher(Protocol):
++    def __call__(
++        self,
++        outbound: OutboundMessage,
++        *,
++        actor: str | None = None,
++        inbound: InboundMessage | None = None,
++        action: str = "turn.response",
++    ) -> Awaitable[None]: ...
++
++
+ def _bind_events(
+     bus: MessageBus, route: TurnRoute,
+ ) -> EventSink:
+@@ -77,10 +88,12 @@
+         self,
+         bus: MessageBus,
+         route_policy: TurnRoutePolicy | None = None,
++        outbound_publisher: OutboundPublisher | None = None,
+     ) -> None:
+         self.bus = bus
+         self.runtime_event_publisher = RuntimeEventPublisher(bus)
+         self.route_policy = route_policy
++        self.outbound_publisher = outbound_publisher
+ 
+     def create(
+         self,
+@@ -101,6 +114,7 @@
+             session_key=session_key,
+             route=route,
+             enable_stream=enable_stream,
++            outbound_publisher=self.outbound_publisher,
          )
-         self.lifecycle_message = (
-             self.delivery_message if self.route.publish_lifecycle else self.input_message
-@@ -164,7 +186,8 @@ class TurnDelivery:
-                     chat_id=self.delivery_message.chat_id,
-                     event=RetryWaitEvent(content=content),
-                     metadata=self.delivery_message.metadata,
--                )
-+                ),
-+                action="message.send",
-             )
  
-         return _on_retry_wait
-@@ -226,7 +249,7 @@ class TurnDelivery:
-         completed_channel = self.lifecycle_message.channel
-         completed_chat_id = self.lifecycle_message.chat_id
-         if response is not None:
--            await self.bus.publish_outbound(response)
-+            await self.bus.publish_outbound(response, action="message.send")
+     def unrouted(self, msg: InboundMessage, session_key: str) -> TurnDelivery:
+@@ -115,6 +129,7 @@
+                 chat_id=msg.chat_id,
+                 metadata=dict(msg.metadata or {}),
+             ),
++            outbound_publisher=self.outbound_publisher,
+         )
+ 
+     def session_events(
+@@ -184,6 +199,7 @@
+     session_key: str
+     route: TurnRoute
+     enable_stream: bool = False
++    outbound_publisher: OutboundPublisher | None = None
+     delivery_message: InboundMessage = field(init=False)
+     lifecycle_message: InboundMessage = field(init=False)
+     _stream_base_id: str | None = field(init=False, default=None)
+@@ -306,15 +322,16 @@
              completed_channel = response.channel
              completed_chat_id = response.chat_id
+             if response.channel != "websocket" or stop_reason != "error":
+-                await self.bus.publish_outbound(response)
++                await self._publish_outbound(response, "turn.response")
          elif self.lifecycle_message.channel == "cli":
-@@ -236,7 +259,8 @@ class TurnDelivery:
+-            await self.bus.publish_outbound(
++            await self._publish_outbound(
+                 OutboundMessage(
+                     channel=self.lifecycle_message.channel,
                      chat_id=self.lifecycle_message.chat_id,
                      content="",
                      metadata=dict(self.lifecycle_message.metadata or {}),
 -                )
 +                ),
-+                action="message.send",
++                "turn.response",
              )
          if publish_completion:
-             await self.runtime_event_publisher.turn_completed(
-@@ -253,7 +277,8 @@ class TurnDelivery:
+             outcome, failure_kind = _turn_outcome(stop_reason)
+@@ -334,13 +351,14 @@
+             )
+ 
+     async def fail(self, *, publish_completion: bool) -> None:
+-        await self.bus.publish_outbound(
++        await self._publish_outbound(
+             OutboundMessage(
+                 channel=self.lifecycle_message.channel,
                  chat_id=self.lifecycle_message.chat_id,
                  content="Sorry, I encountered an error.",
                  metadata=dict(self.lifecycle_message.metadata or {}),
 -            )
 +            ),
-+            action="message.send",
++            "turn.error",
          )
          if publish_completion:
              await self.runtime_event_publisher.turn_completed(
-@@ -282,7 +307,8 @@ class TurnDelivery:
-                 chat_id=self.delivery_message.chat_id,
-                 event=StreamDeltaEvent(content=delta, stream_id=self._stream_id()),
-                 metadata=self.delivery_message.metadata,
--            )
-+            ),
-+            action="message.send",
-         )
+@@ -380,6 +398,16 @@
+             if not event.merge_next:
+                 self._stream_segment += 1
  
-     async def _publish_stream_end(self, *, resuming: bool = False) -> None:
-@@ -295,6 +321,7 @@ class TurnDelivery:
-                     resuming=resuming,
-                 ),
-                 metadata=self.delivery_message.metadata,
--            )
-+            ),
-+            action="message.send",
-         )
-         self._stream_segment += 1
-
++    async def _publish_outbound(self, message: OutboundMessage, action: str) -> None:
++        if self.outbound_publisher is not None:
++            await self.outbound_publisher(
++                message,
++                inbound=self.input_message,
++                action=action,
++            )
++            return
++        await self.bus.publish_outbound(message)
++
+     async def abort_stream(self) -> None:
+         """Close an interrupted stream so stateful channels can release its buffer."""
+         if self._stream_open:

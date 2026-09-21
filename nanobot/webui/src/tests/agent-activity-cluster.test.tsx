@@ -2,6 +2,8 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { describe, expect, it, vi } from "vitest";
 
 import { AgentActivityCluster } from "@/components/thread/AgentActivityCluster";
+import { preloadMarkdownText } from "@/components/MarkdownText";
+import { DEFAULT_LOCAL_PREFS, writeLocalPreferences } from "@/lib/local-preferences";
 import type { CliAppInfo, McpPresetInfo, UIMessage } from "@/lib/types";
 
 const BLENDER_CLI_APP: CliAppInfo = {
@@ -138,6 +140,85 @@ function installReducedMotion() {
 }
 
 describe("AgentActivityCluster", () => {
+  it("loads deferred trace details only after completed activity is expanded", async () => {
+    const onLoadTraceDetails = vi.fn();
+    render(
+      <AgentActivityCluster
+        messages={[{
+          id: "t-deferred",
+          role: "tool",
+          kind: "trace",
+          content: "exec(…)",
+          traces: ["exec(…)"],
+          traceDetail: {
+            ref: "9.tr-deadbeefdeadbeef",
+            bytes: 40_000,
+            traceCount: 1,
+          },
+          createdAt: 1,
+        }]}
+        isTurnStreaming={false}
+        hasBodyBelow={false}
+        onLoadTraceDetails={onLoadTraceDetails}
+      />,
+    );
+
+    expect(onLoadTraceDetails).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /Worked/ }));
+    await waitFor(() => {
+      expect(onLoadTraceDetails).toHaveBeenCalledWith(["9.tr-deadbeefdeadbeef"]);
+    });
+  });
+
+  it("shows model retries in the existing live activity header", () => {
+    render(
+      <AgentActivityCluster
+        messages={[]}
+        isTurnStreaming
+        hasBodyBelow={false}
+        retryStatus={{
+          state: "waiting",
+          attempt: 1,
+          max_attempts: 4,
+          error_kind: "connection",
+          next_retry_at: Date.now() / 1000 + 5,
+        }}
+      />,
+    );
+
+    expect(
+      screen.getByText("Connection failed · retrying in 5s · attempt 1/4"),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps intermediate assistant output as normal Markdown inside live activity", async () => {
+    await act(async () => {
+      await preloadMarkdownText();
+    });
+
+    render(
+      <AgentActivityCluster
+        messages={[
+          {
+            id: "model-activity",
+            role: "assistant",
+            content: "**partial answer**",
+            activityKind: "model",
+            isStreaming: true,
+            createdAt: 1,
+          },
+        ]}
+        isTurnStreaming
+        hasBodyBelow={false}
+      />,
+    );
+
+    const block = screen.getByTestId("activity-model-message");
+    await waitFor(() => expect(block.querySelector("strong")).not.toBeNull());
+    expect(block.querySelector("strong")).toHaveTextContent("partial answer");
+    expect(screen.queryByTestId("activity-step")).not.toBeInTheDocument();
+  });
+
   it("jumps to the latest activity when opened", () => {
     const raf = installAnimationFrameQueue();
     try {
@@ -264,6 +345,63 @@ describe("AgentActivityCluster", () => {
     }
   });
 
+  it("feathers only the activity edges with clipped content", () => {
+    const raf = installAnimationFrameQueue();
+    try {
+      render(
+        <AgentActivityCluster
+          messages={activityMessages()}
+          isTurnStreaming
+          hasBodyBelow={false}
+        />,
+      );
+
+      const scrollport = screen.getByTestId("agent-activity-scroll");
+      setScrollGeometry(scrollport, {
+        scrollHeight: 1000,
+        clientHeight: 120,
+        scrollTop: 0,
+      });
+
+      act(() => {
+        raf.flush();
+      });
+      expect(scrollport).toHaveAttribute("data-fade-top", "true");
+      expect(scrollport).toHaveAttribute("data-fade-bottom", "false");
+      const topFade = screen.getByTestId("activity-scroll-fade-top");
+      expect(scrollport).not.toContainElement(topFade);
+      expect(scrollport).not.toHaveClass("activity-scroll-fade");
+      expect(screen.queryByTestId("activity-scroll-fade-bottom")).not.toBeInTheDocument();
+
+      scrollport.scrollTop = 440;
+      fireEvent.scroll(scrollport);
+      expect(scrollport).toHaveAttribute("data-fade-top", "true");
+      expect(scrollport).toHaveAttribute("data-fade-bottom", "true");
+      expect(screen.getByTestId("activity-scroll-fade-top")).toBeInTheDocument();
+      expect(screen.getByTestId("activity-scroll-fade-bottom")).toBeInTheDocument();
+
+      scrollport.scrollTop = 0;
+      fireEvent.scroll(scrollport);
+      expect(scrollport).toHaveAttribute("data-fade-top", "false");
+      expect(scrollport).toHaveAttribute("data-fade-bottom", "true");
+      expect(screen.queryByTestId("activity-scroll-fade-top")).not.toBeInTheDocument();
+      expect(screen.getByTestId("activity-scroll-fade-bottom")).toBeInTheDocument();
+
+      setScrollGeometry(scrollport, {
+        scrollHeight: 100,
+        clientHeight: 120,
+        scrollTop: 0,
+      });
+      fireEvent.scroll(scrollport);
+      expect(scrollport).toHaveAttribute("data-fade-top", "false");
+      expect(scrollport).toHaveAttribute("data-fade-bottom", "false");
+      expect(screen.queryByTestId("activity-scroll-fade-top")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("activity-scroll-fade-bottom")).not.toBeInTheDocument();
+    } finally {
+      raf.restore();
+    }
+  });
+
   it("turns the live reasoning marker into an animated check when thinking completes", async () => {
     const liveReasoning: UIMessage = {
       id: "r-check",
@@ -337,16 +475,42 @@ describe("AgentActivityCluster", () => {
 
       expect(screen.getByTestId("agent-activity-scroll")).toBeInTheDocument();
       act(() => {
-        vi.advanceTimersByTime(901);
+        vi.advanceTimersByTime(301);
       });
       expect(screen.queryByTestId("agent-activity-scroll")).not.toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "Thought" })).toHaveAttribute(
+      expect(screen.getByRole("button", { name: "Worked" })).toHaveAttribute(
         "aria-expanded",
         "false",
       );
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("keeps chevron color feedback faster than the drawer rotation", () => {
+    render(
+      <AgentActivityCluster
+        messages={[{
+          id: "r-motion",
+          role: "assistant",
+          content: "",
+          reasoning: "checking motion",
+          createdAt: 1,
+        }]}
+        isTurnStreaming={false}
+        hasBodyBelow
+      />,
+    );
+
+    const button = screen.getByRole("button", { name: "Worked" });
+    expect(button).toHaveAttribute("data-thread-disclosure");
+    const chevron = button.querySelector("svg");
+    expect(chevron).toBeInTheDocument();
+    expect(chevron).toHaveClass("transition-colors", "duration-200");
+    expect(chevron?.parentElement).toHaveClass(
+      "transition-transform",
+      "[transition-duration:220ms]",
+    );
   });
 
   it("uses persisted turn latency for completed history instead of replay timestamps", () => {
@@ -365,7 +529,7 @@ describe("AgentActivityCluster", () => {
       />,
     );
 
-    expect(screen.getByText("Thought for 12s")).toBeInTheDocument();
+    expect(screen.getByText("Worked for 12s")).toBeInTheDocument();
   });
 
   it("labels mixed tool activity as work instead of thought", () => {
@@ -397,8 +561,8 @@ describe("AgentActivityCluster", () => {
       />,
     );
 
-    expect(screen.getByText("Thought")).toBeInTheDocument();
-    expect(screen.queryByText("Thought for 0s")).not.toBeInTheDocument();
+    expect(screen.getByText("Worked")).toBeInTheDocument();
+    expect(screen.queryByText("Worked for 0s")).not.toBeInTheDocument();
   });
 
   it("renders file edits as one-line activity rows", async () => {
@@ -429,6 +593,7 @@ describe("AgentActivityCluster", () => {
           hasBodyBelow={false}
         />,
       );
+      fireEvent.click(screen.getByRole("button", { name: /^Worked/ }));
 
       expect(screen.queryByText("Edited files")).not.toBeInTheDocument();
       const fileRef = screen.getByTestId("activity-file-reference");
@@ -448,7 +613,155 @@ describe("AgentActivityCluster", () => {
     }
   });
 
-  it("keeps file edits flat even when the legacy diff preference is enabled", () => {
+  it("keeps a completed file edit at its original position in the turn", () => {
+    const before: UIMessage = {
+      id: "model-before-edit",
+      role: "assistant",
+      content: "Before the edit",
+      activityKind: "model",
+      createdAt: 1,
+    };
+    const after: UIMessage = {
+      id: "model-after-edit",
+      role: "assistant",
+      content: "After the edit",
+      activityKind: "model",
+      createdAt: 3,
+    };
+    const fileEdit = (status: "editing" | "done"): UIMessage => ({
+      id: "file-edit-in-place",
+      role: "tool",
+      kind: "trace",
+      content: "edit_file()",
+      traces: ["edit_file()"],
+      fileEdits: [{
+        call_id: "call-edit-in-place",
+        tool: "edit_file",
+        path: "src/app.tsx",
+        phase: status === "editing" ? "start" : "end",
+        added: status === "editing" ? 0 : 2,
+        deleted: 0,
+        approximate: false,
+        status,
+      }],
+      createdAt: 2,
+    });
+    const assertBetween = (middle: HTMLElement) => {
+      const beforeElement = screen.getByText("Before the edit");
+      const afterElement = screen.getByText("After the edit");
+      expect(beforeElement.compareDocumentPosition(middle) & Node.DOCUMENT_POSITION_FOLLOWING)
+        .toBeTruthy();
+      expect(middle.compareDocumentPosition(afterElement) & Node.DOCUMENT_POSITION_FOLLOWING)
+        .toBeTruthy();
+    };
+
+    const { rerender } = render(
+      <AgentActivityCluster
+        messages={[before, fileEdit("editing"), after]}
+        isTurnStreaming
+        hasBodyBelow={false}
+      />,
+    );
+
+    assertBetween(screen.getByText("Editing"));
+
+    rerender(
+      <AgentActivityCluster
+        messages={[before, fileEdit("done"), after]}
+        isTurnStreaming
+        hasBodyBelow={false}
+      />,
+    );
+
+    assertBetween(screen.getByText("Edited"));
+  });
+
+  it.each(["diff", "collapsed_diff"] as const)(
+    "keeps %s edits outside reasoning folds in live and replayed activity",
+    (fileEditDisplayMode) => {
+      localStorage.setItem(
+        "nanobot-webui.settings-preferences",
+        JSON.stringify({ fileEditDisplayMode }),
+      );
+      const messages: UIMessage[] = [
+        { id: "before", role: "assistant", content: "", reasoning: "Before edit", createdAt: 1 },
+        {
+          id: "edit", role: "tool", kind: "trace", content: "edit_file()", createdAt: 2,
+          traces: ["edit_file()"],
+          fileEdits: [{
+            call_id: "edit-call", tool: "edit_file", path: "src/app.tsx", phase: "end",
+            added: 1, deleted: 1, approximate: false, status: "done",
+            diff: unifiedFileDiff([
+              "--- a/src/app.tsx", "+++ b/src/app.tsx", "@@ -1 +1 @@", "-old", "+new",
+            ]),
+          }],
+        },
+        {
+          id: "after", role: "assistant", content: "After edit",
+          activityKind: "model", createdAt: 3,
+        },
+      ];
+      const { rerender, unmount } = render(
+        <AgentActivityCluster messages={messages} isTurnStreaming hasBodyBelow={false} />,
+      );
+      try {
+        if (fileEditDisplayMode === "collapsed_diff") {
+          fireEvent.click(screen.getByTestId("file-edit-diff-toggle"));
+        }
+        const assertIndependentDiff = () => {
+          const diff = screen.getByTestId("file-edit-diff");
+          expect(diff).toBeVisible();
+          expect(diff.closest('[aria-hidden="true"], [inert], [data-testid="agent-activity-scroll"]'))
+            .toBeNull();
+          expect(screen.getAllByTestId("activity-file-reference")).toHaveLength(1);
+        };
+        const assertExpandedOrder = () => {
+          for (const toggle of document.querySelectorAll<HTMLButtonElement>(
+            '[data-thread-disclosure][aria-expanded="false"]',
+          )) {
+            fireEvent.click(toggle);
+          }
+          const diff = screen.getByTestId("file-edit-diff");
+          expect(screen.getByText("Before edit")).toBeVisible();
+          expect(screen.getByText("After edit")).toBeVisible();
+          expect(screen.getByText("Before edit").compareDocumentPosition(diff)
+            & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+          expect(diff.compareDocumentPosition(screen.getByText("After edit"))
+            & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+          assertIndependentDiff();
+        };
+        assertIndependentDiff();
+        assertExpandedOrder();
+        for (const toggle of document.querySelectorAll<HTMLButtonElement>("[data-thread-disclosure]")) {
+          fireEvent.click(toggle);
+          assertIndependentDiff();
+        }
+        rerender(<AgentActivityCluster messages={messages} isTurnStreaming={false} hasBodyBelow />);
+        assertIndependentDiff();
+        rerender(
+          <AgentActivityCluster
+            messages={messages.slice(0, 2)}
+            isTurnStreaming
+            hasBodyBelow={false}
+            retryStatus={{ state: "waiting", attempt: 1, max_attempts: 4, error_kind: "connection" }}
+          />,
+        );
+        expect(screen.getByRole("status", { name: "Connection failed · retrying in 0s · attempt 1/4" }))
+          .toBeVisible();
+        unmount();
+        render(<AgentActivityCluster messages={messages} isTurnStreaming={false} hasBodyBelow />);
+        if (fileEditDisplayMode === "collapsed_diff") {
+          fireEvent.click(screen.getByTestId("file-edit-diff-toggle"));
+        }
+        assertIndependentDiff();
+        assertExpandedOrder();
+      } finally {
+        localStorage.removeItem("nanobot-webui.settings-preferences");
+      }
+    },
+  );
+
+  it("renders file edit diffs and responds to preference changes", () => {
     localStorage.setItem(
       "nanobot-webui.settings-preferences",
       JSON.stringify({ fileEditDisplayMode: "diff" }),
@@ -488,17 +801,27 @@ describe("AgentActivityCluster", () => {
         />,
       );
 
-      expect(screen.queryByTestId("file-edit-diff")).not.toBeInTheDocument();
-      expect(screen.queryByText("return <Old />;")).not.toBeInTheDocument();
-      expect(screen.queryByText("return <New />;")).not.toBeInTheDocument();
+      expect(screen.getByTestId("file-edit-diff")).toBeInTheDocument();
+      expect(screen.getByText("return <Old />;")).toBeInTheDocument();
+      expect(screen.getByText("return <New />;")).toBeInTheDocument();
       expect(screen.getByTestId("activity-file-reference")).toHaveTextContent("src/app.tsx");
       expect(screen.getAllByTestId("activity-diff-pair")).toHaveLength(1);
+
+      act(() => {
+        writeLocalPreferences({ ...DEFAULT_LOCAL_PREFS, fileEditDisplayMode: "summary" });
+      });
+      expect(screen.queryByTestId("file-edit-diff")).not.toBeInTheDocument();
+
+      act(() => {
+        writeLocalPreferences({ ...DEFAULT_LOCAL_PREFS, fileEditDisplayMode: "diff" });
+      });
+      expect(screen.getByTestId("file-edit-diff")).toBeInTheDocument();
     } finally {
       localStorage.removeItem("nanobot-webui.settings-preferences");
     }
   });
 
-  it("does not render diff hunks inside the activity list", () => {
+  it("renders folded separators between separated file edit hunks", () => {
     localStorage.setItem(
       "nanobot-webui.settings-preferences",
       JSON.stringify({ fileEditDisplayMode: "diff" }),
@@ -544,16 +867,18 @@ describe("AgentActivityCluster", () => {
         />,
       );
 
-      expect(screen.queryByTestId("file-edit-diff-hunk-gap")).not.toBeInTheDocument();
+      expect(screen.getByTestId("file-edit-diff-hunk-gap")).toHaveTextContent(
+        "21 unchanged lines hidden",
+      );
       expect(screen.queryByText("@@ -25,3 +25,3 @@")).not.toBeInTheDocument();
-      expect(screen.queryByText("return newSecond;")).not.toBeInTheDocument();
+      expect(screen.getByText("return newSecond;")).toBeInTheDocument();
       expect(screen.getByTestId("activity-file-reference")).toHaveTextContent("src/app.tsx");
     } finally {
       localStorage.removeItem("nanobot-webui.settings-preferences");
     }
   });
 
-  it("summarizes long file edit diffs without an expansion control", () => {
+  it("keeps long file edit diffs lazy and releases them after closing", async () => {
     localStorage.setItem(
       "nanobot-webui.settings-preferences",
       JSON.stringify({ fileEditDisplayMode: "diff" }),
@@ -592,16 +917,56 @@ describe("AgentActivityCluster", () => {
         />,
       );
 
-      expect(screen.queryByTestId("file-edit-diff-toggle")).not.toBeInTheDocument();
+      const toggle = screen.getByTestId("file-edit-diff-toggle");
+      expect(toggle).toHaveAttribute("aria-expanded", "false");
+      expect(toggle).toHaveTextContent("View large diff");
+      expect(toggle).toHaveTextContent("165 lines");
       expect(screen.queryByTestId("file-edit-diff")).not.toBeInTheDocument();
       expect(screen.queryByText("line-1")).not.toBeInTheDocument();
-      expect(screen.getByText("+165")).toBeInTheDocument();
+
+      fireEvent.click(toggle);
+
+      expect(toggle).toHaveAttribute("aria-expanded", "true");
+      expect(screen.getByText("line-160")).toBeInTheDocument();
+      expect(screen.queryByText("line-161")).not.toBeInTheDocument();
+      expect(screen.getByTestId("file-edit-diff-expand-lines")).toHaveTextContent(
+        "Show 5 more lines",
+      );
+
+      fireEvent.click(screen.getByTestId("file-edit-diff-expand-lines"));
+
+      expect(screen.getByText("line-165")).toBeInTheDocument();
+      expect(screen.getByTestId("file-edit-diff-collapse-lines")).toHaveTextContent(
+        "Show fewer lines",
+      );
+
+      fireEvent.click(screen.getByTestId("file-edit-diff-collapse-lines"));
+
+      expect(screen.queryByText("line-165")).not.toBeInTheDocument();
+      expect(screen.getByTestId("file-edit-diff-expand-lines")).toHaveTextContent(
+        "Show 5 more lines",
+      );
+
+      const content = document.getElementById(toggle.getAttribute("aria-controls")!)!;
+      let finish!: () => void;
+      const finished = new Promise<void>((resolve) => { finish = resolve; });
+      Object.defineProperty(content, "getAnimations", { value: () => [{ finished }] });
+      fireEvent.click(toggle);
+      expect(toggle).toHaveAttribute("aria-expanded", "false");
+      expect(content).toHaveAttribute("data-state", "closed");
+      expect(content).toHaveAttribute("inert");
+      expect(screen.getByTestId("file-edit-diff")).toBeInTheDocument();
+      await act(async () => { finish(); });
+      expect(screen.queryByTestId("file-edit-diff")).not.toBeInTheDocument();
+      fireEvent.click(toggle);
+      expect(screen.getByText("line-160")).toBeInTheDocument();
+      expect(screen.queryByText("line-161")).not.toBeInTheDocument();
     } finally {
       localStorage.removeItem("nanobot-webui.settings-preferences");
     }
   });
 
-  it("ignores the legacy collapsed diff mode in the activity list", () => {
+  it("does not mount collapsed file edit diffs until opened", () => {
     localStorage.setItem(
       "nanobot-webui.settings-preferences",
       JSON.stringify({ fileEditDisplayMode: "collapsed_diff" }),
@@ -641,16 +1006,24 @@ describe("AgentActivityCluster", () => {
         />,
       );
 
-      expect(screen.queryByTestId("file-edit-diff-toggle")).not.toBeInTheDocument();
+      const toggle = screen.getByTestId("file-edit-diff-toggle");
+      expect(toggle).toHaveAttribute("aria-expanded", "false");
+      expect(toggle).toHaveTextContent("View diff");
+      expect(toggle).toHaveTextContent("3 lines");
       expect(screen.queryByTestId("file-edit-diff")).not.toBeInTheDocument();
       expect(screen.queryByText("return <New />;")).not.toBeInTheDocument();
-      expect(screen.getByTestId("activity-file-reference")).toHaveTextContent("src/app.tsx");
+
+      fireEvent.click(toggle);
+
+      expect(toggle).toHaveAttribute("aria-expanded", "true");
+      expect(screen.getByTestId("file-edit-diff")).toBeInTheDocument();
+      expect(screen.getByText("return <New />;")).toBeInTheDocument();
     } finally {
       localStorage.removeItem("nanobot-webui.settings-preferences");
     }
   });
 
-  it("opens the edited file directly instead of expanding a truncated diff", () => {
+  it("offers the file preview entry point when a diff payload is truncated", () => {
     localStorage.setItem(
       "nanobot-webui.settings-preferences",
       JSON.stringify({ fileEditDisplayMode: "diff" }),
@@ -691,9 +1064,15 @@ describe("AgentActivityCluster", () => {
         />,
       );
 
-      expect(screen.queryByTestId("file-edit-diff-toggle")).not.toBeInTheDocument();
+      const toggle = screen.getByTestId("file-edit-diff-toggle");
+      expect(toggle).toHaveAttribute("aria-expanded", "false");
+      expect(toggle).toHaveTextContent("View large diff");
       expect(screen.queryByTestId("file-edit-diff-truncated")).not.toBeInTheDocument();
-      fireEvent.click(screen.getByTestId("activity-file-reference"));
+
+      fireEvent.click(toggle);
+
+      expect(screen.getByTestId("file-edit-diff-truncated")).toHaveTextContent("Diff truncated");
+      fireEvent.click(screen.getByTestId("file-edit-diff-open-file"));
 
       expect(onOpenFilePreview).toHaveBeenCalledWith("/repo/src/app.tsx");
     } finally {
@@ -727,6 +1106,7 @@ describe("AgentActivityCluster", () => {
         hasBodyBelow={false}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: /^Worked/ }));
 
     expect(screen.getByText("Deleted")).toBeInTheDocument();
     expect(screen.queryByText("Edited")).not.toBeInTheDocument();
@@ -984,6 +1364,7 @@ describe("AgentActivityCluster", () => {
         hasBodyBelow={false}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: /^Worked/ }));
 
     expect(screen.getByText("Searched X · nanobot oauth")).toBeInTheDocument();
     expect(screen.queryByText(/Completed X search/i)).not.toBeInTheDocument();
@@ -1017,6 +1398,7 @@ describe("AgentActivityCluster", () => {
         hasBodyBelow={false}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: /^Worked/ }));
 
     expect(screen.queryByText(/signed-secret|secret1234|url-secret/)).not.toBeInTheDocument();
     expect(screen.getByText("Searched release notes access_token=<redacted>")).toBeInTheDocument();
@@ -1036,12 +1418,13 @@ describe("AgentActivityCluster", () => {
             id: "search-start",
             role: "tool",
             kind: "trace",
-            content: line,
-            traces: [line],
+            content: "web_search()",
+            traces: ["web_search()"],
             toolEvents: [{
               phase: "start",
+              call_id: "hosted-search-1",
               name: "web_search",
-              arguments: { query: "site:linkedin.com/company Evomap startup" },
+              arguments: {},
             }],
             createdAt: 1,
           },
@@ -1053,6 +1436,7 @@ describe("AgentActivityCluster", () => {
             traces: [line],
             toolEvents: [{
               phase: "error",
+              call_id: "hosted-search-1",
               name: "web_search",
               arguments: { query: "site:linkedin.com/company Evomap startup" },
               error: "Search provider rate limited the request",
@@ -1231,6 +1615,7 @@ describe("AgentActivityCluster", () => {
         hasBodyBelow={false}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: /^Worked/ }));
 
     const title = screen.getByText("Example documentation");
     const url = screen.getByText("example.com/docs");
@@ -1312,6 +1697,7 @@ describe("AgentActivityCluster", () => {
         hasBodyBelow={false}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: /^Worked/ }));
 
     const run = screen.getByText(/Reviewed sources.*2 files/).closest('[data-testid="activity-step"]');
     expect(run).toBeInTheDocument();
@@ -1352,6 +1738,7 @@ describe("AgentActivityCluster", () => {
         hasBodyBelow={false}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: /^Worked/ }));
 
     const row = screen.getByText("Could not search files “needle”").closest(
       '[data-testid="activity-step"]',
@@ -1380,6 +1767,7 @@ describe("AgentActivityCluster", () => {
         hasBodyBelow={false}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: /^Worked/ }));
 
     expect(screen.queryByText(/password|signed-secret/)).not.toBeInTheDocument();
     expect(screen.getByText("Completed Download asset")).toBeInTheDocument();
@@ -1466,6 +1854,7 @@ describe("AgentActivityCluster", () => {
         hasBodyBelow={false}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: /^Worked/ }));
 
     expect(screen.getByText("Edited")).toBeInTheDocument();
     expect(screen.queryByText("+0")).not.toBeInTheDocument();
@@ -1560,6 +1949,7 @@ describe("AgentActivityCluster", () => {
         hasBodyBelow={false}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: /^Worked/ }));
 
     const row = screen.getByText("Could not edit").closest('[data-testid="activity-step"]');
     expect(row).toBeInTheDocument();
@@ -1593,6 +1983,7 @@ describe("AgentActivityCluster", () => {
         hasBodyBelow={false}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: /^Worked/ }));
 
     const row = screen.getByText("Could not edit").closest('[data-testid="activity-step"]');
     expect(row).toBeInTheDocument();
@@ -1601,7 +1992,7 @@ describe("AgentActivityCluster", () => {
     expect(screen.queryByText(/\[Errno 13\]/)).not.toBeInTheDocument();
   });
 
-  it("renders repeated edits for the same path as separate actions", () => {
+  it("keeps repeated edits for the same path as separate actions", () => {
     localStorage.setItem(
       "nanobot-webui.settings-preferences",
       JSON.stringify({ fileEditDisplayMode: "diff" }),
@@ -1660,6 +2051,7 @@ describe("AgentActivityCluster", () => {
                   "-const fps = 30;",
                   "+const fps = 60;",
                   " start();",
+
                 ]),
               },
             ],
@@ -1669,6 +2061,7 @@ describe("AgentActivityCluster", () => {
           hasBodyBelow={false}
         />,
       );
+      fireEvent.click(screen.getByRole("button", { name: /^Worked/ }));
 
       const fileRefs = screen.getAllByTestId("activity-file-reference");
       expect(fileRefs).toHaveLength(3);
@@ -1679,9 +2072,9 @@ describe("AgentActivityCluster", () => {
       expect(failedRow).toBeInTheDocument();
       expect(failedRow).not.toHaveAttribute("title");
       expect(screen.queryByText("patch failed")).not.toBeInTheDocument();
-      expect(screen.queryByTestId("file-edit-diff")).not.toBeInTheDocument();
-      expect(screen.queryByText("<canvas />")).not.toBeInTheDocument();
-      expect(screen.queryByText("const fps = 60;")).not.toBeInTheDocument();
+      expect(screen.getAllByTestId("file-edit-diff")).toHaveLength(2);
+      expect(screen.getByText("<canvas />")).toBeInTheDocument();
+      expect(screen.getByText("const fps = 60;")).toBeInTheDocument();
       expect(screen.getAllByText("+2").length).toBeGreaterThan(0);
       expect(screen.getAllByText("-1").length).toBeGreaterThan(0);
       expect(screen.getAllByText("+6").length).toBeGreaterThan(0);
@@ -1689,6 +2082,51 @@ describe("AgentActivityCluster", () => {
     } finally {
       localStorage.removeItem("nanobot-webui.settings-preferences");
     }
+  });
+
+  it("keeps the latest failed attempt visible after an earlier edit succeeded", () => {
+    render(
+      <AgentActivityCluster
+        messages={activityMessages("", {
+          id: "t2",
+          role: "tool",
+          kind: "trace",
+          content: "edit_file()",
+          traces: ["edit_file()"],
+          fileEdits: [
+            {
+              call_id: "call-edit-1",
+              tool: "edit_file",
+              path: "src/app.tsx",
+              phase: "end",
+              added: 1,
+              deleted: 0,
+              approximate: false,
+              status: "done",
+            },
+            {
+              call_id: "call-edit-2",
+              tool: "edit_file",
+              path: "src/app.tsx",
+              phase: "error",
+              added: 0,
+              deleted: 0,
+              approximate: false,
+              status: "error",
+              error: "patch failed",
+            },
+          ],
+          createdAt: 3,
+        })}
+        isTurnStreaming={false}
+        hasBodyBelow={false}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^Worked/ }));
+
+    expect(screen.getByText("Edited")).toBeInTheDocument();
+    expect(screen.getByText("Could not edit")).toBeInTheDocument();
+    expect(screen.getAllByTestId("activity-file-reference")).toHaveLength(2);
   });
 
   it("keeps tool event embeds out of the flat activity list", () => {
@@ -1792,6 +2230,7 @@ describe("AgentActivityCluster", () => {
         hasBodyBelow={false}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: /^Worked/ }));
 
     expect(screen.getByText("Could not generate image")).toBeInTheDocument();
     const row = screen.getByText("Could not generate image").closest(
@@ -1864,6 +2303,7 @@ describe("AgentActivityCluster", () => {
         hasBodyBelow={false}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: /^Worked/ }));
 
     const steps = screen.getAllByTestId("activity-step");
     expect(steps.length).toBeGreaterThanOrEqual(3);

@@ -182,7 +182,7 @@ def test_actual_agent_turn_binds_distinct_actor_scopes_before_prompt(
     from nanobot.agent.loop import AgentLoop
     from nanobot.agent.tools.context import current_request_context
     from nanobot.config.schema import AgentDefaults, ToolsConfig
-    from nanobot.providers.base import GenerationSettings, LLMResponse
+    from nanobot.providers.base import GenerationSettings, LLMResponse, LLMUsage
     from nanobot.runtime_adapters import RuntimeAdapters
     from nanobot.security.workspace_access import current_workspace_scope
 
@@ -211,9 +211,13 @@ def test_actual_agent_turn_binds_distinct_actor_scopes_before_prompt(
                 request.workspace if request is not None else None,
             )
         )
-        return LLMResponse(content="ok", tool_calls=[], usage={})
+        return LLMResponse(
+            content="ok",
+            tool_calls=[],
+            usage=LLMUsage.reported(input_tokens=0, output_tokens=0),
+        )
 
-    provider.chat_with_retry = AsyncMock(side_effect=chat)
+    provider.chat_stream_with_retry = AsyncMock(side_effect=chat)
 
     def context_factory(admission, message):
         return replace(
@@ -240,8 +244,8 @@ def test_actual_agent_turn_binds_distinct_actor_scopes_before_prompt(
     async def run() -> None:
         async def one(actor: str) -> None:
             raw = InboundMessage("vk", actor, "chat", "hello", actor=actor)
-            admitted, rejection = await loop._admit_message(raw)
-            assert rejection is None and admitted is not None
+            admitted = await loop._admit_inbound(raw)
+            assert admitted is not None
             await loop._process_message(admitted)
 
         await asyncio.gather(one("owner"), one("member"))

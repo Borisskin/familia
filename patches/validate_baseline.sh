@@ -3,8 +3,8 @@
 
 set -euo pipefail
 
-EXPECTED_COMMIT="3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec"
-EXPECTED_VERSION="0.3.0"
+EXPECTED_COMMIT="1bb712d3488915ca4ed9ccc1a93067ff722f5ab9"
+EXPECTED_VERSION="0.3.5"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 UPSTREAM_REPO="${UPSTREAM_REPO:-$(cd "$REPO/.." && pwd)/nanobot}"

@@ -1,14 +1,14 @@
+# pyright: reportMissingTypeStubs=false
 """WeCom (Enterprise WeChat) channel implementation using wecom_aibot_sdk."""
 
 import asyncio
-import base64
-import hashlib
 import importlib.util
 import os
 import re
 from collections import OrderedDict
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from pydantic import Field
 
@@ -20,37 +20,32 @@ from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
 
 WECOM_AVAILABLE = importlib.util.find_spec("wecom_aibot_sdk") is not None
+WECOM_WEBSOCKET_HOST = "openws.work.weixin.qq.com"
 
-# Upload safety limits (matching QQ channel defaults)
-WECOM_UPLOAD_MAX_BYTES = 1024 * 1024 * 200  # 200MB
+# Inbound media safety limit (matching QQ channel defaults)
+WECOM_DOWNLOAD_MAX_BYTES = 1024 * 1024 * 200  # 200MB
 
 # Replace unsafe characters with "_", keep Chinese and common safe punctuation.
 _SAFE_NAME_RE = re.compile(r"[^\w.\-()\[\]（）【】\u4e00-\u9fff]+", re.UNICODE)
 
 
-def _sanitize_filename(name: str) -> str:
+def _bypass_system_proxy(host: str) -> None:
+    """Keep the WeCom SDK's WebSocket on its direct connection path."""
+    for key in ("NO_PROXY", "no_proxy"):
+        entries = [entry.strip() for entry in os.environ.get(key, "").split(",") if entry.strip()]
+        if host not in entries:
+            os.environ[key] = ",".join([*entries, host])
+
+
+def _sanitize_filename(name: str, fallback: str = "unnamed") -> str:
     """Sanitize filename to avoid traversal and problematic chars."""
-    name = (name or "").strip()
-    name = Path(name).name
-    name = _SAFE_NAME_RE.sub("_", name).strip("._ ")
-    return name
+    def _clean(value: str) -> str:
+        value = (value or "").strip()
+        value = Path(value).name
+        return _SAFE_NAME_RE.sub("_", value).strip("._ ")
 
+    return _clean(name) or _clean(fallback) or "unnamed"
 
-_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
-_VIDEO_EXTS = {".mp4", ".avi", ".mov"}
-_AUDIO_EXTS = {".amr", ".mp3", ".wav", ".ogg"}
-
-
-def _guess_wecom_media_type(filename: str) -> str:
-    """Classify file extension as WeCom media_type string."""
-    ext = Path(filename).suffix.lower()
-    if ext in _IMAGE_EXTS:
-        return "image"
-    if ext in _VIDEO_EXTS:
-        return "video"
-    if ext in _AUDIO_EXTS:
-        return "voice"
-    return "file"
 
 class WecomConfig(Base):
     """WeCom (Enterprise WeChat) AI Bot channel configuration."""
@@ -96,7 +91,7 @@ class WecomChannel(BaseChannel):
         self._client: Any = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._generate_req_id = None
+        self._generate_req_id: Callable[[str], str] | None = None
         # Store frame headers for each chat to enable replies
         self._chat_frames: dict[str, Any] = {}
 
@@ -110,6 +105,10 @@ class WecomChannel(BaseChannel):
             self.logger.error("bot_id and secret not configured")
             return
 
+        # websockets 15+ automatically uses the system proxy. The current WeCom SDK
+        # doesn't expose its proxy argument and expects this endpoint to connect directly.
+        _bypass_system_proxy(WECOM_WEBSOCKET_HOST)
+
         from wecom_aibot_sdk import WSClient, generate_req_id
 
         self._running = True
@@ -117,7 +116,8 @@ class WecomChannel(BaseChannel):
         self._generate_req_id = generate_req_id
 
         # Create WebSocket client
-        self._client = WSClient({
+        ws_client = cast(Any, WSClient)
+        self._client = ws_client({
             "bot_id": self.config.bot_id,
             "secret": self.config.secret,
             "reconnect_interval": 1000,
@@ -195,14 +195,16 @@ class WecomChannel(BaseChannel):
         """Handle enter_chat event (user opens chat with bot)."""
         try:
             # Extract body from WsFrame dataclass or dict
-            if hasattr(frame, 'body'):
-                body = frame.body or {}
+            if hasattr(frame, "body"):
+                body: Any = frame.body or {}
             elif isinstance(frame, dict):
-                body = frame.get("body", frame)
+                frame_dict = cast(dict[str, Any], frame)
+                body = frame_dict.get("body", frame_dict)
             else:
                 body = {}
 
-            chat_id = body.get("chatid", "") if isinstance(body, dict) else ""
+            body_dict = cast(dict[str, Any], body) if isinstance(body, dict) else {}
+            chat_id = cast(str, body_dict.get("chatid", ""))
 
             if chat_id and not self.is_allowed(chat_id):
                 return
@@ -219,26 +221,32 @@ class WecomChannel(BaseChannel):
         """Process incoming message and forward to bus."""
         try:
             # Extract body from WsFrame dataclass or dict
-            if hasattr(frame, 'body'):
-                body = frame.body or {}
+            if hasattr(frame, "body"):
+                body: Any = frame.body or {}
             elif isinstance(frame, dict):
-                body = frame.get("body", frame)
+                frame_dict = cast(dict[str, Any], frame)
+                body = frame_dict.get("body", frame_dict)
             else:
                 body = {}
 
             # Ensure body is a dict
             if not isinstance(body, dict):
-                self.logger.warning("Invalid body type: {}", type(body))
+                self.logger.warning("Invalid body type: {}", type(cast(object, body)))
                 return
+            body = cast(dict[str, Any], body)
 
             # Extract message info
-            msg_id = body.get("msgid", "")
+            msg_id = cast(str, body.get("msgid", ""))
             if not msg_id:
                 msg_id = f"{body.get('chatid', '')}_{body.get('sendertime', '')}"
 
             # Extract sender info from "from" field (SDK format)
             from_info = body.get("from", {})
-            sender_id = from_info.get("userid", "unknown") if isinstance(from_info, dict) else "unknown"
+            sender_id = (
+                cast(str, cast(dict[str, Any], from_info).get("userid", "unknown"))
+                if isinstance(from_info, dict)
+                else "unknown"
+            )
             if not self.is_allowed(sender_id):
                 return
 
@@ -253,21 +261,22 @@ class WecomChannel(BaseChannel):
 
             # For single chat, chatid is the sender's userid
             # For group chat, chatid is provided in body
-            chat_type = body.get("chattype", "single")
-            chat_id = body.get("chatid", sender_id)
+            chat_type = cast(str, body.get("chattype", "single"))
+            chat_id = cast(str, body.get("chatid", sender_id))
 
-            content_parts = []
+            content_parts: list[str] = []
             media_paths: list[str] = []
 
             if msg_type == "text":
-                text = body.get("text", {}).get("content", "")
+                text_info = cast(dict[str, Any], body.get("text", {}))
+                text = cast(str, text_info.get("content", ""))
                 if text:
                     content_parts.append(text)
 
             elif msg_type == "image":
-                image_info = body.get("image", {})
-                file_url = image_info.get("url", "")
-                aes_key = image_info.get("aeskey", "")
+                image_info = cast(dict[str, Any], body.get("image", {}))
+                file_url = cast(str, image_info.get("url", ""))
+                aes_key = cast(str, image_info.get("aeskey", ""))
 
                 if file_url and aes_key:
                     file_path = await self._download_and_save_media(file_url, aes_key, "image")
@@ -281,19 +290,19 @@ class WecomChannel(BaseChannel):
                     content_parts.append("[image: download failed]")
 
             elif msg_type == "voice":
-                voice_info = body.get("voice", {})
+                voice_info = cast(dict[str, Any], body.get("voice", {}))
                 # Voice message already contains transcribed content from WeCom
-                voice_content = voice_info.get("content", "")
+                voice_content = cast(str, voice_info.get("content", ""))
                 if voice_content:
                     content_parts.append(f"[voice] {voice_content}")
                 else:
                     content_parts.append("[voice]")
 
             elif msg_type == "file":
-                file_info = body.get("file", {})
-                file_url = file_info.get("url", "")
-                aes_key = file_info.get("aeskey", "")
-                file_name = file_info.get("name") or None
+                file_info = cast(dict[str, Any], body.get("file", {}))
+                file_url = cast(str, file_info.get("url", ""))
+                aes_key = cast(str, file_info.get("aeskey", ""))
+                file_name = cast(str | None, file_info.get("name") or None)
 
                 if file_url and aes_key:
                     file_path = await self._download_and_save_media(file_url, aes_key, "file", file_name)
@@ -308,16 +317,20 @@ class WecomChannel(BaseChannel):
 
             elif msg_type == "mixed":
                 # Mixed content contains multiple message items
-                msg_items = body.get("mixed", {}).get("msg_item", [])
-                for item in msg_items:
-                    item_type = item.get("msgtype", "")
+                mixed_info = cast(dict[str, Any], body.get("mixed", {}))
+                msg_items = cast(list[Any], mixed_info.get("msg_item", []))
+                for raw_item in msg_items:
+                    item = cast(dict[str, Any], raw_item)
+                    item_type = cast(str, item.get("msgtype", ""))
                     if item_type == "text":
-                        text = item.get("text", {}).get("content", "")
+                        text_info = cast(dict[str, Any], item.get("text", {}))
+                        text = cast(str, text_info.get("content", ""))
                         if text:
                             content_parts.append(text)
                     elif item_type == "image":
-                        file_url = item.get("image", {}).get("url", "")
-                        aes_key = item.get("image", {}).get("aeskey", "")
+                        image_info = cast(dict[str, Any], item.get("image", {}))
+                        file_url = cast(str, image_info.get("url", ""))
+                        aes_key = cast(str, image_info.get("aeskey", ""))
                         if file_url and aes_key:
                             file_path = await self._download_and_save_media(file_url, aes_key, "image")
                             if file_path:
@@ -374,18 +387,17 @@ class WecomChannel(BaseChannel):
                 self.logger.warning("Failed to download media")
                 return None
 
-            if len(data) > WECOM_UPLOAD_MAX_BYTES:
+            if len(data) > WECOM_DOWNLOAD_MAX_BYTES:
                 self.logger.warning(
                     "inbound media too large: {} bytes (max {})",
                     len(data),
-                    WECOM_UPLOAD_MAX_BYTES,
+                    WECOM_DOWNLOAD_MAX_BYTES,
                 )
                 return None
 
             media_dir = get_media_dir("wecom")
-            if not filename:
-                filename = fname or f"{media_type}_{hash(file_url) % 100000}"
-            filename = _sanitize_filename(filename)
+            fallback_name = fname or f"{media_type}_{hash(file_url) % 100000}"
+            filename = _sanitize_filename(cast(str, filename or fallback_name), fallback=fallback_name)
 
             file_path = media_dir / filename
             await asyncio.to_thread(file_path.write_bytes, data)
@@ -395,100 +407,6 @@ class WecomChannel(BaseChannel):
         except Exception:
             self.logger.exception("Error downloading media")
             return None
-
-    async def _upload_media_ws(
-        self, client: Any, file_path: str,
-    ) -> "tuple[str, str] | tuple[None, None]":
-        """Upload a local file to WeCom via WebSocket 3-step protocol (base64).
-
-        Uses the WeCom WebSocket upload commands directly via
-        ``client._ws_manager.send_reply()``:
-
-          ``aibot_upload_media_init``   → upload_id
-          ``aibot_upload_media_chunk`` × N  (≤512 KB raw per chunk, base64)
-          ``aibot_upload_media_finish`` → media_id
-
-        Returns (media_id, media_type) on success, (None, None) on failure.
-        """
-        from wecom_aibot_sdk.utils import generate_req_id as _gen_req_id
-
-        try:
-            fname = os.path.basename(file_path)
-            media_type = _guess_wecom_media_type(fname)
-
-            # Read file size and data in a thread to avoid blocking the event loop
-            def _read_file():
-                file_size = os.path.getsize(file_path)
-                if file_size > WECOM_UPLOAD_MAX_BYTES:
-                    raise ValueError(
-                        f"File too large: {file_size} bytes (max {WECOM_UPLOAD_MAX_BYTES})"
-                    )
-                with open(file_path, "rb") as f:
-                    return file_size, f.read()
-
-            file_size, data = await asyncio.to_thread(_read_file)
-            # MD5 is used for file integrity only, not cryptographic security
-            md5_hash = hashlib.md5(data).hexdigest()
-
-            chunk_size = 512 * 1024  # 512 KB raw (before base64)
-            mv = memoryview(data)
-            chunk_list = [bytes(mv[i : i + chunk_size]) for i in range(0, file_size, chunk_size)]
-            n_chunks = len(chunk_list)
-            del mv, data
-
-            # Step 1: init
-            req_id = _gen_req_id("upload_init")
-            resp = await client._ws_manager.send_reply(req_id, {
-                "type": media_type,
-                "filename": fname,
-                "total_size": file_size,
-                "total_chunks": n_chunks,
-                "md5": md5_hash,
-            }, "aibot_upload_media_init")
-            if resp.errcode != 0:
-                self.logger.warning("upload init failed ({}): {}", resp.errcode, resp.errmsg)
-                return None, None
-            upload_id = resp.body.get("upload_id") if resp.body else None
-            if not upload_id:
-                self.logger.warning("upload init: no upload_id in response")
-                return None, None
-
-            # Step 2: send chunks
-            for i, chunk in enumerate(chunk_list):
-                req_id = _gen_req_id("upload_chunk")
-                resp = await client._ws_manager.send_reply(req_id, {
-                    "upload_id": upload_id,
-                    "chunk_index": i,
-                    "base64_data": base64.b64encode(chunk).decode(),
-                }, "aibot_upload_media_chunk")
-                if resp.errcode != 0:
-                    self.logger.warning("upload chunk {} failed ({}): {}", i, resp.errcode, resp.errmsg)
-                    return None, None
-
-            # Step 3: finish
-            req_id = _gen_req_id("upload_finish")
-            resp = await client._ws_manager.send_reply(req_id, {
-                "upload_id": upload_id,
-            }, "aibot_upload_media_finish")
-            if resp.errcode != 0:
-                self.logger.warning("upload finish failed ({}): {}", resp.errcode, resp.errmsg)
-                return None, None
-
-            media_id = resp.body.get("media_id") if resp.body else None
-            if not media_id:
-                self.logger.warning("upload finish: no media_id in response body={}", resp.body)
-                return None, None
-
-            suffix = "..." if len(media_id) > 16 else ""
-            self.logger.debug("uploaded {} ({}) → media_id={}", fname, media_type, media_id[:16] + suffix)
-            return media_id, media_type
-
-        except ValueError as e:
-            self.logger.warning("upload skipped for {}: {}", file_path, e)
-            return None, None
-        except Exception:
-            self.logger.exception("_upload_media_ws error for {}", file_path)
-            return None, None
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through WeCom."""
@@ -507,30 +425,33 @@ class WecomChannel(BaseChannel):
                 if not os.path.isfile(file_path):
                     self.logger.warning("media file not found: {}", file_path)
                     continue
-                media_id, media_type = await self._upload_media_ws(self._client, file_path)
-                if media_id:
-                    if frame:
-                        await self._client.reply(frame, {
-                            "msgtype": media_type,
-                            media_type: {"media_id": media_id},
-                        })
-                    else:
-                        await self._client.send_message(msg.chat_id, {
-                            "msgtype": media_type,
-                            media_type: {"media_id": media_id},
-                        })
-                    self.logger.debug("sent {} → {}", media_type, msg.chat_id)
-                else:
+                try:
+                    upload = await self._client.upload_media(file_path)
+                except Exception:
+                    self.logger.exception("media upload failed for {}", file_path)
                     content += f"\n[file upload failed: {os.path.basename(file_path)}]"
+                    continue
+
+                media_type = upload.media_type
+                media_body = {
+                    "msgtype": media_type,
+                    media_type: {"media_id": upload.media_id},
+                }
+                if frame:
+                    await self._client.reply(frame, media_body)
+                else:
+                    await self._client.send_message(msg.chat_id, media_body)
+                self.logger.debug("sent {} → {}", media_type, msg.chat_id)
 
             if not content:
                 return
 
             if frame:
-                # Both progress and final messages must use reply_stream (cmd="aibot_respond_msg").
-                # The plain reply() uses cmd="reply" which does not support "text" msgtype
-                # and causes errcode=40008 from WeCom API.
-                stream_id = self._generate_req_id("stream")
+                # Keep progress and final updates on the SDK's serialized streaming reply path.
+                generate_req_id = self._generate_req_id
+                if generate_req_id is None:
+                    raise RuntimeError("WeCom request-id generator is not initialized")
+                stream_id = generate_req_id("stream")
                 await self._client.reply_stream(
                     frame,
                     stream_id,

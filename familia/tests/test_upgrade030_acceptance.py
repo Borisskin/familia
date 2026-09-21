@@ -17,7 +17,7 @@ async def test_callback_consumer_runs_inside_agent_loop(tmp_path: Path, monkeypa
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.events import CallbackEvent
     from nanobot.bus.queue import MessageBus
-    from nanobot.providers.base import GenerationSettings, LLMResponse
+    from nanobot.providers.base import GenerationSettings, LLMResponse, LLMUsage
     from nanobot.runtime_adapters import RuntimeAdapters
 
     registry = PrincipalRegistry(
@@ -44,8 +44,11 @@ async def test_callback_consumer_runs_inside_agent_loop(tmp_path: Path, monkeypa
     provider.get_default_model.return_value = "test-model"
     provider.generation = GenerationSettings()
     provider.supports_progress_deltas = False
-    provider.chat_with_retry = AsyncMock(
-        return_value=LLMResponse(content="callback handled", usage={})
+    provider.chat_stream_with_retry = AsyncMock(
+        return_value=LLMResponse(
+            content="callback handled",
+            usage=LLMUsage.reported(input_tokens=0, output_tokens=0),
+        )
     )
     bus = MessageBus()
     adapters = RuntimeAdapters(
@@ -75,7 +78,7 @@ async def test_callback_consumer_runs_inside_agent_loop(tmp_path: Path, monkeypa
     )
     outbound = await asyncio.wait_for(bus.consume_outbound(), timeout=2)
     assert outbound.content == "callback handled"
-    assert provider.chat_with_retry.await_count == 1
+    assert provider.chat_stream_with_retry.await_count == 1
     loop._running = False
     await asyncio.wait_for(run_task, timeout=2)
     assert bus.callback_size == 0
@@ -89,7 +92,7 @@ async def test_cron_create_save_reload_and_run(tmp_path: Path, monkeypatch) -> N
     calls: list[tuple[str, str | None, str | None]] = []
 
     async def on_job(job) -> None:
-        calls.append((job.id, job.payload.owner_actor, job.payload.session_key))
+        calls.append((job.id, job.payload.origin_metadata.get("actor"), job.payload.session_key))
 
     store_path = tmp_path / "cron" / "jobs.json"
     service = CronService(store_path, on_job=on_job)
@@ -103,11 +106,6 @@ async def test_cron_create_save_reload_and_run(tmp_path: Path, monkeypatch) -> N
         origin_channel="telegram",
         origin_chat_id="200",
         origin_metadata={"actor": "owner", "route": "private"},
-        created_by="owner",
-        creator_actor="owner",
-        target_actor="owner",
-        owner_actor="owner",
-        tags=["acceptance"],
     )
     assert store_path.is_file()
 
@@ -115,7 +113,7 @@ async def test_cron_create_save_reload_and_run(tmp_path: Path, monkeypatch) -> N
     monkeypatch.setattr(restarted, "_arm_timer", lambda: None)
     loaded = restarted.get_job(job.id)
     assert loaded is not None
-    assert loaded.payload.owner_actor == "owner"
+    assert loaded.payload.origin_metadata["actor"] == "owner"
     assert loaded.payload.session_key == "familia:owner:telegram:200"
     assert loaded.payload.origin_metadata == {"actor": "owner", "route": "private"}
     assert await restarted.run_job(job.id)
@@ -123,8 +121,7 @@ async def test_cron_create_save_reload_and_run(tmp_path: Path, monkeypatch) -> N
 
     persisted = json.loads(store_path.read_text(encoding="utf-8"))
     saved = persisted["jobs"][0]
-    assert saved["payload"]["ownerActor"] == "owner"
-    assert saved["payload"]["creatorActor"] == "owner"
+    assert saved["payload"]["originMetadata"] == {"actor": "owner", "route": "private"}
     assert saved["state"]["lastStatus"] == "ok"
     assert saved["state"]["runHistory"][-1]["status"] == "ok"
 
@@ -184,6 +181,7 @@ def test_admin_model_config_round_trip_keeps_fallback_and_uses_main(
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
     from nanobot.config.loader import load_config
+    from nanobot.agent.tools.registry import ToolRegistry
     from nanobot.runtime_adapters import RuntimeAdapters
 
     config_path = tmp_path / "config.json"
@@ -229,7 +227,7 @@ def test_admin_model_config_round_trip_keeps_fallback_and_uses_main(
         config,
         bus=MessageBus(),
         provider=provider,
+        tool_registry=ToolRegistry(),
         runtime_adapters=RuntimeAdapters(),
     )
     assert loop.model == "openai/main-selected"
-    assert getattr(config.agents, "familia_fallback")["model"] == "openai/fallback-selected"

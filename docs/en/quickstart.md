@@ -61,7 +61,7 @@ Any Windows 10 / 11 machine with **WebView2** installed. It is present by defaul
 
 ## Install through the admin app
 
-1. Download **two** files from [Releases](../../releases/latest):
+1. Download **two** files from [Releases](https://github.com/Verconto/familia/releases/latest):
    - `FamiliaAdmin-vX.Y.Z.exe`
    - `WebView2Loader.dll`
 

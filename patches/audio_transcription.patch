@@ -1,11 +1,11 @@
-# nanobot baseline: 0.3.0
-# upstream commit: 3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
-diff --git aa/nanobot/nanobot/audio/transcription.py bb/nanobot/nanobot/audio/transcription.py
-index 539f90b..43b1038 100644
---- aa/nanobot/nanobot/audio/transcription.py
-+++ bb/nanobot/nanobot/audio/transcription.py
-@@ -28,6 +28,7 @@ from nanobot.utils.media_decode import FileSizeExceeded, save_base64_data_url
+diff --git a/nanobot/nanobot/audio/transcription.py b/nanobot/nanobot/audio/transcription.py
+index c336cc8..41b2a2a 100644
+--- a/nanobot/nanobot/audio/transcription.py
++++ b/nanobot/nanobot/audio/transcription.py
+@@ -29,6 +29,7 @@
  TranscriptionProviderName = str
  
  _DEFAULT_PROVIDER: TranscriptionProviderName = "groq"
@@ -13,7 +13,7 @@ index 539f90b..43b1038 100644
  _MAX_AUDIO_BYTES_FALLBACK = 25 * 1024 * 1024
  _AUDIO_MIME_ALLOWED: frozenset[str] = frozenset({
      "audio/aac",
-@@ -53,10 +54,13 @@ class EffectiveTranscriptionConfig:
+@@ -54,10 +55,13 @@
      api_base: str
      max_duration_sec: int
      max_upload_mb: int
@@ -28,7 +28,7 @@ index 539f90b..43b1038 100644
  
  
  class TranscriptionIngressError(Exception):
-@@ -69,8 +73,10 @@ class TranscriptionIngressError(Exception):
+@@ -70,8 +74,10 @@
  
  
  def _as_provider(value: Any) -> TranscriptionProviderName | None:
@@ -39,8 +39,8 @@ index 539f90b..43b1038 100644
 +    return spec.name if spec else value.strip().lower()
  
  
- def _provider_config(config: Any, provider: str) -> Any:
-@@ -78,6 +84,8 @@ def _provider_config(config: Any, provider: str) -> Any:
+ def _provider_config(config: Config, provider: str) -> ProviderConfig | None:
+@@ -80,6 +86,8 @@
  
  
  def _provider_default_api_base(provider: str) -> str | None:
@@ -49,7 +49,7 @@ index 539f90b..43b1038 100644
      spec = find_by_name(provider)
      return spec.default_api_base if spec else None
  
-@@ -92,6 +100,10 @@ def _resolve_transcription_api_key(provider: str, provider_cfg: Any) -> str:
+@@ -97,6 +105,10 @@
          env_key = os.environ.get("SILICONFLOW_API_KEY")
          if env_key:
              return env_key
@@ -59,8 +59,8 @@ index 539f90b..43b1038 100644
 +            return env_key
  
      env_key = spec.env_key if spec else ""
-     return os.environ.get(env_key) if env_key else ""
-@@ -101,6 +113,8 @@ def _resolve_transcription_api_base(provider: str, provider_cfg: Any) -> str:
+     return os.environ.get(env_key, "") if env_key else ""
+@@ -109,6 +121,8 @@
      api_base = resolve_env_refs(getattr(provider_cfg, "api_base", None) or "") if provider_cfg else ""
      if api_base:
          return api_base
@@ -69,7 +69,7 @@ index 539f90b..43b1038 100644
      return _provider_default_api_base(provider) or ""
  
  
-@@ -115,18 +129,18 @@ def resolve_transcription_config(config: Any) -> EffectiveTranscriptionConfig:
+@@ -123,18 +137,18 @@
      """Resolve top-level transcription settings with legacy channel fallback."""
      top = getattr(config, "transcription", None)
      channels = getattr(config, "channels", None)
@@ -96,7 +96,7 @@ index 539f90b..43b1038 100644
      return EffectiveTranscriptionConfig(
          enabled=bool(getattr(top, "enabled", True)),
          provider=provider,
-@@ -136,6 +150,7 @@ def resolve_transcription_config(config: Any) -> EffectiveTranscriptionConfig:
+@@ -144,6 +158,7 @@
          api_base=_resolve_transcription_api_base(provider, provider_cfg),
          max_duration_sec=int(getattr(top, "max_duration_sec", 120)),
          max_upload_mb=int(getattr(top, "max_upload_mb", 25)),
@@ -104,7 +104,7 @@ index 539f90b..43b1038 100644
      )
  
  
-@@ -199,10 +214,15 @@ async def transcribe_audio_file(
+@@ -207,10 +222,15 @@
      if spec is None:
          logger.warning("Unknown transcription provider: {}", config.provider)
          return ""
@@ -124,4 +124,3 @@ index 539f90b..43b1038 100644
 +        **provider_kwargs,
      )
      return await provider.transcribe(file_path)
-

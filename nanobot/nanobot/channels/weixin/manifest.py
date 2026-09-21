@@ -8,8 +8,23 @@ from nanobot.channels.weixin.validation import validate
 
 SETUP_SPEC = ChannelSetupSpec(
     fields={
-        "token": field("secret"),
+        # QR-managed credentials must not be exposed to generic WebUI autosave.
+        "token": field("secret", writable=False, snapshot=False),
         "allowFrom": field("list"),
+        "baseUrl": field(default="https://ilinkai.weixin.qq.com"),
+        "cdnBaseUrl": field(default="https://novac2c.cdn.weixin.qq.com/c2c"),
+        "routeTag": field(),
+        "stateDir": field(),
+        "pollTimeout": field("int", default=35),
+        "sendProgress": field("bool", default=False),
+        "sendToolHints": field("bool", default=False),
+        "replyProgressMessages": field("bool", default=False),
+        "replyProgressMaxMessages": field("int", default=2),
+        "contextMessageBudget": field("int", default=8),
+        "streaming": field("bool", default=True),
+        "blockStreaming": field("bool", default=False),
+        "blockStreamingMinChars": field("int", default=1200),
+        "blockStreamingMaxMessages": field("int", default=3),
     },
     required=(required("token"),),
     official_url="https://weixin.qq.com/",

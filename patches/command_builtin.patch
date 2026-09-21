@@ -1,147 +1,223 @@
-# nanobot baseline: 0.3.0
-# upstream commit: 3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
-diff --git aa/nanobot/nanobot/command/builtin.py bb/nanobot/nanobot/command/builtin.py
-index a928900..dd8c104 100644
---- aa/nanobot/nanobot/command/builtin.py
-+++ bb/nanobot/nanobot/command/builtin.py
-@@ -11,6 +11,8 @@ from contextlib import suppress
- from dataclasses import dataclass
- from typing import Literal
+diff --git a/nanobot/nanobot/command/builtin.py b/nanobot/nanobot/command/builtin.py
+index 27021b9..03dec68 100644
+--- a/nanobot/nanobot/command/builtin.py
++++ b/nanobot/nanobot/command/builtin.py
+@@ -3,11 +3,13 @@
+ from __future__ import annotations
  
-+from loguru import logger
-+
- from nanobot import __version__
- from nanobot.agent.goal_permission import goal_mutation_permission
- from nanobot.bus.events import OutboundMessage
-@@ -396,6 +398,24 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
+ import asyncio
++import inspect
+ import os
+ import subprocess
+ import sys
+ import time
+ from contextlib import suppress
++from copy import deepcopy
+ from dataclasses import dataclass, replace
+ from typing import TYPE_CHECKING, Any, Literal, cast
+ 
+@@ -310,13 +312,16 @@
      )
  
  
-+def _familia_dream_adapter(loop: object):
-+    adapters = getattr(loop, "runtime_adapters", None)
-+    handler = getattr(adapters, "run_dream", None)
-+    return handler if callable(handler) else None
+-async def cmd_new(ctx: CommandContext) -> OutboundMessage:
++async def _cmd_new_unlocked(ctx: CommandContext) -> OutboundMessage:
+     """Stop active task and start a fresh session."""
+     loop = ctx.loop
+     await loop._cancel_active_tasks(ctx.key)  # pyright: ignore[reportPrivateUsage]
+-    loop.discard_session_file_state(ctx.key)
+     session = ctx.session or loop.sessions.get_or_create(ctx.key)
+     snapshot = list(session.messages)
++    original_metadata = deepcopy(session.metadata)
++    original_last_archived = session.last_archived
++    original_provider_state = session.provider_state
++    original_updated_at = session.updated_at
+     archive_snapshot = None
+     runtime = None
+     if session.last_archived < len(snapshot):
+@@ -327,22 +332,65 @@
+             metadata=dict(session.metadata),
+             provider_state=None,
+         )
+-    session.clear()
+-    loop.sessions.save(session)
+-    loop.sessions.invalidate(session.key)
+     if archive_snapshot is not None and runtime is not None:
+-        loop.schedule_background(
+-            loop.consolidator.archive_session(  # pyright: ignore[reportUnknownMemberType]
++        try:
++            archived = await loop.consolidator.archive_session(
+                 archive_snapshot,
+                 archive_end=len(snapshot),
+                 runtime=runtime,
+             )
+-        )
++        except Exception:
++            logger.exception("Could not archive session {} before /new", ctx.key)
++            return OutboundMessage(
++                channel=ctx.msg.channel,
++                chat_id=ctx.msg.chat_id,
++                content="Could not start a new session; existing history was kept.",
++                metadata=dict(ctx.msg.metadata or {}),
++            )
++        if archived is None:
++            logger.error("Session archive was not committed before /new for {}", ctx.key)
++            return OutboundMessage(
++                channel=ctx.msg.channel,
++                chat_id=ctx.msg.chat_id,
++                content="Could not start a new session; existing history was kept.",
++                metadata=dict(ctx.msg.metadata or {}),
++            )
++    session.clear()
++    try:
++        loop.sessions.save(session)
++    except Exception:
++        session.messages = snapshot
++        session.metadata = original_metadata
++        session.last_archived = original_last_archived
++        session.provider_state = original_provider_state
++        session.updated_at = original_updated_at
++        logger.exception("Could not persist /new for session {}", ctx.key)
++        return OutboundMessage(
++            channel=ctx.msg.channel,
++            chat_id=ctx.msg.chat_id,
++            content="Could not start a new session; existing history was kept.",
++            metadata=dict(ctx.msg.metadata or {}),
++        )
++    loop.sessions.invalidate(session.key)
++    loop.discard_session_file_state(ctx.key)
+     return OutboundMessage(
+         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
+         content="New session started.",
+         metadata=dict(ctx.msg.metadata or {})
+     )
 +
 +
-+def _familia_dream_management_unavailable(ctx: CommandContext, command: str) -> OutboundMessage:
-+    return OutboundMessage(
-+        channel=ctx.msg.channel,
-+        chat_id=ctx.msg.chat_id,
-+        content=(
-+            f"{command} is unavailable in Familia mode because Dream memory is "
-+            "owner-scoped. Use `/dream` for a private consolidation run."
-+        ),
-+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
++async def cmd_new(ctx: CommandContext) -> OutboundMessage:
++    """Stop active work and reset only after the shared archive lock is held."""
++    lock_factory = getattr(ctx.loop, "_session_lock", None)
++    if callable(lock_factory):
++        async with lock_factory(ctx.key):
++            return await _cmd_new_unlocked(ctx)
++    lock_factory = getattr(getattr(ctx.loop, "consolidator", None), "get_lock", None)
++    if callable(lock_factory):
++        async with lock_factory(ctx.key):
++            return await _cmd_new_unlocked(ctx)
++    return await _cmd_new_unlocked(ctx)
+ 
+ 
+ async def cmd_compact(ctx: CommandContext) -> None:
+@@ -448,12 +496,84 @@
+     )
+ 
+ 
++async def _publish_dream_outbound(
++    loop: Any,
++    outbound: OutboundMessage,
++    inbound: Any,
++) -> None:
++    """Route Dream status through the same outbound policy as a normal turn."""
++    publisher = getattr(loop, "_publish_outbound", None)
++    if callable(publisher):
++        result = publisher(
++            outbound,
++            inbound=inbound,
++            actor=getattr(inbound, "actor", None),
++            action="dream",
++        )
++        if inspect.isawaitable(result):
++            await result
++        return
++    guard = getattr(getattr(loop, "runtime_adapters", None), "outbound_guard", None)
++    bus = getattr(loop, "bus", None)
++    publish = getattr(bus, "publish_outbound", None)
++    if not callable(publish):
++        return
++    if guard is None:
++        await publish(outbound)
++        return
++    from nanobot.agent.outbound import OutboundDecision, OutboundRequest
++
++    result = guard(
++        OutboundRequest(
++            action="dream",
++            outbound=outbound,
++            actor=getattr(inbound, "actor", None),
++            inbound_channel=getattr(inbound, "channel", None),
++            inbound_chat_id=getattr(inbound, "chat_id", None),
++            metadata=dict(getattr(inbound, "metadata", {}) or {}),
++            publish_outbound=publish,
++        )
 +    )
++    if inspect.isawaitable(result):
++        result = await result
++    if isinstance(result, OutboundDecision) and result.kind == "allow":
++        await publish(result.outbound or outbound)
 +
 +
  async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
      """Manually trigger a Dream consolidation run."""
      import time
-@@ -403,6 +423,59 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
+ 
      loop = ctx.loop
      msg = ctx.msg
- 
-+    if _familia_dream_adapter(loop) is not None:
-+        actor = (
-+            msg.actor.strip()
-+            if isinstance(msg.actor, str) and msg.actor.strip()
-+            else None
-+        )
-+        if actor is None:
-+            return OutboundMessage(
-+                channel=msg.channel,
-+                chat_id=msg.chat_id,
-+                content="Dream failed: no server-resolved actor.",
-+                metadata={**dict(msg.metadata or {}), "render_as": "text"},
-+            )
 +
-+        async def _run_adapter_dream() -> None:
++    service_runner = getattr(getattr(loop, "runtime_adapters", None), "run_dream", None)
++    if callable(service_runner) and getattr(msg, "actor", None):
++        async def _run_service_dream() -> None:
 +            try:
-+                result = await loop.run_dream(actor)
++                result = service_runner(msg.actor, loop)
++                if inspect.isawaitable(result):
++                    result = await result
 +                if isinstance(result, OutboundMessage):
 +                    outbound = result
-+                elif result is None:
-+                    return
-+                else:
++                elif isinstance(result, str) and result.strip():
 +                    outbound = OutboundMessage(
 +                        channel=msg.channel,
 +                        chat_id=msg.chat_id,
-+                        content=str(result),
++                        content=result,
 +                    )
-+                await loop._publish_outbound(
-+                    outbound,
-+                    actor=actor,
-+                    inbound=msg,
-+                    action="message.send",
-+                )
-+            except Exception as exc:  # pragma: no cover - adapter-owned path
-+                logger.exception("Runtime Dream handler failed")
-+                await loop._publish_outbound(
-+                    OutboundMessage(
-+                        channel=msg.channel,
-+                        chat_id=msg.chat_id,
-+                        content=f"Dream failed: {exc}",
-+                    ),
-+                    actor=actor,
-+                    inbound=msg,
-+                    action="message.send",
-+                )
++                else:
++                    return
++                await _publish_dream_outbound(loop, outbound, msg)
++            except Exception:
++                logger.exception("Dream service hook failed")
 +
-+        asyncio.create_task(_run_adapter_dream())
++        asyncio.create_task(_run_service_dream())
 +        return OutboundMessage(
 +            channel=msg.channel,
 +            chat_id=msg.chat_id,
 +            content="Dreaming...",
 +        )
-+
+ 
      async def _run_dream():
-         async def _silent(*_args, **_kwargs):
-             pass
-@@ -425,7 +498,7 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
+         from nanobot.agent.memory import MemoryStore
+@@ -473,11 +593,11 @@
+         try:
+             result = store.build_dream_prompt()
+             if result is None:
+-                await loop.bus.publish_outbound(OutboundMessage(
++                await _publish_dream_outbound(loop, OutboundMessage(
                      channel=msg.channel, chat_id=msg.chat_id,
                      content=_format_dream_no_input_message(),
                      metadata={"render_as": "text"},
 -                ))
-+                ), action="message.send")
++                ), msg)
                  return
              prompt, last_cursor = result
              key = dream_session_key()
-@@ -473,7 +546,7 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
-             prune_dream_sessions(loop.sessions.sessions_dir)
-         await loop.bus.publish_outbound(OutboundMessage(
+@@ -518,9 +638,9 @@
+                     content += f" (commit {sha})"
+             store.compact_history()
+             prune_dream_sessions(loop.sessions)
+-        await loop.bus.publish_outbound(OutboundMessage(
++        await _publish_dream_outbound(loop, OutboundMessage(
              channel=msg.channel, chat_id=msg.chat_id, content=content,
 -        ))
-+        ), action="message.send")
++        ), msg)
  
      asyncio.create_task(_run_dream())
      return OutboundMessage(
-@@ -483,6 +556,8 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
- 
- async def cmd_dream_prompt(ctx: CommandContext) -> OutboundMessage:
-     """Show or set up the workspace Dream memory instructions."""
-+    if _familia_dream_adapter(ctx.loop) is not None:
-+        return _familia_dream_management_unavailable(ctx, "/dream-prompt")
-     store = ctx.loop.context.memory
-     path = store.dream_prompt_file
-     display_path = path.relative_to(store.workspace).as_posix()
-@@ -673,6 +748,8 @@ async def cmd_dream_log(ctx: CommandContext) -> OutboundMessage:
-     Default: diff of the latest Dream commit versus its parent.
-     With /dream-log <sha>: diff of that specific commit.
-     """
-+    if _familia_dream_adapter(ctx.loop) is not None:
-+        return _familia_dream_management_unavailable(ctx, "/dream-log")
-     store = ctx.loop.consolidator.store
-     git = store.git
- 
-@@ -737,6 +814,8 @@ async def cmd_dream_restore(ctx: CommandContext) -> OutboundMessage:
-         /dream-restore          — list recent commits
-         /dream-restore <sha>    — revert a specific commit
-     """
-+    if _familia_dream_adapter(ctx.loop) is not None:
-+        return _familia_dream_management_unavailable(ctx, "/dream-restore")
-     store = ctx.loop.consolidator.store
-     git = store.git
-     if not git.is_initialized():
-

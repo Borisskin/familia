@@ -6,10 +6,11 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
-from nanobot.agent.tools.context import RUNTIME_REQUEST_CONTEXT_KEY
-
 if TYPE_CHECKING:
     from nanobot.bus.events import OutboundMessage
+
+
+RUNTIME_REQUEST_CONTEXT_KEY = "_runtime_request_context"
 
 
 @dataclass(frozen=True)
@@ -35,15 +36,15 @@ class OutboundDecision:
     outbound: OutboundMessage | None = None
 
     @classmethod
-    def allow(cls, outbound: OutboundMessage | None = None) -> OutboundDecision:
+    def allow(cls, outbound: OutboundMessage | None = None) -> "OutboundDecision":
         return cls(kind="allow", outbound=outbound)
 
     @classmethod
-    def deny(cls, reason: str) -> OutboundDecision:
+    def deny(cls, reason: str) -> "OutboundDecision":
         return cls(kind="deny", reason=reason)
 
     @classmethod
-    def asked(cls, reason: str, approvers_label: str) -> OutboundDecision:
+    def asked(cls, reason: str, approvers_label: str) -> "OutboundDecision":
         return cls(kind="asked", reason=reason, approvers_label=approvers_label)
 
 
@@ -59,13 +60,3 @@ async def allow_outbound(request: OutboundRequest) -> OutboundDecision:
 def replace_outbound(request: OutboundRequest, outbound: OutboundMessage) -> OutboundRequest:
     """Return the same authorization request with a guarded message."""
     return replace(request, outbound=outbound)
-
-
-__all__ = [
-    "OutboundDecision",
-    "OutboundGuard",
-    "OutboundRequest",
-    "RUNTIME_REQUEST_CONTEXT_KEY",
-    "allow_outbound",
-    "replace_outbound",
-]

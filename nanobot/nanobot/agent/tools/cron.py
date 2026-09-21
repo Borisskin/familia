@@ -1,21 +1,24 @@
 """Cron tool for scheduling reminders and tasks."""
 
+# pyright: reportIncompatibleMethodOverride=false
+
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from datetime import datetime
 from typing import Any
 
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
-from nanobot.agent.tools.context import RequestContext, current_request_context
+from nanobot.agent.tools.context import RequestContext, ToolContext, current_request_context
 from nanobot.agent.tools.schema import (
+    ArraySchema,
     IntegerSchema,
     StringSchema,
     tool_parameters_schema,
 )
 from nanobot.cron.service import CronService
-from nanobot.cron.types import CronJob, CronJobState, CronSchedule
+from nanobot.cron.types import CronJob, CronJobState, CronPayload, CronSchedule
 from nanobot.session.keys import UNIFIED_SESSION_KEY
 
 _CRON_PARAMETERS = tool_parameters_schema(
@@ -29,7 +32,7 @@ _CRON_PARAMETERS = tool_parameters_schema(
         "(e.g., 'Send a reminder to WeChat: xxx' or 'Check system status and report'). "
         "Not used for action='list' or action='remove'."
     ),
-    every_seconds=IntegerSchema(0, description="Interval in seconds (for recurring tasks)"),
+    every_seconds=IntegerSchema(description="Interval in seconds (for recurring tasks)"),
     cron_expr=StringSchema("Cron expression like '0 9 * * *' (for scheduled tasks)"),
     tz=StringSchema(
         "Optional IANA timezone for cron expressions (e.g. 'America/Vancouver'). "
@@ -38,6 +41,14 @@ _CRON_PARAMETERS = tool_parameters_schema(
     at=StringSchema(
         "ISO datetime for one-time execution (e.g. '2026-02-12T10:30:00'). "
         "Naive values use the tool's default timezone."
+    ),
+    tags=ArraySchema(
+        StringSchema(""),
+        description=(
+            "Optional tag IDs attached to this job. In Familia, every tag must be reachable "
+            "by the calling actor."
+        ),
+        nullable=True,
     ),
     job_id=StringSchema("REQUIRED when action='remove'. Job ID to remove (obtain via action='list')."),
     required=["action"],
@@ -68,16 +79,23 @@ class CronTool(Tool):
         self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
 
     @classmethod
-    def enabled(cls, ctx: Any) -> bool:
+    def enabled(cls, ctx: ToolContext) -> bool:
         return ctx.cron_service is not None
 
     @classmethod
-    def create(cls, ctx: Any) -> Tool:
-        job_access = getattr(ctx, "cron_job_access", None)
+    def create(cls, ctx: ToolContext) -> Tool:
+        cron_service = ctx.cron_service
+        if cron_service is None:
+            raise RuntimeError("CronTool requires an initialized cron service")
+        job_access = ctx.cron_job_access
         return cls(
-            cron_service=ctx.cron_service,
+            cron_service=cron_service,
             default_timezone=ctx.timezone,
-            job_access=job_access if callable(job_access) else None,
+            job_access=(
+                job_access
+                if job_access is None or callable(job_access)
+                else lambda _job, _request: False
+            ),
         )
 
     @staticmethod
@@ -92,11 +110,11 @@ class CronTool(Tool):
         )
         return session_key, ctx.channel or "", ctx.chat_id or "", dict(ctx.metadata or {})
 
-    def set_cron_context(self, active: bool):
+    def set_cron_context(self, active: bool) -> Token[bool]:
         """Mark whether the tool is executing inside a cron job callback."""
         return self._in_cron_context.set(active)
 
-    def reset_cron_context(self, token) -> None:
+    def reset_cron_context(self, token: Token[bool]) -> None:
         """Restore previous cron context."""
         self._in_cron_context.reset(token)
 
@@ -150,14 +168,13 @@ class CronTool(Tool):
         cron_expr: str | None = None,
         tz: str | None = None,
         at: str | None = None,
+        tags: list[str] | None = None,
         job_id: str | None = None,
-        deliver: bool = True,
-        **kwargs: Any,
     ) -> str:
         if action == "add":
             if self._in_cron_context.get():
                 return ToolResult.error("Error: cannot schedule new jobs from within a cron job execution")
-            return self._add_job(name, message, every_seconds, cron_expr, tz, at)
+            return self._add_job(name, message, every_seconds, cron_expr, tz, at, tags)
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -172,6 +189,7 @@ class CronTool(Tool):
         cron_expr: str | None,
         tz: str | None,
         at: str | None,
+        tags: list[str] | None,
     ) -> str:
         if not message:
             return ToolResult.error(
@@ -189,6 +207,18 @@ class CronTool(Tool):
         if tz:
             if err := self._validate_timezone(tz):
                 return err
+        clean_tags = [
+            tag.strip() for tag in tags or [] if isinstance(tag, str) and tag.strip()
+        ]
+        missing_tags = [
+            tag
+            for tag in clean_tags
+            if not self._can_access(CronJob(id="", name="", payload=CronPayload(tags=[tag])))
+        ]
+        if missing_tags:
+            return ToolResult.error(
+                f"Error: tags not reachable from your identity: {', '.join(missing_tags)}"
+            )
 
         # Build schedule
         delete_after = False
@@ -216,10 +246,6 @@ class CronTool(Tool):
         else:
             return ToolResult.error("Error: either every_seconds, cron_expr, or at is required")
 
-        request = current_request_context()
-        actor = request.actor if request and isinstance(request.actor, str) else None
-        if actor is not None and not actor.strip():
-            actor = None
         job = self._cron.add_job(
             name=name or message[:30],
             schedule=schedule,
@@ -229,10 +255,7 @@ class CronTool(Tool):
             origin_channel=origin_channel,
             origin_chat_id=origin_chat_id,
             origin_metadata=origin_metadata,
-            created_by=actor,
-            creator_actor=actor,
-            owner_actor=actor,
-            target_actor=actor,
+            tags=clean_tags,
         )
         return f"Created job '{job.name}' (id: {job.id})"
 
@@ -280,7 +303,7 @@ class CronTool(Tool):
         jobs = [job for job in self._cron.list_jobs() if self._can_access(job)]
         if not jobs:
             return "No scheduled jobs."
-        lines = []
+        lines: list[str] = []
         for j in jobs:
             timing = self._format_timing(j.schedule)
             parts = [f"- {j.name} (id: {j.id}, {timing})"]

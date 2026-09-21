@@ -1,58 +1,35 @@
-"""Neutral runtime wiring for optional product integrations.
-
-The engine discovers one product adapter through the
-``nanobot.runtime_adapters`` entry-point group.  The default nanobot path stays
-empty; an explicitly selected mode is fail-closed when its adapter is missing
-or invalid.  Product code owns the implementations and this module only owns
-the boundary types and loading policy.
-"""
+"""Neutral runtime wiring for optional product integrations."""
 
 from __future__ import annotations
 
 import os
-from collections.abc import (
-    Awaitable,
-    Callable,
-    Mapping,
-    Sequence,
-)
-from contextlib import (
-    AbstractAsyncContextManager,
-    AbstractContextManager,
-    contextmanager,
-)
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager, AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from importlib.metadata import EntryPoint, entry_points
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
 
-from nanobot.agent.outbound import (
-    OutboundDecision,
-    OutboundGuard,
-    OutboundRequest,
-)
-from nanobot.agent.tools.context import (
-    RUNTIME_REQUEST_CONTEXT_KEY,
-    RequestContext,
-    ToolContext,
-    request_context,
-)
-from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.bus.events import CallbackEvent, InboundMessage, OutboundMessage
-from nanobot.channels.plugin import ChannelPlugin
-from nanobot.runtime_context import (
-    RuntimeContextProvider,
-    RuntimeContextResult,
-)
+from nanobot.runtime_context import RuntimeContextProvider, RuntimeContextResult
+
+
+# Keep preparation evidence in-process.  The storage preparer owns migration;
+# a second gateway construction must reuse its receipt instead of running it
+# over the source tree again.  A receipt is scoped to the workspace namespace,
+# not just the shared parent directory.
+_PREPARED_SESSION_NAMESPACES: set[tuple[Path, Path, str]] = set()
+_PREPARATION_CACHE: dict[tuple[int, str, str], tuple[Path, Path, str]] = {}
 
 if TYPE_CHECKING:
-    from nanobot.agent.context import ContextBuilder
+    from nanobot.agent.outbound import OutboundDecision, OutboundGuard, OutboundRequest
+    from nanobot.agent.tools.context import RequestContext, ToolContext
+    from nanobot.bus.events import InboundMessage, OutboundMessage
     from nanobot.bus.queue import MessageBus
-    from nanobot.utils.llm_runtime import LLMRuntime
 
 
 ENTRY_POINT_GROUP = "nanobot.runtime_adapters"
 RUNTIME_MODE_ENV = "NANOBOT_RUNTIME_ADAPTERS"
+RUNTIME_REQUEST_CONTEXT_KEY = "_runtime_request_context"
 
 
 class RuntimeAdapterError(RuntimeError):
@@ -76,17 +53,11 @@ class Admission:
                 raise ValueError("admitted message requires a non-empty actor")
             if not isinstance(self.session_key, str) or not self.session_key.strip():
                 raise ValueError("admitted message requires a non-empty session_key")
-            return
-        if self.session_key is not None:
+        elif self.session_key is not None:
             raise ValueError("rejected admission cannot create a session")
-        if self.actor is not None and (
-            not isinstance(self.actor, str) or not self.actor.strip()
-        ):
-            raise ValueError("rejection actor, when present, must be non-empty")
 
     @property
     def admitted(self) -> bool:
-        """Whether processing may create or use a session."""
         return self.message is not None
 
 
@@ -98,45 +69,28 @@ class ArchiveResult:
     retryable: bool = False
 
 
-CallbackResult: TypeAlias = OutboundMessage | Sequence[OutboundMessage] | None
-AdmissionHandler: TypeAlias = Callable[
-    [InboundMessage], Admission | Awaitable[Admission]
-]
-ContextFactory: TypeAlias = Callable[
-    [Admission, InboundMessage], RequestContext
-]
-ContextBuilderFactory: TypeAlias = Callable[
-    [Path, str | None, list[str] | None], "ContextBuilder"
-]
-ToolInstaller: TypeAlias = Callable[
-    [ToolContext, ToolRegistry], Sequence[str] | None
-]
+AdmissionHandler: TypeAlias = Callable[[Any], Admission | Awaitable[Admission]]
+ContextFactory: TypeAlias = Callable[[Admission, Any], Any]
+ContextBuilderFactory: TypeAlias = Callable[[Path, str | None, list[str] | None], Any]
+ToolInstaller: TypeAlias = Callable[[Any, Any], Sequence[str] | None]
 TurnScopeFactory: TypeAlias = Callable[
-    [RequestContext],
-    AbstractContextManager[RequestContext]
-    | AbstractAsyncContextManager[RequestContext],
+    [Any],
+    AbstractContextManager[Any] | AbstractAsyncContextManager[Any],
 ]
 PromptBuilder: TypeAlias = Callable[[str], Any | Awaitable[Any]]
+OutboundGuard: TypeAlias = Callable[[Any], Awaitable[Any]]
 ArchiveHandler: TypeAlias = Callable[
     [str, Sequence[Mapping[str, Any]]], ArchiveResult | Awaitable[ArchiveResult]
 ]
-DreamHandler: TypeAlias = Callable[[str, Any], Any | Awaitable[Any]]
-HeartbeatHandler: TypeAlias = Callable[[str, Any], Any | Awaitable[Any]]
-ScheduledHandler: TypeAlias = Callable[[Any, Any], Any | Awaitable[Any]]
-HeartbeatTargetResolver: TypeAlias = Callable[
-    [str, set[str]], tuple[str, str] | None
+ArchiveOwnerResolver: TypeAlias = Callable[[str], str | None]
+SessionStoragePreparer: TypeAlias = Callable[[Any], Any]
+SessionAccessGuard: TypeAlias = Callable[[str], bool]
+ChannelEnabledResolver: TypeAlias = Callable[[str, bool], bool]
+DeliveryObserver: TypeAlias = Callable[[Any, str], Awaitable[None]]
+DeliveryObserverFactory: TypeAlias = Callable[
+    [Callable[..., Awaitable[Any]], Any, Callable[[], list[str]]], DeliveryObserver | None
 ]
-HeartbeatSourceReader: TypeAlias = Callable[[str | None], Any]
-ChannelPluginLoader: TypeAlias = Callable[
-    [set[str] | None], Mapping[str, ChannelPlugin]
-]
-ChannelDescriptorRegistrar: TypeAlias = Callable[[ChannelPlugin], None]
-CallbackHandler: TypeAlias = Callable[
-    [CallbackEvent], CallbackResult | Awaitable[CallbackResult]
-]
-RuntimeAdapterFactory: TypeAlias = Callable[
-    [Any, "MessageBus | None"], "RuntimeAdapters"
-]
+RuntimeAdapterFactory: TypeAlias = Callable[[Any, "MessageBus | None"], "RuntimeAdapters"]
 
 
 @dataclass(frozen=True)
@@ -151,14 +105,19 @@ class RuntimeAdapters:
     turn_scope: TurnScopeFactory | None = None
     build_prompt: PromptBuilder | None = None
     archive: ArchiveHandler | None = None
-    run_dream: DreamHandler | None = None
-    run_heartbeat: HeartbeatHandler | None = None
-    run_scheduled: ScheduledHandler | None = None
-    resolve_heartbeat_target: HeartbeatTargetResolver | None = None
-    make_heartbeat_source_reader: HeartbeatSourceReader | None = None
-    channel_plugins: ChannelPluginLoader | None = None
-    register_channel_descriptor: ChannelDescriptorRegistrar | None = None
-    callback_handler: CallbackHandler | None = None
+    archive_owner: ArchiveOwnerResolver | None = None
+    prepare_session_storage: SessionStoragePreparer | None = None
+    session_access: SessionAccessGuard | None = None
+    channel_enabled: ChannelEnabledResolver | None = None
+    make_delivery_observer: DeliveryObserverFactory | None = None
+    run_dream: Callable[[str, Any], Any | Awaitable[Any]] | None = None
+    run_heartbeat: Callable[[str, Any], Any | Awaitable[Any]] | None = None
+    run_scheduled: Callable[[Any, Any], Any | Awaitable[Any]] | None = None
+    resolve_heartbeat_target: Callable[[str, set[str]], tuple[str, str] | None] | None = None
+    make_heartbeat_source_reader: Callable[[str | None], Any] | None = None
+    channel_plugins: Callable[[set[str] | None], Mapping[str, Any]] | None = None
+    register_channel_descriptor: Callable[[Any], None] | None = None
+    callback_handler: Callable[[Any], Any | Awaitable[Any]] | None = None
     outbound_guard: OutboundGuard | None = None
 
     def __post_init__(self) -> None:
@@ -170,7 +129,8 @@ class RuntimeAdapters:
 
 @contextmanager
 def default_turn_scope(ctx: RequestContext):
-    """Bind one request context and restore the previous scope on exit."""
+    from nanobot.agent.tools.context import request_context
+
     with request_context(ctx):
         yield ctx
 
@@ -179,10 +139,12 @@ def default_context_factory(
     admission: Admission,
     message: InboundMessage,
     *,
-    runtime: LLMRuntime | None = None,
+    runtime: Any = None,
     turn_id: str | None = None,
 ) -> RequestContext:
-    """Build a trusted :class:`RequestContext` from an admitted message."""
+    """Build a trusted request context from an admitted message."""
+    from nanobot.agent.tools.context import RequestContext
+
     if not admission.admitted or admission.actor is None or admission.session_key is None:
         raise ValueError("context factory requires an admitted message")
     metadata = dict(message.metadata or {})
@@ -207,25 +169,22 @@ def _entry_points() -> tuple[EntryPoint, ...]:
 
 def _load_factory(entry_point: EntryPoint) -> RuntimeAdapterFactory:
     try:
-        loaded = entry_point.load()
+        factory = entry_point.load()
     except Exception as exc:
         raise RuntimeAdapterError(
             f"failed to load runtime adapter '{entry_point.name}'"
         ) from exc
-
-    if not callable(loaded):
+    if not callable(factory):
         raise RuntimeAdapterError(
-            f"runtime adapter '{entry_point.name}' must expose "
-            "make_runtime_adapters(config, bus)"
+            f"runtime adapter '{entry_point.name}' must expose make_runtime_adapters(config, bus)"
         )
-    return loaded
+    return factory
 
 
 def _validate_adapters(value: Any, name: str) -> RuntimeAdapters:
     if not isinstance(value, RuntimeAdapters):
         raise RuntimeAdapterError(
-            f"runtime adapter '{name}' returned {type(value).__name__}, "
-            "expected RuntimeAdapters"
+            f"runtime adapter '{name}' returned {type(value).__name__}, expected RuntimeAdapters"
         )
     return value
 
@@ -233,68 +192,125 @@ def _validate_adapters(value: Any, name: str) -> RuntimeAdapters:
 def load_runtime_adapters(
     config: Any = None,
     *,
-    bus: MessageBus | None = None,
+    bus: "MessageBus | None" = None,
     adapters: RuntimeAdapters | None = None,
 ) -> RuntimeAdapters:
-    """Load the selected adapter before any engine state is constructed.
-
-    An explicitly supplied object wins over entry-point discovery.  Without a
-    selected mode the ordinary nanobot path returns an empty object, even when
-    product packages are installed.  A selected mode must resolve exactly one
-    entry point and return ``RuntimeAdapters``.
-    """
+    """Load an explicitly selected adapter before engine state is constructed."""
     if adapters is not None:
         return _validate_adapters(adapters, "explicit")
-
     mode = os.environ.get(RUNTIME_MODE_ENV, "").strip()
     if not mode:
         return RuntimeAdapters()
+    matches = tuple(entry for entry in _entry_points() if entry.name == mode)
+    if len(matches) != 1:
+        detail = "was not found" if not matches else "has a name collision"
+        raise RuntimeAdapterError(f"required runtime adapter '{mode}' {detail}")
+    return _validate_adapters(_load_factory(matches[0])(config, bus), mode)
 
-    matches = tuple(ep for ep in _entry_points() if ep.name == mode)
-    if not matches:
+
+def prepare_session_storage_root(config: Any, adapters: RuntimeAdapters) -> Path | None:
+    """Run the selected storage preparer and return its parent sessions root."""
+    preparer = adapters.prepare_session_storage
+    if preparer is None:
+        return None
+    workspace_value = getattr(config, "workspace_path", None)
+    if not isinstance(workspace_value, (str, os.PathLike)):
         raise RuntimeAdapterError(
-            f"required runtime adapter '{mode}' was not found in "
-            f"{ENTRY_POINT_GROUP}"
+            "runtime session storage preparer requires a workspace path"
         )
-    if len(matches) > 1:
+    workspace = Path(workspace_value).expanduser().resolve(strict=False)
+    cache_key = (
+        id(preparer),
+        str(workspace),
+        str(getattr(config, "runtime_data_dir", "")),
+    )
+    cached = _PREPARATION_CACHE.get(cache_key)
+    if cached is not None:
+        root, prepared_workspace, workspace_id = cached
+        _PREPARED_SESSION_NAMESPACES.add((root, prepared_workspace, workspace_id))
+        return root
+    prepared = preparer(config)
+    root = getattr(prepared, "sessions_root", None)
+    if root is None:
         raise RuntimeAdapterError(
-            f"runtime adapter name collision for '{mode}' in {ENTRY_POINT_GROUP}"
+            "runtime session storage preparer returned no sessions_root"
+        )
+    workspace_id = getattr(prepared, "workspace_id", None)
+    if not isinstance(workspace_id, str) or not workspace_id:
+        raise RuntimeAdapterError(
+            "runtime session storage preparer returned no workspace_id"
+        )
+    resolved = Path(root).expanduser().resolve(strict=False)
+    receipt = (resolved, workspace, workspace_id)
+    _PREPARATION_CACHE[cache_key] = receipt
+    _PREPARED_SESSION_NAMESPACES.add(receipt)
+    return resolved
+
+
+def validate_prepared_session_manager(
+    session_manager: Any,
+    workspace: Any,
+) -> None:
+    """Reject a manager without a receipt for its workspace namespace."""
+    sessions_dir = getattr(session_manager, "sessions_dir", None)
+    if not isinstance(sessions_dir, (str, os.PathLike)):
+        raise RuntimeAdapterError(
+            "runtime session manager has no prepared sessions root"
+        )
+    manager_workspace = getattr(session_manager, "workspace", None)
+    if not isinstance(manager_workspace, (str, os.PathLike)):
+        raise RuntimeAdapterError(
+            "runtime session manager has no prepared workspace"
+        )
+    if not isinstance(workspace, (str, os.PathLike)):
+        raise RuntimeAdapterError("runtime session loop has no workspace")
+    expected_workspace = Path(workspace).expanduser().resolve(strict=False)
+    actual_workspace = Path(manager_workspace).expanduser().resolve(strict=False)
+    if actual_workspace != expected_workspace:
+        raise RuntimeAdapterError(
+            "runtime session manager does not belong to the loop workspace"
+        )
+    sessions_path = Path(sessions_dir).expanduser().resolve(strict=False)
+    receipt = (sessions_path.parent, expected_workspace, sessions_path.name)
+    if receipt not in _PREPARED_SESSION_NAMESPACES:
+        raise RuntimeAdapterError(
+            "runtime session storage must be prepared before direct AgentLoop "
+            "construction for this workspace namespace"
         )
 
-    factory = _load_factory(matches[0])
-    result = factory(config, bus)
-    return _validate_adapters(result, mode)
+
+def __getattr__(name: str) -> Any:
+    if name in {"OutboundDecision", "OutboundGuard", "OutboundRequest"}:
+        from nanobot.agent.outbound import OutboundDecision, OutboundGuard, OutboundRequest
+
+        return {
+            "OutboundDecision": OutboundDecision,
+            "OutboundGuard": OutboundGuard,
+            "OutboundRequest": OutboundRequest,
+        }[name]
+    raise AttributeError(name)
 
 
 __all__ = [
     "Admission",
     "AdmissionHandler",
     "ArchiveHandler",
+    "ArchiveOwnerResolver",
     "ArchiveResult",
-    "CallbackEvent",
-    "CallbackHandler",
-    "CallbackResult",
-    "ChannelDescriptorRegistrar",
-    "ChannelPluginLoader",
-    "ContextFactory",
-    "ContextBuilderFactory",
-    "DreamHandler",
-    "HeartbeatHandler",
-    "HeartbeatSourceReader",
-    "HeartbeatTargetResolver",
     "OutboundDecision",
     "OutboundGuard",
     "OutboundRequest",
-    "PromptBuilder",
     "RUNTIME_REQUEST_CONTEXT_KEY",
     "RuntimeAdapterError",
     "RuntimeAdapters",
     "RuntimeContextProvider",
     "RuntimeContextResult",
-    "ScheduledHandler",
-    "ToolInstaller",
-    "TurnScopeFactory",
+    "SessionAccessGuard",
+    "SessionStoragePreparer",
+    "ChannelEnabledResolver",
     "default_context_factory",
     "default_turn_scope",
     "load_runtime_adapters",
+    "prepare_session_storage_root",
+    "validate_prepared_session_manager",
 ]

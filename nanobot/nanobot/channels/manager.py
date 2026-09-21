@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import Callable, Iterable
+import inspect
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from loguru import logger
 
@@ -19,12 +21,11 @@ from nanobot.bus.outbound_events import (
     StreamDeltaEvent,
     StreamedResponseEvent,
     StreamEndEvent,
-    outbound_event_from_message,
     replace_outbound_event,
 )
 from nanobot.bus.queue import MessageBus
 from nanobot.channels._setup import channel_setup_spec
-from nanobot.channels.base import BaseChannel
+from nanobot.channels.base import BaseChannel, DeliveryResult, DeliveryUnavailableError
 from nanobot.channels.contracts import (
     channel_default_config,
     channel_instance_specs,
@@ -40,7 +41,9 @@ from nanobot.utils.restart import (
 )
 
 if TYPE_CHECKING:
+    from nanobot.cron.service import CronService
     from nanobot.session.manager import SessionManager
+    from nanobot.triggers.local_store import LocalTriggerStore
 
 
 def _default_webui_dist() -> Path | None:
@@ -55,8 +58,11 @@ def _default_webui_dist() -> Path | None:
 
 # Retry delays for message sending (exponential backoff: 1s, 2s, 4s)
 _SEND_RETRY_DELAYS = (1, 2, 4)
+_OUTBOUND_CONCURRENCY = 32
+_OUTBOUND_PENDING_LIMIT = 256
 _RESTART_NOTICE_START_TIMEOUT_S = 30.0
 _RESTART_NOTICE_START_POLL_S = 0.25
+ORIGIN_REPLY_FINGERPRINTS_MAX_SIZE = 1000
 
 _BOOL_CAMEL_ALIASES: dict[str, str] = {
     "send_progress": "sendProgress",
@@ -89,36 +95,67 @@ class ChannelManager:
         bus: MessageBus,
         *,
         session_manager: "SessionManager | None" = None,
-        cron_service: Any | None = None,
-        local_trigger_store: Any | None = None,
+        cron_service: CronService | None = None,
+        local_trigger_store: LocalTriggerStore | None = None,
         webui_runtime_model_name: Callable[[], str | None] | None = None,
+        webui_refresh_runtime_config: Callable[[], None] | None = None,
         webui_cron_pending_job_ids: Callable[[str], set[str]] | None = None,
         webui_local_trigger_pending_ids: Callable[[str], set[str]] | None = None,
         webui_static_dist: bool = True,
         webui_runtime_surface: str = "browser",
         webui_runtime_capabilities: dict[str, Any] | None = None,
+        webui_mcp_runtime_status: Callable[[], Mapping[str, str]] | None = None,
+        webui_mcp_reload: Callable[[], Awaitable[dict[str, Any]]] | None = None,
+        webui_skill_state_action: Callable[[set[str]], None] | None = None,
+        webui_recovery_action: (
+            Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] | None
+        ) = None,
+        config_path: Path | None = None,
+        channel_enabled: Callable[[str, bool], bool] | None = None,
         runtime_adapters: Any | None = None,
+        on_delivery_result: Callable[[OutboundMessage, DeliveryResult], Awaitable[None]] | None = None,
     ):
+        if config_path is None:
+            from nanobot.config.loader import get_config_path
+
+            config_path = get_config_path()
         self.config = config
+        self._config_path = config_path.expanduser().resolve(strict=False)
         self.bus = bus
         self._session_manager = session_manager
         self._cron_service = cron_service
         self._local_trigger_store = local_trigger_store
         self._webui_runtime_model_name = webui_runtime_model_name
+        self._webui_refresh_runtime_config = webui_refresh_runtime_config
         self._webui_cron_pending_job_ids = webui_cron_pending_job_ids
         self._webui_local_trigger_pending_ids = webui_local_trigger_pending_ids
         self._webui_static_dist = webui_static_dist
         self._webui_runtime_surface = webui_runtime_surface
         self._webui_runtime_capabilities = dict(webui_runtime_capabilities or {})
+        self._webui_mcp_runtime_status = webui_mcp_runtime_status
+        self._webui_mcp_reload = webui_mcp_reload
+        self._webui_skill_state_action = webui_skill_state_action
+        self._webui_recovery_action = webui_recovery_action
+        self._channel_enabled = channel_enabled
         self._runtime_adapters = runtime_adapters
+        self._on_delivery_result = on_delivery_result
+        self._runtime_callback_handler = getattr(runtime_adapters, "callback_handler", None)
+        set_callback_handler = getattr(self.bus, "set_callback_handler", None)
+        if callable(set_callback_handler) and self._runtime_callback_handler is not None:
+            set_callback_handler(self._runtime_callback_handler)
         self.channels: dict[str, BaseChannel] = {}
         self._channel_owners: dict[str, str] = {}
         self._channel_runtime_specs: dict[str, tuple[str, str]] = {}
         self._channel_errors: dict[str, str] = {}
-        self._channel_tasks: dict[str, asyncio.Task] = {}
-        self._dispatch_task: asyncio.Task | None = None
+        self._channel_tasks: dict[str, asyncio.Task[None]] = {}
+        self._dispatch_task: asyncio.Task[None] | None = None
+        self._outbound_tasks: dict[asyncio.Task[None], tuple[str, str]] = {}
+        self._outbound_tails: dict[tuple[str, str], asyncio.Task[None]] = {}
+        self._outbound_slots = asyncio.Semaphore(_OUTBOUND_PENDING_LIMIT)
+        self._outbound_sends = asyncio.Semaphore(_OUTBOUND_CONCURRENCY)
+        self._stopping_channels: set[str] = set()
         self._started = False
-        self._origin_reply_fingerprints: dict[tuple[str, str, str], str] = {}
+        self._origin_reply_fingerprints: OrderedDict[tuple[str, str, str], str] = OrderedDict()
 
         self._init_channels()
 
@@ -126,10 +163,10 @@ class ChannelManager:
         self,
         name: str,
         *,
-        plugin: Any | None = None,
         config: Config | None = None,
         default_sections: dict[str, Any] | None = None,
         default_enabled: bool | None = None,
+        default_config: dict[str, Any] | None = None,
     ) -> Any:
         config = config or self.config
         section = getattr(config.channels, name, None)
@@ -138,35 +175,12 @@ class ChannelManager:
         if section is not None or not default_enabled:
             return section
         if default_sections is None:
-            return (
-                channel_default_config(plugin)
-                if plugin is not None
-                else _default_channel_config(name)
-            )
+            return default_config if default_config is not None else _default_channel_config(name)
         if name not in default_sections:
-            default = (
-                channel_default_config(plugin)
-                if plugin is not None
-                else _default_channel_config(name)
-            )
+            default = default_config if default_config is not None else _default_channel_config(name)
             if default is not None:
                 default_sections[name] = default
         return default_sections.get(name)
-
-    def _discover_plugins(
-        self,
-        enabled_names: set[str] | None = None,
-    ) -> dict[str, Any]:
-        from nanobot.channels.registry import discover_plugins
-
-        loader = getattr(
-            getattr(self, "_runtime_adapters", None),
-            "channel_plugins",
-            None,
-        )
-        if loader is None:
-            return discover_plugins(enabled_names)
-        return discover_plugins(enabled_names, external_loader=loader)
 
     def _build_channel(
         self,
@@ -191,8 +205,10 @@ class ChannelManager:
                 static_dist_path=static_path,
                 workspace_path=workspace,
                 default_restrict_to_workspace=self.config.tools.restrict_to_workspace,
+                config_path=self._config_path,
                 disabled_skills=set(self.config.agents.defaults.disabled_skills),
                 runtime_model_name=self._webui_runtime_model_name,
+                refresh_runtime_config=self._webui_refresh_runtime_config,
                 runtime_surface=self._webui_runtime_surface,
                 runtime_capabilities_overrides=self._webui_runtime_capabilities,
                 cron_service=self._cron_service,
@@ -201,17 +217,25 @@ class ChannelManager:
                 local_trigger_pending_ids=self._webui_local_trigger_pending_ids,
                 channel_feature_action=self.apply_channel_feature_action,
                 channel_runtime_status=self.get_status,
+                mcp_runtime_status=self._webui_mcp_runtime_status,
+                mcp_reload=self._webui_mcp_reload,
+                skill_state_action=self._webui_skill_state_action,
+                recovery_action=self._webui_recovery_action,
                 logger=logger,
             )
             kwargs["gateway"] = gateway
         channel = cls(section, self.bus, **kwargs)
         if runtime_name and runtime_name != channel.name:
             channel.name = runtime_name
+        progress_default, tool_hints_default = channel.progress_transport_defaults() or (
+            self.config.channels.send_progress,
+            self.config.channels.send_tool_hints,
+        )
         channel.send_progress = self._resolve_bool_override(
-            section, "send_progress", self.config.channels.send_progress,
+            section, "send_progress", progress_default,
         )
         channel.send_tool_hints = self._resolve_bool_override(
-            section, "send_tool_hints", self.config.channels.send_tool_hints,
+            section, "send_tool_hints", tool_hints_default,
         )
         channel.show_reasoning = self._resolve_bool_override(
             section, "show_reasoning", self.config.channels.show_reasoning,
@@ -220,19 +244,53 @@ class ChannelManager:
 
     def _init_channels(self) -> None:
         """Initialize enabled runtimes from dependency-free channel descriptors."""
+        from nanobot.channels.registry import discover_plugins
         from nanobot.optional_features import ensure_enabled_channel_dependencies
 
-        plugins = self._discover_plugins()
+        plugins = dict(discover_plugins())
+        plugin_loader = getattr(self._runtime_adapters, "channel_plugins", None)
+        register_descriptor = getattr(
+            self._runtime_adapters, "register_channel_descriptor", None
+        )
+        external_plugins: Mapping[str, Any] = {}
+        if callable(plugin_loader):
+            loaded = plugin_loader(None)
+            if loaded is not None:
+                if not isinstance(loaded, Mapping):
+                    raise TypeError("runtime channel plugin loader must return a mapping")
+                external_plugins = loaded
+            # The registrar is a handshake as well as a registry hook; invoke
+            # it even when this adapter has no descriptors to register.
+            if callable(register_descriptor) and not external_plugins:
+                try:
+                    register_descriptor(None)
+                except Exception as exc:
+                    logger.debug("Runtime channel descriptor hook rejected empty registration: {}", exc)
+        for name, plugin in external_plugins.items():
+            if callable(register_descriptor):
+                try:
+                    register_descriptor(plugin)
+                except Exception as exc:
+                    logger.debug("Runtime channel descriptor registration for {}: {}", name, exc)
+            if name in plugins:
+                logger.warning("Runtime channel descriptor collides with built-in '{}'; keeping built-in", name)
+                continue
+            plugins[name] = plugin
         default_sections: dict[str, Any] = {}
         activations: dict[str, tuple[Any, list[tuple[str, Any]]]] = {}
         enabled_names: set[str] = set()
         for name, plugin in plugins.items():
+            configured = getattr(self.config.channels, name, None) is not None
+            if self._channel_enabled is not None and not self._channel_enabled(name, configured):
+                continue
             section = self._channel_section(
                 name,
-                plugin=plugin,
                 default_sections=default_sections,
                 default_enabled=plugin.default_enabled,
+                default_config=(channel_default_config(plugin) if name in external_plugins else None),
             )
+            if section is None and plugin.default_enabled:
+                section = channel_default_config(plugin)
             if section is None:
                 continue
             try:
@@ -316,10 +374,11 @@ class ChannelManager:
         for name, ch in self.channels.items():
             cfg = ch.config
             if isinstance(cfg, dict):
-                if "allow_from" in cfg:
-                    allow = cfg.get("allow_from")
+                config_data = cast(dict[str, Any], cfg)
+                if "allow_from" in config_data:
+                    allow = config_data.get("allow_from")
                 else:
-                    allow = cfg.get("allowFrom")
+                    allow = config_data.get("allowFrom")
             else:
                 allow = getattr(cfg, "allow_from", None)
             if allow is None:
@@ -346,11 +405,12 @@ class ChannelManager:
         Pydantic models.
         """
         if isinstance(section, dict):
-            value = section.get(key)
+            section_data = cast(dict[str, Any], section)
+            value = section_data.get(key)
             if value is None:
                 camel = _BOOL_CAMEL_ALIASES.get(key)
                 if camel:
-                    value = section.get(camel)
+                    value = section_data.get(camel)
             return value if isinstance(value, bool) else default
         value = getattr(section, key, None)
         return value if isinstance(value, bool) else default
@@ -365,17 +425,29 @@ class ChannelManager:
             await channel.start()
         except asyncio.CancelledError:
             raise
-        except Exception:
-            errors[name] = "Channel failed to start. Check gateway logs."
-            logger.exception("Failed to start channel {}", name)
+        except Exception as exc:
+            public_error = channel.start_error_message(exc)
+            errors[name] = public_error or "Channel failed to start. Check gateway logs."
+            if public_error:
+                logger.error("Failed to start channel {}: {}", name, public_error)
+            else:
+                logger.exception("Failed to start channel {}", name)
 
-    def _start_channel_task(self, name: str, channel: BaseChannel) -> asyncio.Task:
+    def _start_channel_task(self, name: str, channel: BaseChannel) -> asyncio.Task[None]:
         logger.info("Starting {} channel...", name)
         task = asyncio.create_task(self._start_channel(name, channel))
         self._channel_tasks[name] = task
         return task
 
     async def _stop_channel(self, name: str) -> bool:
+        self._stopping_channels.add(name)
+        try:
+            await self._cancel_outbound(name)
+            return await self._stop_channel_runtime(name)
+        finally:
+            self._stopping_channels.discard(name)
+
+    async def _stop_channel_runtime(self, name: str) -> bool:
         channel = self.channels.get(name)
         if channel is None:
             self._channel_tasks.pop(name, None)
@@ -386,7 +458,8 @@ class ChannelManager:
             await channel.stop()
             logger.info("Stopped {} channel", name)
         except asyncio.CancelledError:
-            if asyncio.current_task() and asyncio.current_task().cancelling():
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling():
                 raise
             logger.debug("Channel {} stop task was already cancelled", name)
         except Exception:
@@ -415,7 +488,9 @@ class ChannelManager:
         if not name:
             return {"handled": False}
 
-        plugin = self._discover_plugins({name}).get(name)
+        from nanobot.channels.registry import discover_plugins
+
+        plugin = discover_plugins({name}).get(name)
         if plugin is None:
             return {"handled": False}
         if "always_enabled" in plugin.capabilities:
@@ -429,11 +504,7 @@ class ChannelManager:
         from nanobot.config.loader import load_config
 
         self.config = load_config()
-        section = self._channel_section(
-            name,
-            plugin=plugin,
-            default_enabled=plugin.default_enabled,
-        )
+        section = self._channel_section(name, default_enabled=plugin.default_enabled)
         channel_setup_spec(name, plugin=plugin)
         instance_id = resolve_channel_action_target(instance_id)
 
@@ -580,7 +651,7 @@ class ChannelManager:
         self._dispatch_task = asyncio.create_task(self._dispatch_outbound())
 
         # Start channels
-        tasks = []
+        tasks: list[asyncio.Task[None]] = []
         for name, channel in self.channels.items():
             tasks.append(self._start_channel_task(name, channel))
 
@@ -609,6 +680,12 @@ class ChannelManager:
         target = self.channels.get(notice.channel)
         if target is None:
             logger.warning("Restart notice target channel is not enabled: {}", notice.channel)
+            return
+        if notice.channel == "websocket":
+            # Reconnect and recovery are already represented by WebSocket
+            # protocol state. A generic restart-complete notice must not
+            # masquerade as a recovery transition and overwrite a real
+            # awaiting-user checkpoint in connected clients.
             return
 
         while not target.is_running:
@@ -653,9 +730,19 @@ class ChannelManager:
         normalized = " ".join(content.split())
         return hashlib.sha1(normalized.encode("utf-8")).hexdigest() if normalized else ""
 
+    def _remember_origin_reply_fingerprint(
+        self,
+        key: tuple[str, str, str],
+        fingerprint: str,
+    ) -> None:
+        self._origin_reply_fingerprints[key] = fingerprint
+        self._origin_reply_fingerprints.move_to_end(key)
+        while len(self._origin_reply_fingerprints) > ORIGIN_REPLY_FINGERPRINTS_MAX_SIZE:
+            self._origin_reply_fingerprints.popitem(last=False)
+
     def _should_suppress_outbound(self, msg: OutboundMessage) -> bool:
         metadata = msg.metadata or {}
-        if isinstance(outbound_event_from_message(msg), ProgressEvent):
+        if isinstance(msg.event, ProgressEvent):
             return False
         fingerprint = self._fingerprint_content(msg.content)
         if not fingerprint:
@@ -665,17 +752,93 @@ class ChannelManager:
         if isinstance(origin_message_id, str) and origin_message_id:
             key = (msg.channel, msg.chat_id, origin_message_id)
             if self._origin_reply_fingerprints.get(key) == fingerprint:
+                self._origin_reply_fingerprints.move_to_end(key)
                 return True
-            self._origin_reply_fingerprints[key] = fingerprint
+            self._remember_origin_reply_fingerprint(key, fingerprint)
 
         message_id = metadata.get("message_id")
         if isinstance(message_id, str) and message_id:
             key = (msg.channel, msg.chat_id, message_id)
-            self._origin_reply_fingerprints[key] = fingerprint
+            self._remember_origin_reply_fingerprint(key, fingerprint)
 
         return False
 
+    async def _cancel_outbound(self, channel: str | None = None) -> None:
+        tasks = [task for task, key in self._outbound_tasks.items()
+                 if channel is None or key[0] == channel]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _notify_delivery_result(
+        self,
+        msg: OutboundMessage,
+        result: DeliveryResult,
+    ) -> None:
+        if self._on_delivery_result is None:
+            return
+        try:
+            await self._on_delivery_result(msg, result)
+        except Exception:
+            logger.exception("Delivery-result observer failed for {}:{}", msg.channel, msg.chat_id)
+
+    async def _queue_outbound(self, channel: BaseChannel, msg: OutboundMessage) -> None:
+        """Bound scheduled sends; preserve FIFO per destination, not across chats.
+
+        Retry waits occupy only their destination and one send slot. Saturation
+        pauses dispatch rather than creating unbounded tasks or dropping messages.
+        """
+        try:
+            await self._outbound_slots.acquire()
+        except asyncio.CancelledError:
+            await self._notify_delivery_result(msg, "unknown")
+            raise
+        if msg.channel in self._stopping_channels or self.channels.get(msg.channel) is not channel:
+            self._outbound_slots.release()
+            await self._notify_delivery_result(msg, "unknown")
+            return
+        key = (msg.channel, msg.chat_id)
+        previous = self._outbound_tails.get(key)
+        reported = False
+
+        async def send() -> None:
+            nonlocal reported
+            result: DeliveryResult = "unknown"
+            try:
+                if previous is not None:
+                    await asyncio.shield(asyncio.gather(previous, return_exceptions=True))
+                async with self._outbound_sends:
+                    result = await self._send_with_retry(channel, msg)
+            finally:
+                reported = True
+                await self._notify_delivery_result(msg, result)
+
+        task = asyncio.create_task(send(), name=f"outbound-{msg.channel}-{msg.chat_id}")
+        self._outbound_tasks[task] = key
+        self._outbound_tails[key] = task
+
+        def finished(done: asyncio.Task[None]) -> None:
+            self._outbound_tasks.pop(done, None)
+            if self._outbound_tails.get(key) is done:
+                self._outbound_tails.pop(key, None)
+            self._outbound_slots.release()
+            if not reported:
+                asyncio.create_task(
+                    self._notify_delivery_result(msg, "unknown"),
+                    name=f"outbound-result-{msg.channel}-{msg.chat_id}",
+                )
+            if not done.cancelled() and (error := done.exception()) is not None:
+                logger.error("Outbound delivery to {}:{} failed: {}", *key, error)
+
+        task.add_done_callback(finished)
+
     async def _dispatch_outbound(self) -> None:
+        try:
+            await self._dispatch_outbound_loop()
+        finally:
+            await self._cancel_outbound()
+
+    async def _dispatch_outbound_loop(self) -> None:
         """Dispatch outbound messages to the appropriate channel."""
         logger.info("Outbound dispatcher started")
 
@@ -694,7 +857,7 @@ class ChannelManager:
                         timeout=1.0
                     )
 
-                event = outbound_event_from_message(msg)
+                event = msg.event
                 progress_event = event if isinstance(event, ProgressEvent) else None
                 if progress_event and (
                     progress_event.reasoning_delta
@@ -708,7 +871,7 @@ class ChannelManager:
                     # content silently drops here.
                     channel = self.channels.get(msg.channel)
                     if channel is not None and channel.show_reasoning:
-                        await self._send_with_retry(channel, msg)
+                        await self._queue_outbound(channel, msg)
                     continue
 
                 if progress_event:
@@ -736,7 +899,7 @@ class ChannelManager:
                 if isinstance(event, StreamDeltaEvent):
                     msg, extra_pending = self._coalesce_stream_deltas(msg)
                     pending.extend(extra_pending)
-                    event = outbound_event_from_message(msg)
+                    event = msg.event
 
                 channel = self.channels.get(msg.channel)
                 if channel:
@@ -751,9 +914,10 @@ class ChannelManager:
                         if self._should_suppress_outbound(msg):
                             logger.info("Suppressing duplicate outbound message to {}:{}", msg.channel, msg.chat_id)
                             continue
-                    await self._send_with_retry(channel, msg)
+                    await self._queue_outbound(channel, msg)
                 else:
                     logger.warning("Unknown channel: {}", msg.channel)
+                    await self._notify_delivery_result(msg, "unavailable")
 
             except asyncio.TimeoutError:
                 continue
@@ -791,19 +955,35 @@ class ChannelManager:
         msg: OutboundMessage,
         event: StreamDeltaEvent | StreamEndEvent,
     ) -> None:
+        kwargs: dict[str, Any] = {
+            "stream_id": event.stream_id,
+            "stream_end": isinstance(event, StreamEndEvent),
+            "resuming": event.resuming if isinstance(event, StreamEndEvent) else False,
+        }
+        if isinstance(event, StreamEndEvent) and event.merge_next:
+            try:
+                signature = inspect.signature(channel.send_delta)
+                if (
+                    "merge_next" in signature.parameters
+                    or any(
+                        parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in signature.parameters.values()
+                    )
+                ):
+                    kwargs["merge_next"] = True
+            except (TypeError, ValueError):
+                pass
         await channel.send_delta(
             msg.chat_id,
             msg.content,
             msg.metadata,
-            stream_id=event.stream_id,
-            stream_end=isinstance(event, StreamEndEvent),
-            resuming=event.resuming if isinstance(event, StreamEndEvent) else False,
+            **kwargs,
         )
 
     @staticmethod
     async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
         """Send one outbound message without retry policy."""
-        event = outbound_event_from_message(msg)
+        event = msg.event
         if isinstance(event, ProgressEvent) and event.reasoning_end:
             await ChannelManager._send_reasoning_end(channel, msg, event)
         elif isinstance(event, ProgressEvent) and event.reasoning_delta:
@@ -836,7 +1016,7 @@ class ChannelManager:
         Returns:
             tuple of (merged_message, list_of_non_matching_messages)
         """
-        first_event = outbound_event_from_message(first_msg)
+        first_event = first_msg.event
         first_stream_id = first_event.stream_id if isinstance(first_event, StreamDeltaEvent) else None
         target_key = (first_msg.channel, first_msg.chat_id, first_stream_id)
         combined_content = first_msg.content
@@ -856,7 +1036,7 @@ class ChannelManager:
                 break
 
             # Check if this message belongs to the same stream
-            next_event = outbound_event_from_message(next_msg)
+            next_event = next_msg.event
             next_stream_id = (
                 next_event.stream_id
                 if isinstance(next_event, StreamDeltaEvent | StreamEndEvent)
@@ -878,6 +1058,7 @@ class ChannelManager:
                     final_event = StreamEndEvent(
                         stream_id=next_stream_id,
                         resuming=next_event.resuming,
+                        merge_next=next_event.merge_next,
                     )
                     # Stream ended - stop coalescing this stream
                     break
@@ -895,7 +1076,7 @@ class ChannelManager:
         msg: OutboundMessage,
         *,
         deadline: float | None = None,
-    ) -> None:
+    ) -> DeliveryResult:
         """Send a message with retry on failure using exponential backoff.
 
         When deadline is provided, retry until that monotonic time instead of
@@ -905,15 +1086,29 @@ class ChannelManager:
         """
         max_attempts = max(self.config.channels.send_max_retries, 1)
         attempt = 0
+        had_ambiguous_attempt = False
 
         while True:
             attempt += 1
             try:
                 await self._send_once(channel, msg)
-                return  # Send succeeded
+                return "delivered"
             except asyncio.CancelledError:
                 raise  # Propagate cancellation for graceful shutdown
             except Exception as e:
+                if isinstance(e, DeliveryUnavailableError) or not channel.should_retry_send_error(e):
+                    logger.error(
+                        "Send to {} failed with a non-retryable {}: {}",
+                        msg.channel,
+                        type(e).__name__,
+                        e,
+                    )
+                    return (
+                        "unavailable"
+                        if isinstance(e, DeliveryUnavailableError) and not had_ambiguous_attempt
+                        else "unknown"
+                    )
+                had_ambiguous_attempt = True
                 loop = asyncio.get_running_loop()
                 exhausted = (
                     attempt >= max_attempts
@@ -925,7 +1120,7 @@ class ChannelManager:
                         "Failed to send to {} after {} attempts",
                         msg.channel, attempt,
                     )
-                    return
+                    return "unknown"
                 delay = _SEND_RETRY_DELAYS[min(attempt - 1, len(_SEND_RETRY_DELAYS) - 1)]
                 if deadline is not None:
                     delay = min(delay, max(0.0, deadline - loop.time()))

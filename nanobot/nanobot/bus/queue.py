@@ -1,41 +1,40 @@
-"""Async message queue for decoupled channel-agent communication."""
+"""Queued delivery of messages and typed events between core and channels."""
 
 import asyncio
+import contextlib
 import inspect
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, TypeVar, overload
 
-from nanobot.agent.outbound import OutboundDecision, OutboundGuard, OutboundRequest
-from nanobot.agent.tools.context import (
-    RUNTIME_REQUEST_CONTEXT_KEY,
-    RequestContext,
-    current_request_context,
-)
+from loguru import logger
+
 from nanobot.bus.events import CallbackEvent, InboundMessage, OutboundMessage
+from nanobot.bus.outbound_events import outbound_message_for_event
+from nanobot.events import AgentEvent
+
+_EventT = TypeVar("_EventT", bound=AgentEvent)
+EventHandler = Callable[[AgentEvent], Awaitable[None] | None]
 
 
 class MessageBus:
     """
     Async message bus that decouples chat channels from the agent core.
 
-    Channels push messages to the inbound queue, and the agent processes
-    them and pushes responses to the outbound queue.
+    Channels push messages to the inbound queue. Core operations publish text,
+    media, or typed events to the same routed outbound queue, independently of
+    whether an LLM produced them. Channel adapters own their wire projection.
+
+    Local subscribers are awaited by ``publish``; channel delivery is queued by
+    ``publish_event``. Local state transitions never wait for network sends.
     """
 
-    def __init__(
-        self,
-        outbound_guard: OutboundGuard | None = None,
-        callback_handler: Callable[[CallbackEvent], Any] | None = None,
-    ):
+    def __init__(self, callback_handler: Callable[[CallbackEvent], Any] | None = None):
         self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue()
         self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
         self.callbacks: asyncio.Queue[CallbackEvent] = asyncio.Queue()
-        self.outbound_guard = outbound_guard
         self.callback_handler = callback_handler
-
-    def set_outbound_guard(self, guard: OutboundGuard | None) -> None:
-        """Install the single server-side guard used before outbound enqueue."""
-        self.outbound_guard = guard
+        self._handlers: list[EventHandler] = []
+        self._pending: set[asyncio.Task[None]] = set()
 
     async def publish_inbound(self, msg: InboundMessage) -> None:
         """Publish a message from a channel to the agent."""
@@ -46,103 +45,56 @@ class MessageBus:
         return await self.inbound.get()
 
     async def publish_callback(self, event: CallbackEvent) -> None:
-        """Queue one typed channel callback without altering its payload."""
+        """Queue a typed channel callback without trusting its actor field."""
         if not isinstance(event, CallbackEvent):
             raise TypeError("callback queue accepts CallbackEvent")
         await self.callbacks.put(event)
 
     async def consume_callback(self) -> CallbackEvent:
-        """Consume the next channel callback (blocks until one is queued)."""
+        """Consume the next callback event."""
         return await self.callbacks.get()
 
     def set_callback_handler(
         self,
         handler: Callable[[CallbackEvent], Any] | None,
     ) -> None:
-        """Install the optional adapter callback callable."""
         self.callback_handler = handler
 
     async def dispatch_callback(self, event: CallbackEvent | None = None) -> Any:
-        """Run the configured callback handler for one queued/event payload."""
+        """Run the configured callback handler for one queued event."""
         if event is None:
             event = await self.consume_callback()
-        if self.callback_handler is None:
+        callback = self.callback_handler
+        if callback is None:
             return None
-        result = self.callback_handler(event)
+        if not callable(callback):
+            callback = getattr(callback, "handle_callback", None)
+        if not callable(callback):
+            return None
+        result = callback(event)
         return await result if inspect.isawaitable(result) else result
 
-    async def publish_outbound(
+    async def publish_outbound(self, msg: OutboundMessage) -> None:
+        """Queue a routed message or event for its channel."""
+        await self.outbound.put(msg)
+
+    async def publish_event(
         self,
-        msg: OutboundMessage,
+        event: AgentEvent,
         *,
-        action: str | None = None,
-        request_context: RequestContext | None = None,
+        channel: str,
+        chat_id: str,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
-        """Publish a response from the agent to channels.
+        """Queue a typed event using the existing outbound delivery contract.
 
-        ``action`` is a server-owned keyword.  Outbound metadata can cross
-        untrusted channel boundaries and therefore never selects policy.
+        The bus transports event values without inspecting their fields. Known
+        events retain their text fallback; channel adapters decide how to render
+        or ignore events they receive.
         """
-        guard = self.outbound_guard
-        if guard is not None:
-            metadata = dict(msg.metadata or {})
-            trusted = request_context
-            if not isinstance(trusted, RequestContext):
-                trusted = metadata.get(RUNTIME_REQUEST_CONTEXT_KEY)
-            if not isinstance(trusted, RequestContext):
-                trusted = current_request_context()
-            if not isinstance(trusted, RequestContext):
-                trusted = None
-            resolved_action = action.strip() if isinstance(action, str) else ""
-            if not resolved_action:
-                resolved_action = "message.send"
-            request = OutboundRequest(
-                action=resolved_action,
-                outbound=msg,
-                actor=trusted.actor if trusted is not None else None,
-                inbound_channel=trusted.channel if trusted is not None else None,
-                inbound_chat_id=trusted.chat_id if trusted is not None else None,
-                metadata=metadata,
-                publish_outbound=self._publish_unchecked,
-            )
-            decision = guard(request)
-            if inspect.isawaitable(decision):
-                decision = await decision
-            if not isinstance(decision, OutboundDecision):
-                raise TypeError("outbound guard must return OutboundDecision")
-            if decision.kind != "allow":
-                return
-            msg = decision.outbound or msg
-        await self.outbound.put(self._strip_runtime_metadata(msg))
-
-    async def _publish_unchecked(self, msg: OutboundMessage) -> None:
-        """Enqueue a guard-generated approval notice without recursive guarding."""
-        await self.outbound.put(self._strip_runtime_metadata(msg))
-
-    @staticmethod
-    def _strip_runtime_metadata(msg: OutboundMessage) -> OutboundMessage:
-        """Remove server-only provenance before a channel or serializer sees it."""
-        metadata = dict(msg.metadata or {})
-        for key in (
-            RUNTIME_REQUEST_CONTEXT_KEY,
-            "_runtime_actor",
-            "_runtime_inbound_channel",
-            "_runtime_inbound_chat_id",
-            "_runtime_action",
-        ):
-            metadata.pop(key, None)
-        if metadata == (msg.metadata or {}):
-            return msg
-        return OutboundMessage(
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            content=msg.content,
-            reply_to=msg.reply_to,
-            media=list(msg.media),
-            metadata=metadata,
-            buttons=[list(row) for row in msg.buttons],
-            event=msg.event,
-        )
+        await self.publish_outbound(outbound_message_for_event(
+            channel=channel, chat_id=chat_id, event=event, metadata=metadata,
+        ))
 
     async def consume_outbound(self) -> OutboundMessage:
         """Consume the next outbound message (blocks until available)."""
@@ -160,5 +112,74 @@ class MessageBus:
 
     @property
     def callback_size(self) -> int:
-        """Number of pending callback events."""
+        """Number of callbacks waiting for the runtime adapter."""
         return self.callbacks.qsize()
+
+    @overload
+    def subscribe(
+        self, handler: Callable[[_EventT], Awaitable[None] | None],
+        event_type: type[_EventT],
+    ) -> Callable[[], None]: ...
+
+    @overload
+    def subscribe(
+        self, handler: EventHandler, event_type: None = None,
+    ) -> Callable[[], None]: ...
+
+    def subscribe(
+        self,
+        handler: Callable[..., Awaitable[None] | None],
+        event_type: type[AgentEvent] | None = None,
+    ) -> Callable[[], None]:
+        """Connect an ordered, awaited handler; return its idempotent disconnect.
+
+        The overloads bind handler and event type. The erased callable exists
+        only at this heterogeneous dispatch boundary, behind the type filter.
+        """
+        active = True
+
+        def entry(event: AgentEvent) -> Awaitable[None] | None:
+            if active and (event_type is None or isinstance(event, event_type)):
+                return handler(event)
+            return None
+        self._handlers.append(entry)
+
+        def _unsubscribe() -> None:
+            nonlocal active
+            active = False
+            with contextlib.suppress(ValueError):
+                self._handlers.remove(entry)
+
+        return _unsubscribe
+
+    async def publish(self, event: AgentEvent) -> None:
+        """Await local subscribers in registration order, without channel delivery."""
+        for handler in list(self._handlers):
+            try:
+                result = handler(event)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.exception("event handler failed for {}", type(event).__name__)
+
+    def publish_nowait(self, event: AgentEvent) -> asyncio.Task[None] | None:
+        """Schedule local dispatch, retaining it until completion.
+
+        Unlike ``publish``, the caller does not wait for handlers. This does not
+        turn individual handlers into independent workers or change their order.
+        Separate publications may interleave; this is not a global event FIFO.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.debug("dropping event without a running loop: {}", type(event).__name__)
+            return None
+        task = loop.create_task(self.publish(event))
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+        return task
+
+    async def drain(self) -> None:
+        """Finish scheduled dispatches after producers stop, before disconnecting."""
+        while self._pending:
+            await asyncio.gather(*self._pending, return_exceptions=True)

@@ -18,6 +18,7 @@ from typing import Any
 from loguru import logger
 
 from familia.nanobot_extension.cron import (
+    make_cron_delivery_observer,
     make_heartbeat_source_reader,
     make_scheduled_handler,
 )
@@ -161,6 +162,15 @@ def make_outbound_guard() -> Callable[[Any], Awaitable[Any]]:
 
         actor, valid = _trusted_actor(getattr(request, "actor", None))
         inbound_channel, inbound_chat_id = _origin(request)
+        context = _request_context()
+        metadata = getattr(context, "metadata", None)
+        if isinstance(metadata, Mapping) and metadata.get("_familia_server_cron") is True:
+            recipient = get_registry().resolve_unique(inbound_channel or "", inbound_chat_id or "")
+            if recipient is None:
+                return OutboundDecision.deny("адресат серверного cron не определён однозначно")
+            if actor != recipient:
+                action = "message.send"
+                inbound_chat_id = None
         target_is_origin = (
             inbound_channel == getattr(outbound, "channel", None)
             and inbound_chat_id == getattr(outbound, "chat_id", None)
@@ -666,14 +676,6 @@ async def _heartbeat_source(actor: str) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
-def _heartbeat_keep_recent(loop: Any) -> int:
-    config = getattr(loop, "config", None)
-    gateway = getattr(config, "gateway", None)
-    heartbeat = getattr(gateway, "heartbeat", None)
-    value = getattr(heartbeat, "keep_recent_messages", 8)
-    return value if isinstance(value, int) and value >= 0 else 8
-
-
 async def _heartbeat_should_notify(loop: Any, response: str, prompt: str) -> bool:
     evaluator = getattr(loop, "evaluate_response", None)
     workspace = getattr(loop, "workspace", None)
@@ -801,16 +803,6 @@ async def run_heartbeat(actor: str, loop: Any) -> Any:
             reset(suppress_token)
         set_current_actor(previous_actor)
         set_current_channel(previous_channel)
-
-    sessions = getattr(loop, "sessions", None)
-    get_or_create = getattr(sessions, "get_or_create", None)
-    session = get_or_create(private_key) if callable(get_or_create) else None
-    retain = getattr(session, "retain_recent_legal_suffix", None)
-    if callable(retain):
-        retain(_heartbeat_keep_recent(loop))
-        save = getattr(sessions, "save", None)
-        if callable(save):
-            save(session)
 
     response_text = response if isinstance(response, str) else getattr(response, "content", None)
     if not isinstance(response_text, str) or not response_text.strip():
@@ -946,6 +938,7 @@ def make_runtime_service_hooks(config: Any = None, bus: Any = None) -> dict[str,
         "channel_plugins": channel_plugins,
         "register_channel_descriptor": register_channel_descriptor,
         "resolve_heartbeat_target": resolve_heartbeat_target,
+        "make_delivery_observer": make_cron_delivery_observer,
         "make_heartbeat_source_reader": make_heartbeat_source_reader,
         "run_dream": run_dream,
         "run_heartbeat": run_heartbeat,

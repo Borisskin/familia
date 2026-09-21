@@ -2,20 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from nanobot.agent.outbound import RUNTIME_REQUEST_CONTEXT_KEY
-from nanobot.runtime_context import RUNTIME_CONTEXT_HISTORY_META
+from nanobot.bus.runtime_events import SessionTurnPersisted
+from nanobot.runtime_context import RUNTIME_CONTEXT_HISTORY_META, RuntimeContextProvider
 from nanobot.sdk.types import (
     SessionInfo,
     SessionSnapshot,
     snapshot_from_payload,
     snapshot_from_session,
 )
-from nanobot.session.manager import replay_max_messages_for_context
 
 if TYPE_CHECKING:
     from nanobot.agent.loop import AgentLoop
@@ -25,17 +24,15 @@ class SessionClient:
     """Session management helpers exposed through ``bot.sessions``."""
 
     _RESERVED_MESSAGE_KEYS = {"role", "content", RUNTIME_CONTEXT_HISTORY_META}
-    _RUNTIME_PRIVATE_KEYS = {
-        RUNTIME_REQUEST_CONTEXT_KEY,
-        "_runtime_actor",
-        "_runtime_action",
-        "_runtime_inbound_channel",
-        "_runtime_inbound_chat_id",
-    }
     _VALID_ROLES = {"user", "assistant", "tool", "system"}
 
     def __init__(self, loop: AgentLoop) -> None:
         self._loop = loop
+
+    def _ensure_access(self, operation: str) -> None:
+        guard = getattr(self._loop.runtime_adapters, "session_access", None)
+        if guard is not None and not guard(operation):
+            raise RuntimeError(f"session operation '{operation}' is not available")
 
     async def ingest(
         self,
@@ -47,15 +44,10 @@ class SessionClient:
         save: bool = True,
     ) -> SessionSnapshot:
         """Import an existing transcript without running the model."""
+        self._ensure_access("ingest")
         session = self._loop.sessions.get_or_create(session_key)
         if metadata:
-            session.metadata.update(
-                deepcopy({
-                    key: value
-                    for key, value in metadata.items()
-                    if key not in self._RUNTIME_PRIVATE_KEYS
-                })
-            )
+            session.metadata.update(deepcopy(dict(metadata)))
 
         for raw in messages:
             if "role" not in raw:
@@ -69,7 +61,6 @@ class SessionClient:
                 key: deepcopy(value)
                 for key, value in raw.items()
                 if key not in self._RESERVED_MESSAGE_KEYS
-                and key not in self._RUNTIME_PRIVATE_KEYS
             }
             if source is not None and "source" not in extra:
                 extra["source"] = source
@@ -81,7 +72,8 @@ class SessionClient:
 
     def get(self, session_key: str) -> SessionSnapshot | None:
         """Return a display-safe snapshot without creating a new session on disk."""
-        cached = self._loop.sessions._cached(session_key)
+        self._ensure_access("get")
+        cached = self._loop.sessions.get_cached(session_key)
         if cached is not None:
             return snapshot_from_session(cached)
         payload = self._loop.sessions.read_session_file(session_key)
@@ -91,6 +83,7 @@ class SessionClient:
 
     def list(self) -> list[SessionInfo]:
         """List persisted sessions."""
+        self._ensure_access("list")
         return [
             SessionInfo(
                 key=str(row.get("key") or ""),
@@ -103,9 +96,21 @@ class SessionClient:
             for row in self._loop.sessions.list_sessions()
         ]
 
+    def read(self) -> str:
+        """Reject the legacy memory-shaped session read operation."""
+        self._ensure_access("read")
+        raise RuntimeError("session read is not available")
+
+    def read_history(self, *, session_key: str | None = None) -> list[dict[str, Any]]:
+        """Reject the legacy memory-shaped session history operation."""
+        del session_key
+        self._ensure_access("read_history")
+        raise RuntimeError("session history is not available")
+
     def export(self, session_key: str) -> SessionSnapshot | None:
         """Return a trusted full snapshot, including model-only runtime context."""
-        cached = self._loop.sessions._cached(session_key)
+        self._ensure_access("export")
+        cached = self._loop.sessions.get_cached(session_key)
         if cached is not None:
             return snapshot_from_session(cached, include_runtime_context=True)
         payload = self._loop.sessions.read_session_file(session_key)
@@ -121,6 +126,7 @@ class SessionClient:
         save: bool = True,
     ) -> SessionSnapshot:
         """Restore a trusted snapshot into an empty session."""
+        self._ensure_access("restore")
         key = session_key or snapshot.key
         if not key:
             raise ValueError("restored snapshots must include a session key")
@@ -139,17 +145,10 @@ class SessionClient:
                 field: deepcopy(value)
                 for field, value in raw.items()
                 if field not in {"role", "content"}
-                and field not in self._RUNTIME_PRIVATE_KEYS
             }
             prepared.append((role, deepcopy(raw["content"]), extra))
 
-        session.metadata.update(
-            deepcopy({
-                key: value
-                for key, value in snapshot.metadata.items()
-                if key not in self._RUNTIME_PRIVATE_KEYS
-            })
-        )
+        session.metadata.update(deepcopy(snapshot.metadata))
         for role, content, extra in prepared:
             session.add_message(role, content, **extra)
 
@@ -159,6 +158,8 @@ class SessionClient:
 
     def clear(self, session_key: str) -> SessionSnapshot:
         """Clear one session and persist the empty session."""
+        self._ensure_access("clear")
+        self._loop.discard_session_file_state(session_key)
         session = self._loop.sessions.get_or_create(session_key)
         session.clear()
         self._loop.sessions.save(session)
@@ -166,10 +167,12 @@ class SessionClient:
 
     def delete(self, session_key: str) -> bool:
         """Delete one session from disk and cache."""
+        self._ensure_access("delete")
         return self._loop.sessions.delete_session(session_key)
 
     def flush(self) -> int:
         """Flush cached sessions to durable storage."""
+        self._ensure_access("flush")
         return self._loop.sessions.flush_all()
 
 
@@ -215,21 +218,38 @@ class RuntimeClient:
         """Current runtime workspace."""
         return self._loop.workspace
 
+    def add_context_provider(
+        self,
+        provider: RuntimeContextProvider,
+    ) -> Callable[[], None]:
+        """Register per-turn model context and return an unsubscribe callback."""
+        return self._loop.register_runtime_context_provider(provider)
+
+    def on_session_turn_persisted(
+        self,
+        handler: Callable[[SessionTurnPersisted], Awaitable[None] | None],
+    ) -> Callable[[], None]:
+        """Register a persisted-turn callback and return an unsubscribe callback."""
+        return self._loop.bus.subscribe(handler, SessionTurnPersisted)
+
     async def compact_session(self, session_key: str) -> SessionSnapshot:
-        """Run token/replay-window consolidation for one session."""
+        """Summarize one session and exclude its archived messages from replay."""
+        guard = getattr(self._loop.runtime_adapters, "session_access", None)
+        if guard is not None and not guard("compact"):
+            raise RuntimeError("session operation 'compact' is not available")
         session = self._loop.sessions.get_or_create(session_key)
         runtime = self._loop.runtime_for_session(session)
-        await self._loop.consolidator.maybe_consolidate_by_tokens(
-            session,
+        await self._loop.consolidator.compact_idle_session(
+            session_key,
             runtime=runtime,
-            replay_max_messages=replay_max_messages_for_context(
-                runtime.context_window_tokens
-            ),
         )
         return snapshot_from_session(self._loop.sessions.get_or_create(session_key))
 
-    async def compact_idle_session(self, session_key: str, *, max_suffix: int = 8) -> str | None:
-        """Run idle-session compaction for one session and return the summary."""
+    async def compact_idle_session(self, session_key: str, *, max_suffix: int = 0) -> str | None:
+        """Return a replacement summary; legacy ``max_suffix`` no longer retains history."""
+        guard = getattr(self._loop.runtime_adapters, "session_access", None)
+        if guard is not None and not guard("compact_idle"):
+            raise RuntimeError("session operation 'compact_idle' is not available")
         session = self._loop.sessions.get_or_create(session_key)
         runtime = self._loop.runtime_for_session(session)
         return await self._loop.consolidator.compact_idle_session(

@@ -6,19 +6,22 @@ import asyncio
 import hashlib
 import time
 import uuid
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from nanobot.agent.tools.cron import CronTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.cron.session_delivery import origin_delivery_context
 from nanobot.cron.session_turns import CRON_DEFER_UNTIL_IDLE_META, CRON_TRIGGER_META
-from nanobot.cron.types import CronJob
+from nanobot.cron.types import CronJob, CronRunResult
 from nanobot.cron.webui_metadata import cron_proactive_delivery_metadata
 from nanobot.utils.prompt_templates import render_template
 
+if TYPE_CHECKING:
+    from nanobot.agent.tools.registry import ToolRegistry
+
 
 class BoundCronAgent(Protocol):
-    tools: Any
+    tools: ToolRegistry
 
     async def submit_cron_turn(self, msg: InboundMessage) -> OutboundMessage | None:
         ...
@@ -64,7 +67,7 @@ async def run_bound_cron_job(
     *,
     agent: BoundCronAgent,
     cron: CronRunRecorder,
-) -> str | None:
+) -> CronRunResult:
     """Execute a session-bound cron job as a normal agent session turn."""
     session_key = job.payload.session_key
     if not session_key:
@@ -148,4 +151,4 @@ async def run_bound_cron_job(
             "response": response,
         },
     )
-    return response
+    return CronRunResult(run_id=run_id, response=response)

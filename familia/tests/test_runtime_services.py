@@ -118,10 +118,9 @@ def test_service_hooks_bind_real_handlers_not_config_callables() -> None:
 
 
 def test_internal_turn_targets_actual_agent_loop_seam() -> None:
-    admit_params = inspect.signature(AgentLoop._admit_message).parameters
+    admit_params = inspect.signature(AgentLoop._admit_inbound).parameters
     process_params = inspect.signature(AgentLoop._process_message).parameters
     assert tuple(admit_params) == ("self", "msg")
-    assert "request_context" in process_params
     assert "session_key" in process_params
 
 
@@ -148,16 +147,23 @@ async def test_internal_turn_uses_actual_process_direct_lock_path(
         workspace=tmp_path,
         model="test-model",
         runtime_adapters=RuntimeAdapters(admit=admit),
-        mcp_servers={},
     )
-    monkeypatch.setattr(loop, "_connect_mcp", AsyncMock())
     captured: dict[str, object] = {}
 
     async def process(message: object, **kwargs: object) -> OutboundMessage:
         captured["message"] = message
         captured["kwargs"] = kwargs
+        lock = loop._session_locks.get("familia:owner:telegram:chat-owner")
+        captured["lock_held"] = lock is not None and lock.locked()
         return OutboundMessage(channel="telegram", chat_id="chat-owner", content="ok")
 
+    original_process_direct = loop.process_direct
+
+    async def process_direct(*args: object, **kwargs: object) -> OutboundMessage | None:
+        captured["request_context"] = kwargs["request_context"]
+        return await original_process_direct(*args, **kwargs)
+
+    monkeypatch.setattr(loop, "process_direct", process_direct)
     monkeypatch.setattr(loop, "_process_message", process)
     result = await runtime_services._process_internal_turn(
         loop,
@@ -168,8 +174,8 @@ async def test_internal_turn_uses_actual_process_direct_lock_path(
         session_key="familia:owner:telegram:chat-owner",
     )
     assert result.content == "ok"
-    assert "familia:owner:telegram:chat-owner" in loop._session_locks
-    request_context = captured["kwargs"]["request_context"]
+    assert captured["lock_held"] is True
+    request_context = captured["request_context"]
     assert request_context.actor == "owner"
     assert request_context.session_key == "familia:owner:telegram:chat-owner"
 
@@ -532,7 +538,6 @@ async def test_cron_timer_dispatches_system_fanout_and_user_dream_name(
             origin_channel="telegram",
             origin_chat_id="chat-owner",
             origin_metadata={"actor": "owner"},
-            target_actor="owner",
         ),
         state=CronJobState(next_run_at_ms=1),
     )

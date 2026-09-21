@@ -5,14 +5,14 @@ import json
 import time
 import uuid
 import warnings
-from dataclasses import dataclass, field, replace
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, NotRequired, TypedDict
 
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
-from nanobot.agent.outbound import RUNTIME_REQUEST_CONTEXT_KEY
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.base import ToolResult
 from nanobot.agent.tools.context import (
@@ -28,7 +28,8 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults, ToolsConfig
-from nanobot.providers.base import LLMProvider
+from nanobot.llm_usage.context import LLMUsageSource, current_llm_usage_source
+from nanobot.providers.base import LLMProvider, LLMUsage
 from nanobot.security.workspace_access import (
     WorkspaceScope,
     bind_workspace_scope,
@@ -39,6 +40,13 @@ from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.prompt_templates import render_template
 
 
+class _SubagentOrigin(TypedDict):
+    channel: str
+    chat_id: str
+    session_key: str | None
+    llm_usage_source: NotRequired[LLMUsageSource]
+
+
 @dataclass(slots=True)
 class SubagentStatus:
     """Real-time status of a running subagent."""
@@ -47,13 +55,13 @@ class SubagentStatus:
     label: str
     task_description: str
     started_at: float          # time.monotonic()
-    phase: str = "initializing"  # initializing | awaiting_tools | tools_completed | final_response | done | error
+    # queued | initializing | awaiting_tools | tools_completed | final_response | done | error
+    phase: str = "initializing"
     iteration: int = 0
-    tool_events: list = field(default_factory=list)   # [{name, status, detail}, ...]
-    usage: dict = field(default_factory=dict)          # token usage
+    tool_events: list[dict[str, str]] = field(default_factory=list)
+    usage: LLMUsage | None = None
     stop_reason: str | None = None
     error: str | None = None
-    session_key: str | None = None
 
 
 class _SubagentHook(AgentHook):
@@ -77,7 +85,7 @@ class _SubagentHook(AgentHook):
             return
         self._status.iteration = context.iteration
         self._status.tool_events = list(context.tool_events)
-        self._status.usage = dict(context.usage)
+        self._status.usage = context.usage
         if context.error:
             self._status.error = str(context.error)
 
@@ -97,9 +105,6 @@ class SubagentManager:
         disabled_skills: list[str] | None = None,
         max_iterations: int | None = None,
         max_concurrent_subagents: int | None = None,
-        fail_on_tool_error: bool | None = None,
-        llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
-        runtime_adapters: Any | None = None,
     ):
         if workspace is None:
             raise TypeError("SubagentManager.__init__() missing required argument: 'workspace'")
@@ -128,7 +133,6 @@ class SubagentManager:
             )
         self.workspace = workspace
         self.bus = bus
-        self.runtime_adapters = runtime_adapters
         self.tools_config = tools_config or ToolsConfig()
         self.max_tool_result_chars = max_tool_result_chars
         self.restrict_to_workspace = restrict_to_workspace
@@ -143,17 +147,16 @@ class SubagentManager:
             if max_concurrent_subagents is not None
             else defaults.max_concurrent_subagents
         )
-        self.fail_on_tool_error = (
-            fail_on_tool_error
-            if fail_on_tool_error is not None
-            else defaults.fail_on_tool_error
-        )
+        self._run_slots = asyncio.Semaphore(self.max_concurrent_subagents)
         self.runner = AgentRunner()
         self._exec_session_manager = ExecSessionManager()
-        self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
         self._running_tasks: dict[str, asyncio.Task[str]] = {}
         self._task_statuses: dict[str, SubagentStatus] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
+
+    def runtime_statuses(self) -> Mapping[str, SubagentStatus]:
+        """Return the observable task statuses used by runtime-control snapshots."""
+        return self._task_statuses
 
     def set_provider(self, provider: LLMProvider, model: str) -> None:
         """Update the deprecated runtime source used by legacy ``spawn`` calls."""
@@ -211,8 +214,6 @@ class SubagentManager:
         ctx = ToolContext(
             config=cfg,
             workspace=str(root.resolve()),
-            bus=self.bus,
-            subagent_manager=self,
             exec_session_manager=self._exec_session_manager,
             file_state_store=FileStates(),
             workspace_sandbox=workspace_sandbox_status(
@@ -221,9 +222,6 @@ class SubagentManager:
             ),
         )
         ToolLoader().load(ctx, registry, scope="subagent")
-        installer = getattr(self.runtime_adapters, "install_tools", None)
-        if installer is not None:
-            installer(ctx, registry)
         return registry
 
     async def spawn(
@@ -238,7 +236,6 @@ class SubagentManager:
         workspace_scope: WorkspaceScope | None = None,
         *,
         runtime: LLMRuntime | None = None,
-        origin_context: RequestContext | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
         if runtime is None:
@@ -247,12 +244,11 @@ class SubagentManager:
             runtime = runtime.with_generation_overrides(temperature=temperature)
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
-        origin: dict[str, Any] = {
+        origin: _SubagentOrigin = {
             "channel": origin_channel,
             "chat_id": origin_chat_id,
             "session_key": session_key,
-            "actor": origin_context.actor if origin_context is not None else None,
-            "request_context": origin_context,
+            "llm_usage_source": current_llm_usage_source(),
         }
 
         status = SubagentStatus(
@@ -260,7 +256,6 @@ class SubagentManager:
             label=display_label,
             task_description=task,
             started_at=time.monotonic(),
-            session_key=session_key,
         )
         self._task_statuses[task_id] = status
 
@@ -280,7 +275,7 @@ class SubagentManager:
         if session_key:
             self._session_tasks.setdefault(session_key, set()).add(task_id)
 
-        def _cleanup(_: asyncio.Task) -> None:
+        def _cleanup(_: asyncio.Task[str]) -> None:
             self._running_tasks.pop(task_id, None)
             self._task_statuses.pop(task_id, None)
             if session_key and (ids := self._session_tasks.get(session_key)):
@@ -305,7 +300,6 @@ class SubagentManager:
         workspace_scope: WorkspaceScope | None = None,
         *,
         runtime: LLMRuntime | None = None,
-        origin_context: RequestContext | None = None,
     ) -> str:
         """Run a subagent synchronously and return its result to the caller."""
         if runtime is None:
@@ -314,19 +308,17 @@ class SubagentManager:
             runtime = runtime.with_generation_overrides(temperature=temperature)
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
-        origin: dict[str, Any] = {
+        origin: _SubagentOrigin = {
             "channel": origin_channel,
             "chat_id": origin_chat_id,
             "session_key": session_key,
-            "actor": origin_context.actor if origin_context is not None else None,
-            "request_context": origin_context,
+            "llm_usage_source": current_llm_usage_source(),
         }
         status = SubagentStatus(
             task_id=task_id,
             label=display_label,
             task_description=task,
             started_at=time.monotonic(),
-            session_key=session_key,
         )
         self._task_statuses[task_id] = status
         logger.info("Running inline subagent [{}]: {}", task_id, display_label)
@@ -348,7 +340,7 @@ class SubagentManager:
             self._session_tasks.setdefault(session_key, set()).add(task_id)
         try:
             result = await inline_task
-            if status.phase == "error" or status.stop_reason in {"error", "tool_error"}:
+            if status.phase == "error" or status.stop_reason == "error":
                 return ToolResult.error(result)
             return result
         finally:
@@ -364,7 +356,36 @@ class SubagentManager:
         task_id: str,
         task: str,
         label: str,
-        origin: dict[str, Any],
+        origin: _SubagentOrigin,
+        status: SubagentStatus,
+        runtime: LLMRuntime,
+        origin_message_id: str | None = None,
+        workspace_scope: WorkspaceScope | None = None,
+        *,
+        announce: bool = True,
+    ) -> str:
+        """Wait for capacity, then execute one subagent task."""
+        status.phase = "queued"
+        async with self._run_slots:
+            status.phase = "initializing"
+            return await self._run_admitted_subagent(
+                task_id,
+                task,
+                label,
+                origin,
+                status,
+                runtime,
+                origin_message_id,
+                workspace_scope,
+                announce=announce,
+            )
+
+    async def _run_admitted_subagent(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: _SubagentOrigin,
         status: SubagentStatus,
         runtime: LLMRuntime,
         origin_message_id: str | None = None,
@@ -375,7 +396,7 @@ class SubagentManager:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
 
-        async def _on_checkpoint(payload: dict) -> None:
+        async def _on_checkpoint(payload: dict[str, Any]) -> None:
             status.phase = payload.get("phase", status.phase)
             status.iteration = payload.get("iteration", status.iteration)
 
@@ -394,31 +415,13 @@ class SubagentManager:
             ]
 
             sess_key = origin.get("session_key")
-            llm_timeout = (
-                self._llm_wall_timeout_for_session(sess_key)
-                if self._llm_wall_timeout_for_session
-                else None
-            )
-            parent_context = origin.get("request_context")
-            if isinstance(parent_context, RequestContext):
-                request_ctx = replace(
-                    parent_context,
-                    message_id=origin_message_id or parent_context.message_id,
-                    session_key=sess_key,
-                    runtime=runtime,
-                    workspace=root,
-                    metadata=dict(parent_context.metadata or {}),
-                )
-            else:
-                request_ctx = RequestContext(
-                    channel=origin["channel"],
-                    chat_id=origin["chat_id"],
-                    message_id=origin_message_id,
-                    session_key=sess_key,
-                    runtime=runtime,
-                    actor=origin.get("actor"),
-                )
-            request_token = bind_request_context(request_ctx)
+            request_token = bind_request_context(RequestContext(
+                channel=origin["channel"],
+                chat_id=origin["chat_id"],
+                message_id=origin_message_id,
+                session_key=sess_key,
+                runtime=runtime,
+            ))
             token = bind_workspace_scope(workspace_scope) if workspace_scope is not None else None
             try:
                 result = await self.runner.run(AgentRunSpec(
@@ -431,11 +434,13 @@ class SubagentManager:
                     max_iterations_message="Task completed but no final response was generated.",
                     finalize_on_max_iterations=False,
                     error_message=None,
-                    fail_on_tool_error=self.fail_on_tool_error,
                     checkpoint_callback=_on_checkpoint,
                     session_key=sess_key,
                     workspace=root,
-                    llm_timeout_s=llm_timeout,
+                    llm_usage_source=origin.get(
+                        "llm_usage_source",
+                        current_llm_usage_source(),
+                    ),
                 ))
             finally:
                 if token is not None:
@@ -444,11 +449,7 @@ class SubagentManager:
             status.phase = "done"
             status.stop_reason = result.stop_reason
 
-            if result.stop_reason == "tool_error":
-                status.tool_events = list(result.tool_events)
-                final_result = self._format_partial_progress(result)
-                final_status = "error"
-            elif result.stop_reason == "error":
+            if result.stop_reason == "error":
                 final_result = result.error or "Error: subagent execution failed."
                 final_status = "error"
             else:
@@ -490,7 +491,7 @@ class SubagentManager:
         label: str,
         task: str,
         result: str,
-        origin: dict[str, Any],
+        origin: _SubagentOrigin,
         status: str,
         origin_message_id: str | None = None,
     ) -> None:
@@ -515,9 +516,6 @@ class SubagentManager:
             "injected_event": "subagent_result",
             "subagent_task_id": task_id,
         }
-        parent_context = origin.get("request_context")
-        if isinstance(parent_context, RequestContext):
-            metadata[RUNTIME_REQUEST_CONTEXT_KEY] = parent_context
         if origin_message_id:
             metadata["origin_message_id"] = origin_message_id
         msg = InboundMessage(
@@ -526,33 +524,11 @@ class SubagentManager:
             chat_id=f"{origin['channel']}:{origin['chat_id']}",
             content=announce_content,
             session_key_override=override,
-            actor=origin.get("actor") if isinstance(origin.get("actor"), str) else None,
             metadata=metadata,
         )
 
         await self.bus.publish_inbound(msg)
         logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
-
-    @staticmethod
-    def _format_partial_progress(result) -> str:
-        completed = [e for e in result.tool_events if e["status"] == "ok"]
-        failure = next((e for e in reversed(result.tool_events) if e["status"] == "error"), None)
-        lines: list[str] = []
-        if completed:
-            lines.append("Completed steps:")
-            for event in completed[-3:]:
-                lines.append(f"- {event['name']}: {event['detail']}")
-        if failure:
-            if lines:
-                lines.append("")
-            lines.append("Failure:")
-            lines.append(f"- {failure['name']}: {failure['detail']}")
-        if result.error and not failure:
-            if lines:
-                lines.append("")
-            lines.append("Failure:")
-            lines.append(f"- {result.error}")
-        return "\n".join(lines) or (result.error or "Error: subagent execution failed.")
 
     def _build_subagent_prompt(self, workspace: Path | None = None) -> str:
         """Build a focused system prompt for the subagent."""
@@ -563,12 +539,17 @@ class SubagentManager:
         skills_summary = SkillsLoader(
             self.workspace,
             disabled_skills=self.disabled_skills,
-        ).build_skills_summary()
+        ).build_skills_summary(workspace=project_workspace)
+        history_log = (
+            str(agent_workspace / "memory" / "history.jsonl")
+            if agent_workspace != project_workspace
+            else "memory/history.jsonl"
+        )
         return render_template(
             "agent/subagent_system.md",
             workspace=str(project_workspace),
             agent_workspace=str(agent_workspace),
-            history_log=str(agent_workspace / "memory" / "history.jsonl"),
+            history_log=history_log,
             skills_summary=skills_summary or "",
         )
 

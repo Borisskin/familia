@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .session_identity import make_private_session_key
+from .session_identity import make_private_session_key, parse_private_session_key
 
 DEFAULT_SOURCE_ROOT = Path(
     "D:/chat/familia/dist/nanobot-legacy-20260907-111309"
@@ -82,7 +82,7 @@ def _registry_ids(registry: object = None) -> set[str]:
         from .principals import PrincipalRegistry
     except ImportError:  # pragma: no cover - package import boundary
         PrincipalRegistry = ()  # type: ignore[assignment,misc]
-    if isinstance(registry, PrincipalRegistry):
+    if isinstance(registry, PrincipalRegistry) or hasattr(registry, "ids"):
         try:
             values = registry.ids
             return {value for value in values if isinstance(value, str)}
@@ -114,8 +114,15 @@ def _storage_key(key: str) -> str:
     return base64.urlsafe_b64encode(key.encode("utf-8")).decode("ascii").rstrip("=")
 
 
-def _session_target_path(output_root: Path, key: str) -> Path:
-    return output_root / TARGET_SESSIONS_DIR / f"{_storage_key(key)}.jsonl"
+def _session_target_path(
+    output_root: Path,
+    key: str,
+    namespace: str | None = None,
+) -> Path:
+    root = output_root / TARGET_SESSIONS_DIR
+    if namespace is not None:
+        root /= namespace
+    return root / f"{_storage_key(key)}.jsonl"
 
 
 def _valid_timestamp(value: object, issues: list[dict[str, Any]], field_name: str) -> str:
@@ -172,6 +179,33 @@ def _read_cursor(
     return parsed[0]
 
 
+def _read_personal_cursors(
+    metadata: Mapping[str, Any],
+    message_count: int,
+    issues: list[dict[str, Any]],
+    quarantine: list[dict[str, Any]],
+) -> tuple[int, int]:
+    """Keep distinct archive/consolidation boundaries for an existing private key."""
+    values: dict[str, int] = {}
+    for name in ("last_archived", "last_consolidated"):
+        value = metadata.get(name, 0)
+        if isinstance(value, bool) or not isinstance(value, int):
+            issues.append({"reason": "invalid_cursor", "field": name, "value": value})
+            quarantine.append(
+                {"line": 1, "reason": "invalid_cursor", "record": {name: value}}
+            )
+            values[name] = 0
+        elif not 0 <= value <= message_count:
+            issues.append({"reason": "cursor_out_of_range", "field": name, "value": value})
+            quarantine.append(
+                {"line": 1, "reason": "cursor_out_of_range", "record": {name: value}}
+            )
+            values[name] = 0
+        else:
+            values[name] = value
+    return values["last_archived"], values["last_consolidated"]
+
+
 def _tool_call_ids(message: Mapping[str, Any]) -> set[str] | None:
     if "tool_calls" not in message:
         return set()
@@ -187,6 +221,21 @@ def _tool_call_ids(message: Mapping[str, Any]) -> set[str] | None:
             return None
         result.add(call_id)
     return result
+
+
+def _resolve_route_owner(source_key: str, registry: object) -> str | None:
+    """Resolve a shared chat owner from the server-side registry only."""
+    resolver = getattr(registry, "resolve", None)
+    if not callable(resolver):
+        return None
+    channel, separator, chat_id = source_key.partition(":")
+    if not separator or channel not in {"telegram", "vk"} or not chat_id:
+        return None
+    try:
+        owner = resolver(channel, chat_id)
+    except Exception:  # noqa: BLE001 - migration must quarantine unresolved routes
+        return None
+    return owner if _canonical_principal(owner) is not None else None
 
 
 @dataclass
@@ -210,6 +259,10 @@ class _FilePlan:
     quarantine: list[dict[str, Any]] = field(default_factory=list)
     issues: list[dict[str, Any]] = field(default_factory=list)
     sidecars: list[Path] = field(default_factory=list)
+    preserve_sidecars: list[Path] = field(default_factory=list)
+    metadata_extra: dict[str, Any] = field(default_factory=dict)
+    preserve_key: bool = False
+    preserved_cursors: tuple[int, int] | None = None
     message_count: int = 0
 
 
@@ -228,7 +281,7 @@ class MigrationPlan:
     def quarantine_count(self) -> int:
         return sum(len(item.quarantine) for item in self.files)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, target_namespace: str | None = None) -> dict[str, Any]:
         source_files: list[dict[str, Any]] = []
         targets: list[dict[str, Any]] = []
         quarantine: list[dict[str, Any]] = []
@@ -256,16 +309,25 @@ class MigrationPlan:
             for actor, actor_groups in _groups_by_actor(item.groups).items():
                 if item.source_key is None:
                     continue
-                key = make_private_session_key(actor, item.source_key)
-                cursor = _group_cursor(actor_groups, item.source_cursor)
+                key = (
+                    item.source_key
+                    if item.preserve_key
+                    else make_private_session_key(actor, item.source_key)
+                )
+                cursor = (
+                    item.preserved_cursors[1]
+                    if item.preserved_cursors is not None
+                    else _group_cursor(actor_groups, item.source_cursor)
+                )
+                target_path = Path(TARGET_SESSIONS_DIR)
+                if target_namespace is not None:
+                    target_path /= target_namespace
+                target_path /= f"{_storage_key(key)}.jsonl"
                 targets.append(
                     {
                         "actor": actor,
                         "key": key,
-                        "path": str(
-                            Path(TARGET_SESSIONS_DIR)
-                            / f"{_storage_key(key)}.jsonl"
-                        ),
+                        "path": str(target_path),
                         "source": item.relative_path,
                         "message_count": sum(
                             len(group.messages) for group in actor_groups
@@ -334,6 +396,9 @@ def _analyse_messages(
     events: list[tuple[int, object, str | None]],
     known_actors: set[str],
     quarantine: list[dict[str, Any]],
+    *,
+    trusted_actor: str | None = None,
+    require_trusted_actor: bool = False,
 ) -> tuple[list[_Group], int]:
     groups: list[_Group] = []
     current: dict[str, Any] | None = None
@@ -399,7 +464,31 @@ def _analyse_messages(
             continue
 
         if role == "user":
-            actor = message.get("actor")
+            actor = trusted_actor
+            if trusted_actor is None and require_trusted_actor:
+                close_current()
+                quarantine.append(
+                    {
+                        "line": line_number,
+                        "reason": "unresolved_user_owner",
+                        "record": copy.deepcopy(message),
+                    }
+                )
+                continue
+            if trusted_actor is not None:
+                actor_field = message.get("actor")
+                if "actor" in message and actor_field != trusted_actor:
+                    close_current()
+                    quarantine.append(
+                        {
+                            "line": line_number,
+                            "reason": "actor_mismatch",
+                            "record": copy.deepcopy(message),
+                        }
+                    )
+                    continue
+            else:
+                actor = message.get("actor")
             if (
                 not isinstance(actor, str)
                 or _canonical_principal(actor) is None
@@ -510,7 +599,15 @@ def _sidecars_for(path: Path) -> list[Path]:
     return result
 
 
-def _analyse_file(path: Path, source_root: Path, known_actors: set[str]) -> _FilePlan:
+def _analyse_file(
+    path: Path,
+    source_root: Path,
+    known_actors: set[str],
+    *,
+    trusted_actor: str | None = None,
+    require_trusted_actor: bool = False,
+    owner_registry: object = None,
+) -> _FilePlan:
     relative = path.relative_to(source_root).as_posix()
     raw = path.read_bytes()
     digest = _sha256(raw)
@@ -582,11 +679,42 @@ def _analyse_file(path: Path, source_root: Path, known_actors: set[str]) -> _Fil
         issues.append({"reason": "missing_session_key"})
         source_key = None
 
+    private_parts = (
+        parse_private_session_key(source_key)
+        if isinstance(source_key, str)
+        else None
+    )
+    private_owner = private_parts[0] if private_parts is not None else None
+    is_known_private = private_owner in known_actors if private_owner else False
+    if owner_registry is not None and source_key is not None and private_parts is None:
+        trusted_actor = _resolve_route_owner(source_key, owner_registry)
+        require_trusted_actor = callable(getattr(owner_registry, "resolve", None))
+
     metadata_value = metadata_record.get("metadata", {})
     metadata = copy.deepcopy(metadata_value) if isinstance(metadata_value, dict) else {}
+    metadata_extra = {
+        key: copy.deepcopy(value)
+        for key, value in metadata_record.items()
+        if key
+        not in {
+            "_type",
+            "key",
+            "created_at",
+            "updated_at",
+            "metadata",
+            "last_archived",
+            "last_consolidated",
+        }
+    }
     for key in sorted(_CHECKPOINT_KEYS):
         if key in metadata_record or key in metadata:
             checkpoint = metadata_record.get(key, metadata.get(key))
+            if (
+                is_known_private
+                and key == "runtime_checkpoint"
+                and isinstance(checkpoint, Mapping)
+            ):
+                continue
             quarantine.append(
                 {
                     "line": 1,
@@ -596,16 +724,21 @@ def _analyse_file(path: Path, source_root: Path, known_actors: set[str]) -> _Fil
             )
             metadata.pop(key, None)
 
-    # A malformed or incomplete checkpoint must never enter target metadata.
-    cursor = _read_cursor(
-        metadata_record,
-        sum(
-            1
-            for _, value, error in events
-            if error is None and isinstance(value, Mapping)
-        ),
-        issues,
-        quarantine,
+    # Shared sessions require one unambiguous cursor. Existing private
+    # sessions preserve distinct archive/consolidation boundaries below.
+    cursor = (
+        0
+        if private_parts is not None and is_known_private
+        else _read_cursor(
+            metadata_record,
+            sum(
+                1
+                for _, value, error in events
+                if error is None and isinstance(value, Mapping)
+            ),
+            issues,
+            quarantine,
+        )
     )
     created_at = _valid_timestamp(
         metadata_record.get("created_at"), issues, "created_at"
@@ -613,8 +746,86 @@ def _analyse_file(path: Path, source_root: Path, known_actors: set[str]) -> _Fil
     updated_at = _valid_timestamp(
         metadata_record.get("updated_at"), issues, "updated_at"
     )
-    groups, message_count = _analyse_messages(events, known_actors, quarantine)
+    preserved_cursors: tuple[int, int] | None = None
+    preserve_key = False
+    preserve_sidecars: list[Path] = []
+    if private_parts is not None and is_known_private:
+        # A canonical Familia key already carries the server-validated owner.
+        # Do not split it again or trust actor fields embedded in its messages.
+        preserved: list[dict[str, Any]] = []
+        for line_number, value, parse_error in events:
+            if parse_error is not None:
+                if (
+                    parse_error == "unknown_checkpoint"
+                    and isinstance(value, Mapping)
+                    and value.get("_type") == "provider_state"
+                    and isinstance(value.get("state"), Mapping)
+                ):
+                    preserved.append(copy.deepcopy(dict(value)))
+                    continue
+                quarantine.append(
+                    {"line": line_number, "reason": parse_error, "record": value}
+                )
+                continue
+            if not isinstance(value, Mapping):
+                quarantine.append(
+                    {
+                        "line": line_number,
+                        "reason": "message_not_object",
+                        "record": value,
+                    }
+                )
+                continue
+            preserved.append(copy.deepcopy(dict(value)))
+        groups = [
+            _Group(
+                actor=private_owner,
+                messages=preserved,
+                source_indexes=list(range(len(preserved))),
+            )
+        ]
+        message_count = sum(
+            1 for record in preserved if record.get("_type") != "provider_state"
+        )
+        preserved_cursors = _read_personal_cursors(
+            metadata_record,
+            message_count,
+            issues,
+            quarantine,
+        )
+        preserve_key = True
+    else:
+        groups, message_count = _analyse_messages(
+            events,
+            known_actors,
+            quarantine,
+            trusted_actor=trusted_actor,
+            require_trusted_actor=require_trusted_actor,
+        )
+        if private_parts is not None:
+            for group in groups:
+                _quarantine_group(
+                    quarantine,
+                    {"line": None, "messages": group.messages},
+                    "unknown_private_owner",
+                )
+            groups = []
     for sidecar in _sidecars_for(path):
+        if preserve_key:
+            try:
+                sidecar_value = json.loads(sidecar.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                sidecar_value = None
+            if (
+                isinstance(sidecar_value, Mapping)
+                and sidecar_value.get("session_key") == source_key
+                and (
+                    isinstance(sidecar_value.get("checkpoint"), Mapping)
+                    or isinstance(sidecar_value.get("provider_state"), Mapping)
+                )
+            ):
+                preserve_sidecars.append(sidecar)
+                continue
         quarantine.append(
             {
                 "line": None,
@@ -648,6 +859,10 @@ def _analyse_file(path: Path, source_root: Path, known_actors: set[str]) -> _Fil
         quarantine=quarantine,
         issues=issues,
         sidecars=_sidecars_for(path),
+        preserve_sidecars=preserve_sidecars,
+        metadata_extra=metadata_extra,
+        preserve_key=preserve_key,
+        preserved_cursors=preserved_cursors,
         message_count=message_count,
     )
 
@@ -678,13 +893,27 @@ def analyze_sessions(
     """Read legacy sessions and return a side-effect-free migration plan."""
     source = _validate_source_root(Path(source_root))
     root = source if source.is_dir() else source.parent
-    registry_values = _registry_ids(registry) if known_actors is None else set(known_actors)
+    registry_object = registry
+    if registry_object is None:
+        try:
+            registry_object = get_registry()
+        except Exception:  # noqa: BLE001
+            registry_object = None
+    registry_values = (
+        _registry_ids(registry_object)
+        if known_actors is None
+        else set(known_actors)
+    )
     known = {
         actor
         for actor in registry_values
         if _canonical_principal(actor) is not None
     }
-    files = [_analyse_file(path, root, known) for path in _session_files(source)]
+    owner_registry = registry_object if known_actors is None else None
+    files = [
+        _analyse_file(path, root, known, owner_registry=owner_registry)
+        for path in _session_files(source)
+    ]
     issues = [
         {"source": item.relative_path, **issue}
         for item in files
@@ -761,13 +990,17 @@ def _make_source_snapshot(path: Path, data: bytes, output_root: Path, relative: 
 
 def _target_bytes(item: _FilePlan, actor_groups: list[_Group], actor: str) -> tuple[str, bytes]:
     assert item.source_key is not None
-    key = make_private_session_key(actor, item.source_key)
+    key = item.source_key if item.preserve_key else make_private_session_key(actor, item.source_key)
     metadata = copy.deepcopy(item.metadata)
-    channel, separator, chat_id = item.source_key.partition(":")
+    original_key = item.source_key
+    private_parts = parse_private_session_key(item.source_key)
+    if private_parts is not None:
+        original_key = private_parts[1]
+    channel, separator, chat_id = original_key.partition(":")
     metadata.update(
         {
             "familia_actor": actor,
-            "familia_original_session_key": item.source_key,
+            "familia_original_session_key": original_key,
             "familia_source_file": item.relative_path,
             "familia_source_sha256": item.digest,
         }
@@ -775,16 +1008,23 @@ def _target_bytes(item: _FilePlan, actor_groups: list[_Group], actor: str) -> tu
     if separator and channel and chat_id:
         metadata["familia_original_channel"] = channel
         metadata["familia_original_chat_id"] = chat_id
-    cursor = _group_cursor(actor_groups, item.source_cursor)
+    if item.preserved_cursors is not None:
+        last_archived, last_consolidated = item.preserved_cursors
+    else:
+        last_archived = last_consolidated = _group_cursor(
+            actor_groups,
+            item.source_cursor,
+        )
     metadata_line = {
         "_type": "metadata",
         "key": key,
         "created_at": item.created_at,
         "updated_at": item.updated_at,
         "metadata": metadata,
-        "last_archived": cursor,
-        "last_consolidated": cursor,
+        "last_archived": last_archived,
+        "last_consolidated": last_consolidated,
     }
+    metadata_line.update(copy.deepcopy(item.metadata_extra))
     lines = [_json_bytes(metadata_line).rstrip(b"\n")]
     for group in actor_groups:
         lines.extend(
@@ -806,6 +1046,10 @@ def _quarantine_bytes(item: _FilePlan) -> bytes:
         for entry in item.quarantine
     ]
     return b"\n".join(lines) + (b"\n" if lines else b"")
+
+
+def _sidecar_relative_path(item: _FilePlan, sidecar: Path) -> str:
+    return (Path(item.relative_path).parent / sidecar.name).as_posix()
 
 
 @dataclass
@@ -838,14 +1082,34 @@ class MigrationResult:
         }
 
 
-def apply_migration(plan: MigrationPlan, output_root: Path | str) -> MigrationResult:
-    """Apply a previously analysed plan into an isolated output directory."""
+def apply_migration(
+    plan: MigrationPlan,
+    output_root: Path | str,
+    *,
+    target_namespace: str | None = None,
+) -> MigrationResult:
+    """Apply a plan without overwriting targets; namespace is a workspace ID."""
     output = Path(output_root).expanduser().resolve(strict=False)
     source = plan.source_root.resolve(strict=False)
+    target_path = (
+        output / TARGET_SESSIONS_DIR
+        / target_namespace
+        if target_namespace is not None
+        else output / TARGET_SESSIONS_DIR
+    )
+    source_inside_output = source.is_relative_to(output)
+    source_is_disjoint_target = (
+        target_namespace is not None
+        and source_inside_output
+        and (
+            source == output / TARGET_SESSIONS_DIR
+            or not target_path.is_relative_to(source)
+        )
+    )
     if (
         output == source
         or output.is_relative_to(source)
-        or source.is_relative_to(output)
+        or (source_inside_output and not source_is_disjoint_target)
     ):
         raise ValueError("migration output must be disjoint from SOURCE")
     if output.exists() and (output.is_symlink() or not output.is_dir()):
@@ -856,6 +1120,12 @@ def apply_migration(plan: MigrationPlan, output_root: Path | str) -> MigrationRe
         if directory.exists() and (directory.is_symlink() or not directory.is_dir()):
             raise ValueError(f"migration output contains unsafe directory: {directory}")
         directory.mkdir(exist_ok=True)
+    target_root = output / TARGET_SESSIONS_DIR
+    if target_namespace is not None:
+        if not re.fullmatch(r"[0-9a-f]{32}", target_namespace):
+            raise ValueError("migration target namespace must be a workspace ID")
+        target_root /= target_namespace
+        _ensure_directory(target_root)
 
     result = MigrationResult(status="complete", output_root=output)
     for item in plan.files:
@@ -883,17 +1153,12 @@ def apply_migration(plan: MigrationPlan, output_root: Path | str) -> MigrationRe
                 sidecar_data = sidecar.read_bytes()
             except OSError:
                 continue
-            sidecar_root = (
-                plan.source_root
-                if plan.source_root.is_dir()
-                else plan.source_root.parent
-            )
-            sidecar_relative = sidecar.relative_to(sidecar_root).as_posix()
+            sidecar_relative = _sidecar_relative_path(item, sidecar)
             _make_source_snapshot(sidecar, sidecar_data, output, sidecar_relative)
 
         for actor, actor_groups in _groups_by_actor(item.groups).items():
             key, data = _target_bytes(item, actor_groups, actor)
-            target = _session_target_path(output, key)
+            target = _session_target_path(output, key, target_namespace)
             status = _write_new_or_compare(target, data)
             if status == "created":
                 result.created_targets += 1
@@ -902,6 +1167,19 @@ def apply_migration(plan: MigrationPlan, output_root: Path | str) -> MigrationRe
             else:
                 result.conflicting_targets += 1
                 _write_conflict(target, data, _sha256(data))
+            for sidecar in item.preserve_sidecars:
+                try:
+                    sidecar_data = sidecar.read_bytes()
+                except OSError:
+                    continue
+                sidecar_target = target.with_suffix(".checkpoint.json")
+                sidecar_status = _write_new_or_compare(sidecar_target, sidecar_data)
+                if sidecar_status == "different":
+                    _write_conflict(
+                        sidecar_target,
+                        sidecar_data,
+                        _sha256(sidecar_data),
+                    )
 
         if item.quarantine:
             quarantine_path = output / QUARANTINE_DIR / f"{item.relative_path}.jsonl"
@@ -922,18 +1200,10 @@ def apply_migration(plan: MigrationPlan, output_root: Path | str) -> MigrationRe
                 "snapshot": str(Path(SOURCE_SNAPSHOT_DIR) / item.relative_path),
                 "sidecars": [
                     {
-                        "path": sidecar.relative_to(
-                            plan.source_root
-                            if plan.source_root.is_dir()
-                            else plan.source_root.parent
-                        ).as_posix(),
+                        "path": _sidecar_relative_path(item, sidecar),
                         "snapshot": str(
                             Path(SOURCE_SNAPSHOT_DIR)
-                            / sidecar.relative_to(
-                                plan.source_root
-                                if plan.source_root.is_dir()
-                                else plan.source_root.parent
-                            )
+                            / _sidecar_relative_path(item, sidecar)
                         ),
                         "sha256": _sha256(sidecar.read_bytes()),
                     }
@@ -942,7 +1212,7 @@ def apply_migration(plan: MigrationPlan, output_root: Path | str) -> MigrationRe
             }
             for item in plan.files
         ],
-        "targets": plan.to_dict()["targets"],
+        "targets": plan.to_dict(target_namespace=target_namespace)["targets"],
         "quarantine": plan.to_dict()["quarantine"],
         "issues": plan.to_dict()["issues"],
     }
@@ -961,6 +1231,7 @@ def migrate_sessions(
     output_root: Path | str | None = None,
     *,
     apply: bool = False,
+    target_namespace: str | None = None,
     registry: object = None,
     known_actors: Iterable[str] | None = None,
 ) -> MigrationPlan | MigrationResult:
@@ -974,7 +1245,11 @@ def migrate_sessions(
         return plan
     if output_root is None:
         raise ValueError("output_root is required with apply=True")
-    return apply_migration(plan, output_root)
+    return apply_migration(
+        plan,
+        output_root,
+        target_namespace=target_namespace,
+    )
 
 
 migrate = migrate_sessions

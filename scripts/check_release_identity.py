@@ -13,8 +13,8 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NANOBOT_VERSION = "0.3.0"
-NANOBOT_BASELINE = "3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec"
+NANOBOT_VERSION = "0.3.5"
+NANOBOT_BASELINE = "1bb712d3488915ca4ed9ccc1a93067ff722f5ab9"
 
 
 def _toml(relative: str) -> dict[str, Any]:
@@ -51,6 +51,13 @@ def _memx_requirement_pins() -> dict[str, str]:
     return result
 
 
+def _requirement_name(requirement: str) -> str | None:
+    match = re.match(r"^\s*([A-Za-z0-9_.-]+)", requirement)
+    if not match:
+        return None
+    return match.group(1).lower().replace("_", "-")
+
+
 def check(backend_version: str, release_tag: str) -> list[str]:
     errors: list[str] = []
     expected_tag = f"image-v{backend_version}"
@@ -85,7 +92,16 @@ def check(backend_version: str, release_tag: str) -> list[str]:
     pypdf = pins.get("pypdf")
     _error(errors, pypdf is not None and 5 <= int(pypdf.split(".", 1)[0]) < 6, "pypdf lock violates >=5,<6")
     header = "\n".join((ROOT / "familia/requirements.lock").read_text(encoding="utf-8").splitlines()[:4])
-    _error(errors, "nanobot/pyproject.toml familia/pyproject.toml" in header, "familia lock provenance inputs missing")
+    _error(
+        errors,
+        "nanobot/pyproject.toml" in header and "familia/pyproject.toml" in header,
+        "familia lock provenance inputs missing",
+    )
+    for project_name, project in (("nanobot", nanobot), ("familia", familia)):
+        for requirement in project["project"].get("dependencies", []):
+            name = _requirement_name(requirement)
+            if name:
+                _error(errors, name in pins, f"{project_name} lock misses direct dependency {name}")
 
     poetry = _toml("memx/poetry.lock")
     poetry_pins = {
@@ -109,23 +125,12 @@ def check(backend_version: str, release_tag: str) -> list[str]:
     _error(errors, memx["project"]["version"] == "0.1.0", "memX component version changed unexpectedly")
     _error(errors, memx_sdk["project"]["version"] == "0.1.1", "memX SDK component version changed unexpectedly")
 
-    bridge_package = json.loads((ROOT / "nanobot/bridge/package.json").read_text(encoding="utf-8"))
-    bridge_lock_path = ROOT / "nanobot/bridge/package-lock.json"
-    _error(errors, bridge_lock_path.is_file(), "bridge package-lock.json missing")
-    if bridge_lock_path.is_file():
-        bridge_lock = json.loads(bridge_lock_path.read_text(encoding="utf-8"))
-        root_package = bridge_lock.get("packages", {}).get("", {})
-        _error(errors, bridge_lock.get("lockfileVersion", 0) >= 3, "bridge lockfileVersion is not npm-ci compatible")
-        _error(errors, bridge_lock.get("name") == bridge_package["name"], "bridge lock name diverges")
-        _error(errors, bridge_lock.get("version") == bridge_package["version"], "bridge lock version diverges")
-        _error(errors, root_package.get("dependencies") == bridge_package.get("dependencies"), "bridge runtime deps diverge")
-        _error(errors, root_package.get("devDependencies") == bridge_package.get("devDependencies"), "bridge dev deps diverge")
-
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     memx_compose = (ROOT / "docker-compose.memx.yml").read_text(encoding="utf-8")
     source_pack = (ROOT / "bin/build-source-pack.sh").read_text(encoding="utf-8")
-    _error(errors, "npm ci" in dockerfile and "npm install" not in dockerfile, "Docker bridge build is not npm ci locked")
+    _error(errors, "nanobot/bridge" not in dockerfile, "Dockerfile still references removed nanobot bridge")
+    _error(errors, "nanobot/entrypoint-familia.sh" not in dockerfile, "Dockerfile still references removed Familia entrypoint")
     _error(errors, f"${{FAMILIA_TAG:-{backend_version}}}" in compose, "Compose Familia image tag diverges")
     _error(errors, f"${{MEMX_TAG:-{backend_version}}}" in memx_compose, "Compose memX image tag diverges")
     _error(

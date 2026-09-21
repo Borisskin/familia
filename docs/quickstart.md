@@ -61,7 +61,7 @@ Docker и прочее **заранее ставить не нужно**. Мас
 
 ## Установка через админку
 
-1. Скачайте из [Releases](../../releases/latest) **два** файла:
+1. Скачайте из [Releases](https://github.com/Verconto/familia/releases/latest) **два** файла:
    - `FamiliaAdmin-vX.Y.Z.exe`
    - `WebView2Loader.dll`
 

@@ -1,4 +1,5 @@
 """Discord channel implementation using discord.py."""
+# pyright: reportPrivateUsage=false, reportUnusedFunction=false
 
 from __future__ import annotations
 
@@ -8,12 +9,12 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import Field
 
 from nanobot.bus.events import OutboundMessage
-from nanobot.bus.outbound_events import ProgressEvent
+from nanobot.bus.outbound_events import ContextCompactionEvent, ProgressEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.command.builtin import build_help_text
@@ -43,7 +44,7 @@ class _StreamBuf:
     """Per-chat streaming accumulator for progressive Discord message edits."""
 
     text: str = ""
-    message: Any | None = None
+    message: discord.Message | None = None
     last_edit: float = 0.0
     stream_id: str | None = None
 
@@ -256,6 +257,18 @@ if DISCORD_AVAILABLE:
 
         async def send_outbound(self, msg: OutboundMessage) -> None:
             """Send a nanobot outbound message using Discord transport rules."""
+            compaction = msg.event if isinstance(msg.event, ContextCompactionEvent) else None
+            # A compaction's outcome replaces its own start notice in place, so
+            # the lifecycle stays visible as one message instead of two (#5719).
+            # Without a stored notice (restart, edit refused) it is sent as usual.
+            if compaction is not None and compaction.phase != "started":
+                notice = self._channel._compaction_notices.pop(
+                    (msg.chat_id, compaction.compaction_id),
+                    None,
+                )
+                if notice is not None and await self._edit_compaction_notice(notice, msg.content or ""):
+                    return
+
             channel_id = int(msg.chat_id)
 
             channel = self._channel._known_channels.get(msg.chat_id) or self.get_channel(channel_id)
@@ -266,13 +279,14 @@ if DISCORD_AVAILABLE:
                     self._channel.logger.warning("channel {} unavailable: {}", msg.chat_id, e)
                     raise
 
-            reference, mention_settings = self._build_reply_context(channel, msg.reply_to)
+            messageable_channel = cast(Messageable, channel)
+            reference, mention_settings = self._build_reply_context(messageable_channel, msg.reply_to)
             sent_media = False
             failed_media: list[str] = []
 
             for index, media_path in enumerate(msg.media or []):
                 if await self._send_file(
-                    channel,
+                    messageable_channel,
                     media_path,
                     reference=reference if index == 0 else None,
                     mention_settings=mention_settings,
@@ -288,7 +302,24 @@ if DISCORD_AVAILABLE:
                 if index == 0 and reference is not None and not sent_media:
                     kwargs["reference"] = reference
                     kwargs["allowed_mentions"] = mention_settings
-                await channel.send(**kwargs)
+                sent = await messageable_channel.send(**kwargs)
+                if compaction is not None and compaction.phase == "started" and index == 0:
+                    self._channel._remember_compaction_notice(
+                        msg.chat_id,
+                        compaction.compaction_id,
+                        sent,
+                    )
+
+        async def _edit_compaction_notice(self, notice: discord.Message, content: str) -> bool:
+            """Replace a start notice's text with the outcome; False when Discord refused."""
+            if not content:
+                return False
+            try:
+                await notice.edit(content=content)
+            except Exception as e:
+                self._channel.logger.warning("compaction notice edit failed, sending instead: {}", e)
+                return False
+            return True
 
         async def _send_file(
             self,
@@ -344,7 +375,7 @@ if DISCORD_AVAILABLE:
                 self._channel.logger.warning("Invalid reply target: {}", reply_to)
                 return None, mention_settings
 
-            return channel.get_partial_message(message_id), mention_settings
+            return cast(Any, channel).get_partial_message(message_id), mention_settings
 
 
 class DiscordChannel(BaseChannel):
@@ -392,6 +423,7 @@ class DiscordChannel(BaseChannel):
         self._typing_tasks: dict[str, asyncio.Task[None]] = {}
         self._bot_user_id: str | None = None
         self._pending_reactions: dict[str, Any] = {}  # chat_id -> message object
+        self._compaction_notices: dict[tuple[str, str], discord.Message] = {}
         self._working_emoji_tasks: dict[str, asyncio.Task[None]] = {}
         self._stream_bufs: dict[str, _StreamBuf] = {}
         self._known_channels: dict[str, Any] = {}
@@ -423,8 +455,8 @@ class DiscordChannel(BaseChannel):
                 import aiohttp
 
                 proxy_auth = aiohttp.BasicAuth(
-                    login=self.config.proxy_username,
-                    password=self.config.proxy_password,
+                    login=cast(str, self.config.proxy_username),
+                    password=cast(str, self.config.proxy_password),
                 )
             elif has_user != has_pass:
                 self.logger.warning(
@@ -432,10 +464,13 @@ class DiscordChannel(BaseChannel):
                     "proxy_password must be set; ignoring partial credentials",
                 )
 
+            proxy = self.config.proxy
+            if proxy and "://" not in proxy:
+                proxy = f"http://{proxy}"
             self._client = DiscordBotClient(
                 self,
                 intents=intents,
-                proxy=self.config.proxy,
+                proxy=proxy,
                 proxy_auth=proxy_auth,
             )
         except Exception:
@@ -461,6 +496,15 @@ class DiscordChannel(BaseChannel):
         """Stop the Discord channel."""
         self._running = False
         await self._reset_runtime_state(close_client=True)
+
+    def _remember_compaction_notice(
+        self,
+        chat_id: str,
+        compaction_id: str,
+        message: discord.Message,
+    ) -> None:
+        """Keep a start notice until its matching outcome consumes it."""
+        self._compaction_notices[(chat_id, compaction_id)] = message
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Discord using discord.py."""
@@ -489,6 +533,7 @@ class DiscordChannel(BaseChannel):
         stream_id: str | None = None,
         stream_end: bool = False,
         resuming: bool = False,
+        merge_next: bool = False,
     ) -> None:
         """Progressive Discord delivery: send once, then edit until the stream ends."""
         client = self._client
@@ -496,13 +541,17 @@ class DiscordChannel(BaseChannel):
             self.logger.warning("client not ready; dropping stream delta")
             return
 
+        if stream_end and merge_next:
+            if not delta:
+                return
+            stream_end = False
         if stream_end:
             buf = self._stream_bufs.get(chat_id)
             if not buf or buf.message is None or not buf.text:
                 return
             if stream_id is not None and buf.stream_id is not None and buf.stream_id != stream_id:
                 return
-            await self._finalize_stream(chat_id, buf)
+            await self._finalize_stream(chat_id, buf, buf.message)
             return
 
         buf = self._stream_bufs.get(chat_id)
@@ -630,7 +679,12 @@ class DiscordChannel(BaseChannel):
             self.logger.warning("channel {} unavailable: {}", chat_id, e)
             return None
 
-    async def _finalize_stream(self, chat_id: str, buf: _StreamBuf) -> None:
+    async def _finalize_stream(
+        self,
+        chat_id: str,
+        buf: _StreamBuf,
+        message: discord.Message,
+    ) -> None:
         """Commit the final streamed content and flush overflow chunks."""
         chunks = DiscordBotClient._build_chunks(buf.text, [], False)
         if not chunks:
@@ -638,16 +692,12 @@ class DiscordChannel(BaseChannel):
             return
 
         try:
-            await buf.message.edit(content=chunks[0])
+            await message.edit(content=chunks[0])
         except Exception as e:
             self.logger.warning("final stream edit failed: {}", e)
             raise
 
-        target = getattr(buf.message, "channel", None) or await self._resolve_channel(chat_id)
-        if target is None:
-            self.logger.warning("stream follow-up target {} unavailable", chat_id)
-            self._stream_bufs.pop(chat_id, None)
-            return
+        target = message.channel
 
         for extra_chunk in chunks[1:]:
             await target.send(content=extra_chunk)
@@ -823,6 +873,7 @@ class DiscordChannel(BaseChannel):
     async def _reset_runtime_state(self, close_client: bool) -> None:
         """Reset client and typing state."""
         await self._cancel_all_typing()
+        self._compaction_notices.clear()
         self._stream_bufs.clear()
         self._known_channels.clear()
         if close_client and self._client is not None and not self._client.is_closed():

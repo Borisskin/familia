@@ -15,7 +15,7 @@ import shutil
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 from loguru import logger
@@ -225,7 +225,7 @@ async def _request_json_with_retry(
     url: str,
     *,
     provider_label: str,
-    **kwargs: object,
+    **kwargs: Any,
 ) -> dict[str, Any] | None:
     for attempt in range(_MAX_RETRIES + 1):
         try:
@@ -299,7 +299,7 @@ async def _request_json_with_retry(
                 type(payload).__name__,
             )
             return None
-        return payload
+        return cast(dict[str, Any], payload)
     return None
 
 
@@ -534,6 +534,7 @@ async def _post_stepfun_asr_with_retry(
                             payload = json.loads(payload_str)
                         except (json.JSONDecodeError, ValueError):
                             continue
+                        payload = cast(dict[str, Any], payload)
                         event_type = payload.get("type", "")
                         if event_type == "error":
                             msg = payload.get("message", "unknown error")
@@ -654,7 +655,7 @@ async def _post_with_retry(
                     type(payload).__name__,
                 )
                 return ""
-            return extract_text(payload)
+            return extract_text(cast(dict[str, Any], payload))
     return ""
 
 

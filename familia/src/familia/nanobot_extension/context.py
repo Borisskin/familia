@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.tools.context import current_request_context
+from nanobot.session.summary import SessionSummary
 
 
 class FamiliaContextExtension:
@@ -328,23 +330,20 @@ class FamiliaContextBuilder(ContextBuilder):
 
     def build_system_prompt(
         self,
-        skill_names: list[str] | None = None,
+        *,
         channel: str | None = None,
-        session_summary: str | None = None,
+        session_summary: SessionSummary | None = None,
         workspace: Path | None = None,
-        include_memory_recent_history: bool = True,
-        session_key: str | None = None,
-        unified_session: bool = False,
+        include_memory: bool = True,
     ) -> str:
-        # Familia archives only to memX; target session summaries are derived
-        # from file-backed history and are never a prompt source here.
-        del include_memory_recent_history, session_key, unified_session, session_summary
+        del include_memory
         from nanobot.utils.prompt_templates import render_template
 
         from familia.principals import get_current_actor
 
         root = workspace or self.workspace
-        actor = get_current_actor()
+        request = current_request_context()
+        actor = get_current_actor() or (request.actor if request is not None else None)
         parts = [self._get_identity(channel=channel, workspace=root)]
         shared = self._load_shared_system_files(root)
         if shared:
@@ -354,6 +353,19 @@ class FamiliaContextBuilder(ContextBuilder):
         # and memory source in adapter mode.
         parts.extend(self._extension.build_sections(actor=actor, channel=channel))
         parts.append(render_template("agent/tool_contract.md"))
+
+        private_summary = False
+        if actor and request is not None and request.actor == actor:
+            from familia.session_identity import parse_private_session_key
+
+            parsed = parse_private_session_key(request.session_key or "")
+            private_summary = parsed is not None and parsed[0] == actor
+        if private_summary and session_summary and session_summary["text"] != "(nothing)":
+            parts.append(
+                "[Archived Context Summary]\n\n"
+                f"Previous conversation summary (last active {session_summary['last_active']}):\n"
+                f"{session_summary['text']}"
+            )
 
         # ``self.skills`` is created at loop construction for the central
         # workspace.  Rebuild this read-only loader from the server-bound
@@ -377,7 +389,8 @@ class FamiliaContextBuilder(ContextBuilder):
         """Delegate message assembly while retaining the safe prompt override."""
         from familia.principals import get_current_actor
 
-        actor = get_current_actor()
+        request = current_request_context()
+        actor = get_current_actor() or (request.actor if request is not None else None)
         history = kwargs.get("history")
         if isinstance(history, list):
             filtered: list[dict[str, Any]] = []

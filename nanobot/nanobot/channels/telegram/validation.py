@@ -1,7 +1,7 @@
 """Telegram setup validation owned by the channel package."""
 
 import re
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 
 import httpx
@@ -22,6 +22,8 @@ _SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 
 
 def _proxy_url_is_valid(proxy: str) -> bool:
+    if "://" not in proxy:
+        proxy = f"http://{proxy}"
     try:
         parsed = urlparse(proxy)
         hostname = parsed.hostname
@@ -32,6 +34,8 @@ def _proxy_url_is_valid(proxy: str) -> bool:
 
 
 def _get_me(token: str, proxy: str | None) -> dict[str, Any]:
+    if proxy and "://" not in proxy:
+        proxy = f"http://{proxy}"
     client_kwargs: dict[str, Any] = {"timeout": _TIMEOUT_SECONDS}
     if proxy:
         client_kwargs.update(proxy=proxy, trust_env=False)
@@ -39,7 +43,7 @@ def _get_me(token: str, proxy: str | None) -> dict[str, Any]:
         response = client.get(f"https://api.telegram.org/bot{token}/getMe")
         response.raise_for_status()
         data = response.json()
-    return data if isinstance(data, dict) else {}
+    return cast(dict[str, Any], data) if isinstance(data, dict) else {}
 
 
 def validate(values: dict[str, Any], _context: ChannelValidationContext) -> dict[str, Any]:
@@ -74,7 +78,7 @@ def validate(values: dict[str, Any], _context: ChannelValidationContext) -> dict
                 "proxy_format",
                 "Network proxy",
                 "fail",
-                "Enter a full HTTP or SOCKS proxy URL.",
+                "Enter a valid HTTP or SOCKS proxy.",
             )
         )
         return status_from_checks("telegram", checks, missing)

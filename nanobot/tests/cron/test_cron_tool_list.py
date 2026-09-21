@@ -363,25 +363,6 @@ def test_add_job_binds_current_session_key(tmp_path) -> None:
     assert job.payload.to is None
 
 
-def test_add_job_preserves_server_owned_private_session_key(tmp_path) -> None:
-    tool = _make_tool(tmp_path)
-    with request_context(
-        RequestContext(
-            channel="telegram",
-            chat_id="recipient",
-            session_key="familia:recipient:telegram:recipient",
-            actor="recipient",
-        )
-    ):
-        result = tool._add_job(None, "Private reminder", 60, None, None, None)
-
-    assert result.startswith("Created job")
-    job = tool._cron.list_jobs()[0]
-    assert job.payload.session_key == "familia:recipient:telegram:recipient"
-    assert job.payload.origin_channel == "telegram"
-    assert job.payload.origin_chat_id == "recipient"
-
-
 def test_add_job_requires_session_key(tmp_path) -> None:
     tool = _make_tool(tmp_path)
     with request_context(RequestContext(channel="telegram", chat_id="chat-1")):

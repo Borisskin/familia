@@ -29,11 +29,13 @@ if [[ "${NORMALIZE_HEADERS_ONLY:-}" == "1" ]]; then
 fi
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-UPSTREAM_VERSION="${UPSTREAM_VERSION:-0.3.0}"
-UPSTREAM="${UPSTREAM:-3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec}"
+UPSTREAM_VERSION="${UPSTREAM_VERSION:-0.3.5}"
+UPSTREAM="${UPSTREAM:-1bb712d3488915ca4ed9ccc1a93067ff722f5ab9}"
 UPSTREAM_REPO="${UPSTREAM_REPO:-$(cd "$REPO/.." && pwd)/nanobot}"
+PATCH_DIR="${PATCH_DIR:-$REPO/patches}"
 
 cd "$REPO"
+mkdir -p "$PATCH_DIR"
 
 if ! git -c "safe.directory=$UPSTREAM_REPO" -C "$UPSTREAM_REPO" rev-parse --verify "$UPSTREAM^{commit}" >/dev/null 2>&1; then
     echo "refusing to regenerate: UPSTREAM=$UPSTREAM not found in $UPSTREAM_REPO" >&2
@@ -54,7 +56,12 @@ cp -a nanobot/nanobot "$tmp/current/nanobot/"
 cp nanobot/pyproject.toml "$tmp/current/nanobot/pyproject.toml"
 cp nanobot/README.md "$tmp/current/nanobot/README.md"
 
-/usr/bin/find patches -maxdepth 1 -type f -name '*.patch' -delete
+# Windows bind mounts make every copied file look executable to Linux tools.
+# Preserve tracked modes through git apply; generated patches carry content
+# deltas only so untracked additions get the stable regular-file mode.
+find "$tmp/up/nanobot" "$tmp/current/nanobot" -type f -exec chmod 0644 {} +
+
+/usr/bin/find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' -delete
 
 patch_name_for() {
     local rel="$1"
@@ -93,9 +100,9 @@ emit_patch() {
         echo "# nanobot baseline: $UPSTREAM_VERSION"
         echo "# upstream commit: $UPSTREAM"
         echo
-        git diff --no-index "${diff_args[@]}" 2>/dev/null || true
-    ) | normalize_diff_headers > "patches/$name"
-    echo "  patches/$name"
+    git diff --no-index "${diff_args[@]}" 2>/dev/null || true
+    ) | normalize_diff_headers > "$PATCH_DIR/$name"
+    echo "  $PATCH_DIR/$name"
 }
 
 mapfile -t rels < <(
@@ -127,10 +134,14 @@ if command -v cygpath >/dev/null 2>&1; then
 fi
 
 echo "-> proving exact path/blob/mode reconstruction and ownership closure"
-python patches/check_exact_reconstruction.py \
-    --repo "$python_repo" \
-    --upstream-repo "$python_upstream_repo" \
-    --upstream "$UPSTREAM" \
-    --version "$UPSTREAM_VERSION"
+if [[ "${SKIP_CHECK:-0}" != "1" ]]; then
+    python patches/check_exact_reconstruction.py \
+        --repo "$python_repo" \
+        --upstream-repo "$python_upstream_repo" \
+        --upstream "$UPSTREAM" \
+        --version "$UPSTREAM_VERSION" \
+        --patch-dir "$PATCH_DIR" \
+        --ownership "$PATCH_DIR/ownership.yaml"
+fi
 
 echo "-> done. Review with: git diff -- patches/"

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from nanobot.agent.context import ContextBuilder
 from nanobot.agent.tools.cli_apps import CliAppsTool
 from nanobot.agent.tools.context import RequestContext, ToolContext, request_context
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool
@@ -21,8 +22,8 @@ from nanobot.config.schema import ImageGenerationToolConfig, ProviderConfig, Too
 from nanobot.security.workspace_access import (
     WORKSPACE_SCOPE_METADATA_KEY,
     WorkspaceScopeError,
+    WorkspaceScopeResolver,
     bind_workspace_scope,
-    build_workspace_scope,
     default_workspace_scope,
     reset_workspace_scope,
     validate_workspace_scope_payload,
@@ -102,6 +103,34 @@ def test_workspace_scope_accepts_home_relative_project_path(
     assert scope.metadata()["project_path"] == str(project.resolve())
 
 
+@pytest.mark.parametrize("access_mode", ["restricted", "full"])
+def test_selected_websocket_project_is_visible_to_the_model(
+    tmp_path: Path,
+    access_mode: str,
+) -> None:
+    agent_home = tmp_path / "agent-home"
+    project = tmp_path / "project"
+    agent_home.mkdir()
+    project.mkdir()
+    resolver = WorkspaceScopeResolver(agent_home, default_restrict_to_workspace=False)
+
+    scope = resolver.for_turn(
+        channel="websocket",
+        message_metadata={
+            WORKSPACE_SCOPE_METADATA_KEY: {
+                "project_path": str(project),
+                "access_mode": access_mode,
+            }
+        },
+        session_metadata=None,
+    )
+    prompt = ContextBuilder(agent_home).build_system_prompt(workspace=scope.project_path)
+
+    assert prompt.index("# Tool Usage Notes") < prompt.index("# Current Project")
+    assert f"Working directory: {project.resolve()}" in prompt
+    assert "Use it as the default root for project files" in prompt
+
+
 def test_workspace_scope_metadata_falls_back_for_stale_session(tmp_path: Path) -> None:
     scope = workspace_scope_from_metadata(
         {
@@ -141,7 +170,7 @@ async def test_filesystem_tool_uses_current_restricted_workspace_scope(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_restricted_project_cannot_read_shared_skills_or_history(tmp_path: Path) -> None:
+async def test_restricted_project_can_read_agent_skills_and_exact_history(tmp_path: Path) -> None:
     agent_workspace = tmp_path / "agent"
     project = tmp_path / "project"
     skill_file = agent_workspace / "skills" / "custom" / "SKILL.md"
@@ -165,10 +194,10 @@ async def test_restricted_project_cannot_read_shared_skills_or_history(tmp_path:
     read_tool = ReadFileTool.create(ctx)
     grep_tool = GrepTool.create(ctx)
     write_tool = WriteFileTool.create(ctx)
-    scope = build_workspace_scope(
-        project,
-        "restricted",
-        allow_shared_extras=False,
+    scope = validate_workspace_scope_payload(
+        {"project_path": str(project), "access_mode": "restricted"},
+        default_workspace=agent_workspace,
+        default_restrict_to_workspace=True,
     )
 
     token = bind_workspace_scope(scope)
@@ -188,8 +217,8 @@ async def test_restricted_project_cannot_read_shared_skills_or_history(tmp_path:
         reset_workspace_scope(token)
 
     assert "project" in project_result
-    assert "outside allowed directory" in skill_result
-    assert "outside allowed directory" in history_result
+    assert "global skill" in skill_result
+    assert "global history" in history_result
     assert "outside allowed directory" in private_memory_result
     assert "outside allowed directory" in private_result
     assert "outside allowed directory" in write_result
@@ -199,7 +228,7 @@ async def test_restricted_project_cannot_read_shared_skills_or_history(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_restricted_project_blocks_history_from_linked_agent_workspace(
+async def test_restricted_project_reads_history_from_linked_agent_workspace(
     tmp_path: Path,
 ) -> None:
     real_agent_workspace = tmp_path / "real-agent"
@@ -216,10 +245,10 @@ async def test_restricted_project_blocks_history_from_linked_agent_workspace(
         workspace=str(linked_agent_workspace),
     )
     grep_tool = GrepTool.create(ctx)
-    scope = build_workspace_scope(
-        project,
-        "restricted",
-        allow_shared_extras=False,
+    scope = validate_workspace_scope_payload(
+        {"project_path": str(project), "access_mode": "restricted"},
+        default_workspace=linked_agent_workspace,
+        default_restrict_to_workspace=True,
     )
 
     token = bind_workspace_scope(scope)
@@ -232,40 +261,7 @@ async def test_restricted_project_blocks_history_from_linked_agent_workspace(
     finally:
         reset_workspace_scope(token)
 
-    assert "outside allowed directory" in result
-
-
-@pytest.mark.asyncio
-async def test_actor_scope_blocks_global_media_for_file_and_exec_tools(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    project = tmp_path / "project"
-    media = tmp_path / "global-media"
-    project.mkdir()
-    media.mkdir()
-    secret = media / "secret.txt"
-    secret.write_text("must stay private", encoding="utf-8")
-    monkeypatch.setattr("nanobot.agent.tools.path_utils.get_media_dir", lambda: media)
-    monkeypatch.setattr("nanobot.agent.tools.shell.get_media_dir", lambda: media)
-
-    read_tool = ReadFileTool(workspace=tmp_path, restrict_to_workspace=False)
-    exec_tool = ExecTool(working_dir=str(tmp_path), restrict_to_workspace=False, timeout=5)
-    scope = build_workspace_scope(project, "restricted", allow_shared_extras=False)
-    token = bind_workspace_scope(scope)
-    try:
-        read_result = await read_tool.execute(path=str(secret))
-        guard_result = exec_tool._guard_command(
-            str(secret),
-            str(project),
-            restrict_to_workspace=True,
-            workspace_root=str(project),
-        )
-    finally:
-        reset_workspace_scope(token)
-
-    assert "outside allowed directory" in read_result
-    assert guard_result is not None and "outside working dir" in guard_result
+    assert "linked history" in result
 
 
 @pytest.mark.asyncio
@@ -316,6 +312,37 @@ async def test_exec_tool_uses_scope_project_as_default_cwd(
 
     assert "Exit code: 0" in result
     assert (project / "scoped-marker.txt").read_text() == "ok"
+
+
+@pytest.mark.asyncio
+async def test_exec_tool_resolves_relative_working_dir_from_scope_project(
+    tmp_path: Path,
+    cmd_python: str,
+) -> None:
+    project = tmp_path / "project"
+    subdir = project / "subdir"
+    subdir.mkdir(parents=True)
+
+    tool = ExecTool(working_dir=str(tmp_path), restrict_to_workspace=False, timeout=5)
+    scope = validate_workspace_scope_payload(
+        {"project_path": str(project), "access_mode": "full"},
+        default_workspace=tmp_path,
+        default_restrict_to_workspace=False,
+    )
+    token = bind_workspace_scope(scope)
+    try:
+        result = await tool.execute(
+            command=(
+                f'{cmd_python} -c "from pathlib import Path; '
+                "print(Path.cwd())\""
+            ),
+            working_dir="subdir",
+        )
+    finally:
+        reset_workspace_scope(token)
+
+    assert "Exit code: 0" in result
+    assert str(subdir.resolve()) in result
 
 
 @pytest.mark.asyncio

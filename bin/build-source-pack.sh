@@ -21,8 +21,8 @@
 # compose's COPY directives Just Work):
 #
 #   familia/                  — our package source
-#   nanobot/{nanobot,bridge,pyproject.toml,hatch_build.py,LICENSE,README.md,
-#            entrypoint.sh,entrypoint-familia.sh}
+#   nanobot/{nanobot,pyproject.toml,hatch_build.py,LICENSE,README.md,
+#            entrypoint.sh}
 #                              — target nanobot subtree plus Familia adapter
 #   memx/                     — vendored memX subtree
 #   memx-config/acl.example.json
@@ -103,9 +103,8 @@ ROOT_FILES=(
 # nanobot is a forked subtree — we keep upstream attribution
 # (LICENSE, COMMUNICATION.md, SECURITY.md, CONTRIBUTING.md, README) but
 # drop case/ (31 MB of demo gifs), tests/, webui/, docs/, images/. The
-# Dockerfile only COPYs nanobot/{pyproject.toml,README.md,LICENSE,hatch_build.py,nanobot/,bridge/}
-# and installs entrypoint-familia.sh under the image entrypoint name; both
-# entrypoint files remain available for source inspection and future work.
+# Dockerfile only COPYs nanobot/{pyproject.toml,README.md,LICENSE,hatch_build.py,nanobot/}
+# and installs the upstream entrypoint under the image entrypoint name.
 NANOBOT_INCLUDES=(
     nanobot/pyproject.toml
     nanobot/hatch_build.py
@@ -116,9 +115,7 @@ NANOBOT_INCLUDES=(
     nanobot/CONTRIBUTING.md
     nanobot/THIRD_PARTY_NOTICES.md
     nanobot/entrypoint.sh
-    nanobot/entrypoint-familia.sh
     nanobot/nanobot
-    nanobot/bridge
 )
 # familia: pyproject + README + LICENSE + source. Drops tests/, audit
 # logs, .claude/, workspace/.
@@ -156,6 +153,19 @@ MEMX_CONFIG_FILES=(
     memx-config/acl.example.json
 )
 
+# Normalize modes after every copy. Windows bind mounts report 0777 for most
+# entries, so the staging tree must not inherit source-side permissions.
+STAGED_FILE_MODE=0644
+STAGED_DIR_MODE=0755
+EXECUTABLE_FILES=(
+    nanobot/entrypoint.sh
+    nanobot/nanobot/skills/skill-creator/scripts/init_skill.py
+    nanobot/nanobot/skills/skill-creator/scripts/package_skill.py
+    nanobot/nanobot/skills/tmux/scripts/find-sessions.sh
+    nanobot/nanobot/skills/tmux/scripts/wait-for-text.sh
+    patches/regenerate.sh
+)
+
 # Files to exclude from any directory copy regardless of inclusion
 # rule — runtime / IDE / cache droppings.
 EXCLUDES=(
@@ -177,6 +187,9 @@ EXCLUDES=(
     --exclude='audit.jsonl'
     --exclude='audit.jsonl.*'
     --exclude='workspace'
+    # Private runtime ACL; only memx-config/acl.example.json is shipped.
+    --exclude='acl.json'
+    --exclude='*/acl.json'
     --exclude='*.bak'
     --exclude='*.bak.*'
     --exclude='*.tmp'
@@ -192,7 +205,7 @@ EXCLUDES=(
 echo "→ staging files"
 for f in "${ROOT_FILES[@]}"; do
     if [[ -f "$f" ]]; then
-        install -D "$f" "$STAGE/$f"
+        install -D -m "$STAGED_FILE_MODE" "$f" "$STAGE/$f"
     fi
 done
 
@@ -201,7 +214,7 @@ stage_paths() {
     local entries=("$@")
     for p in "${entries[@]}"; do
         if [[ -f "$p" ]]; then
-            install -D "$p" "$STAGE/$p"
+            install -D -m "$STAGED_FILE_MODE" "$p" "$STAGE/$p"
         elif [[ -d "$p" ]]; then
             mkdir -p "$STAGE/$(dirname "$p")"
             tar -cf - "${EXCLUDES[@]}" "$p" | tar -xf - -C "$STAGE"
@@ -218,7 +231,7 @@ stage_paths "${PATCHES_INCLUDES[@]}"
 
 for f in "${EXTRA_FILES[@]}" "${MEMX_CONFIG_FILES[@]}"; do
     if [[ -f "$f" ]]; then
-        install -D "$f" "$STAGE/$f"
+        install -D -m "$STAGED_FILE_MODE" "$f" "$STAGE/$f"
     fi
 done
 
@@ -226,6 +239,24 @@ done
 # weird can still tell what build it was.
 echo "$VER" > "$STAGE/SOURCE_VERSION"
 echo "$RELEASE_TAG" > "$STAGE/SOURCE_RELEASE_TAG"
+
+# Apply one explicit, source-independent mode policy to the complete staged
+# tree. Only the six files above are intentionally executable in the pack.
+find "$STAGE" -type d -exec chmod "$STAGED_DIR_MODE" {} +
+find "$STAGE" -type f -exec chmod "$STAGED_FILE_MODE" {} +
+for f in "${EXECUTABLE_FILES[@]}"; do
+    if [[ ! -f "$STAGE/$f" ]]; then
+        echo "error: expected executable missing from stage: $f" >&2
+        exit 1
+    fi
+    chmod 0755 "$STAGE/$f"
+done
+
+WORLD_WRITABLE=$(find "$STAGE" \( -type f -o -type d \) -perm /0002 -print -quit)
+if [[ -n "$WORLD_WRITABLE" ]]; then
+    echo "error: world-writable entry in stage: $WORLD_WRITABLE" >&2
+    exit 1
+fi
 
 # memx-config/acl.example.json is the only memx-config file we ship;
 # acl.json is operator-generated and gitignored. Sanity-check that we

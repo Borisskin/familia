@@ -1,5 +1,7 @@
 """Utility functions for nanobot."""
 
+from __future__ import annotations
+
 import base64
 import json
 import os
@@ -12,16 +14,28 @@ from contextlib import suppress
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeVar, cast, overload
 
 import tiktoken
 from loguru import logger
 
+if TYPE_CHECKING:
+    from nanobot.providers.base import LLMUsage
+
 _TOOLS_TOKEN_CACHE_MAX_ENTRIES = 64
 _TOOLS_TOKEN_CACHE: dict[int, tuple[tuple[int, ...], dict[bool, int]]] = {}
+_T = TypeVar("_T")
 
 
-def sanitize_surrogates(text: str) -> str:
+@overload
+def sanitize_surrogates(text: str) -> str: ...
+
+
+@overload
+def sanitize_surrogates(text: _T) -> _T: ...
+
+
+def sanitize_surrogates(text: Any) -> Any:
     """Reconstruct surrogate pairs and replace unpaired surrogates.
 
     Lone UTF-16 surrogate code points (``U+D800``..``U+DFFF``) cannot be
@@ -62,24 +76,29 @@ def sanitize_surrogates_deep(value: Any) -> Any:
     if isinstance(value, list):
         result_list: list[Any] = []
         mutated = False
-        for item in value:
+        for item in cast(list[Any], value):
             new_item = sanitize_surrogates_deep(item)
             if new_item is not item:
                 mutated = True
             result_list.append(new_item)
-        return result_list if mutated else value
+        return result_list if mutated else cast(Any, value)
     if isinstance(value, dict):
         result_dict: dict[Any, Any] = {}
         mutated = False
-        for key, item in value.items():
+        for key, item in cast(dict[Any, Any], value).items():
             new_item = sanitize_surrogates_deep(item)
             if new_item is not item:
                 mutated = True
             result_dict[key] = new_item
-        return result_dict if mutated else value
+        return result_dict if mutated else cast(Any, value)
     if isinstance(value, tuple):
-        result_tuple = tuple(sanitize_surrogates_deep(item) for item in value)
-        return result_tuple if any(a is not b for a, b in zip(result_tuple, value)) else value
+        tuple_value = cast(tuple[Any, ...], value)
+        result_tuple = tuple(sanitize_surrogates_deep(item) for item in tuple_value)
+        return (
+            result_tuple
+            if any(a is not b for a, b in zip(result_tuple, tuple_value))
+            else cast(Any, value)
+        )
     return value
 
 
@@ -172,6 +191,9 @@ def strip_think(text: str) -> str:
     tokens mid-text would silently rewrite any message where a user or the
     assistant discusses the tokens themselves.
     """
+    # Every supported control tag contains '<'; ordinary text only needs trimming.
+    if "<" not in text:
+        return text.strip()
     # Well-formed blocks first.
     text = re.sub(rf"<(?P<tag>{_THINKING_TAG})>[\s\S]*?</(?P=tag)>", "", text)
     text = re.sub(rf"^\s*<{_THINKING_TAG}>[\s\S]*$", "", text)
@@ -205,6 +227,8 @@ def strip_reasoning_tags(text: object) -> str:
     """Remove wrapper tags from text that is already known to be reasoning."""
     if not isinstance(text, str):
         return ""
+    if "<" not in text:
+        return text.strip()
     text = re.sub(rf"^\s*<{_THINKING_TAG}/>\s*", "", text)
     text = re.sub(rf"\s*<{_THINKING_TAG}/>\s*$", "", text)
     text = re.sub(rf"^\s*<{_THINKING_TAG}>\s*", "", text)
@@ -220,6 +244,8 @@ def extract_think(text: str) -> tuple[str | None, str]:
     extracted; unclosed streaming prefixes are stripped from the cleaned
     text but not surfaced — :func:`strip_think` handles that case.
     """
+    if "<" not in text:
+        return None, text.strip()
     parts: list[str] = []
     for m in re.finditer(rf"<(?P<tag>{_THINKING_TAG})>([\s\S]*?)</(?P=tag)>", text):
         parts.append(m.group(2).strip())
@@ -289,7 +315,7 @@ def extract_reasoning(
         parts = [
             strip_reasoning_tags(tb.get("thinking", ""))
             for tb in thinking_blocks
-            if isinstance(tb, dict) and tb.get("type") == "thinking"
+            if tb.get("type") == "thinking"
         ]
         joined = "\n\n".join(p for p in parts if p)
         return (joined or None), strip_think(content) if content else content
@@ -337,18 +363,6 @@ def timestamp() -> str:
     return datetime.now().isoformat()
 
 
-def current_time_str(timezone: str | None = None) -> str:
-    """Return the current time string."""
-    from zoneinfo import ZoneInfo
-
-    tz = ZoneInfo(timezone) if timezone else None
-    now = datetime.now(tz=tz) if tz else datetime.now().astimezone()
-    offset = now.strftime("%z")
-    offset_fmt = f"{offset[:3]}:{offset[3:]}" if len(offset) == 5 else offset
-    tz_name = timezone or (time.strftime("%Z") or "UTC")
-    return f"{now.strftime('%Y-%m-%d %H:%M (%A)')} ({tz_name}, UTC{offset_fmt})"
-
-
 _UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*]')
 _TOOL_RESULT_PREVIEW_CHARS = 1200
 _TOOL_RESULTS_DIR = ".nanobot/tool-results"
@@ -365,6 +379,24 @@ def safe_filename(name: str) -> str:
 def image_placeholder_text(path: str | None, *, empty: str = "[image]") -> str:
     """Build an image placeholder string."""
     return f"[image: {path}]" if path else empty
+
+
+def content_with_media_breadcrumbs(
+    role: str | None,
+    content: Any,
+    media: Any,
+) -> Any:
+    """Append persisted user-media breadcrumbs to plain-text content."""
+    if role != "user" or not isinstance(content, str) or not isinstance(media, list):
+        return content
+    breadcrumbs = "\n".join(
+        image_placeholder_text(path)
+        for path in cast(list[object], media)
+        if isinstance(path, str) and path
+    )
+    if not breadcrumbs:
+        return content
+    return f"{content}\n{breadcrumbs}" if content else breadcrumbs
 
 
 def truncate_text(text: str, max_chars: int) -> str:
@@ -450,9 +482,10 @@ def find_legal_message_start(messages: list[dict[str, Any]]) -> int:
     for i, msg in enumerate(messages):
         role = msg.get("role")
         if role == "assistant":
-            for tc in msg.get("tool_calls") or []:
-                if isinstance(tc, dict) and tc.get("id"):
-                    declared.add(str(tc["id"]))
+            for raw_call in cast(list[object], msg.get("tool_calls") or []):
+                tool_call = cast(dict[str, Any], raw_call) if isinstance(raw_call, dict) else None
+                if tool_call is not None and tool_call.get("id"):
+                    declared.add(str(tool_call["id"]))
         elif role == "tool":
             tid = msg.get("tool_call_id")
             if tid and str(tid) not in declared:
@@ -461,11 +494,12 @@ def find_legal_message_start(messages: list[dict[str, Any]]) -> int:
     return start
 
 
-def stringify_text_blocks(content: list[dict[str, Any]]) -> str | None:
+def stringify_text_blocks(content: list[object]) -> str | None:
     parts: list[str] = []
-    for block in content:
-        if not isinstance(block, dict):
+    for raw_block in content:
+        if not isinstance(raw_block, dict):
             return None
+        block = cast(dict[str, Any], raw_block)
         if block.get("type") != "text":
             return None
         text = block.get("text")
@@ -476,20 +510,24 @@ def stringify_text_blocks(content: list[dict[str, Any]]) -> str | None:
 
 
 def _render_tool_result_reference(
-    filepath: Path,
+    reference_path: str,
     *,
     original_size: int,
     preview: str,
     truncated_preview: bool,
+    max_chars: int | None = None,
 ) -> str:
     result = (
         f"[tool output persisted]\n"
-        f"Full output saved to: {filepath}\n"
+        f"Full output saved to workspace path: {reference_path}\n"
         f"Original size: {original_size} chars\n"
         f"Preview:\n{preview}"
     )
     if truncated_preview:
-        result += "\n...\n(Read the saved file if you need the full output.)"
+        result += "\n...\nPreview is also truncated."
+    result += "\nResult truncated. Read the saved file if you need the complete output."
+    if max_chars and len(result) > max_chars:
+        result = f"[truncated: {reference_path}]"
     return result
 
 
@@ -543,27 +581,15 @@ def maybe_persist_tool_result(
     workspace: Path | None,
     session_key: str | None,
     tool_call_id: str,
-    content: Any,
+    content: str,
     *,
     max_chars: int,
-) -> Any:
-    """Persist oversized tool output and replace it with a stable reference string."""
-    if workspace is None or max_chars <= 0:
-        return content
+) -> str:
+    """Offload oversized text.
 
-    text_payload: str | None = None
-    suffix = "txt"
-    if isinstance(content, str):
-        text_payload = content
-    elif isinstance(content, list):
-        text_payload = stringify_text_blocks(content)
-        if text_payload is None:
-            return content
-        suffix = "json"
-    else:
-        return content
-
-    if len(text_payload) <= max_chars:
+    Complete references may exceed the per-block ``max_chars`` budget.
+    """
+    if workspace is None or max_chars <= 0 or len(content) <= max_chars:
         return content
 
     root = ensure_dir(workspace / _TOOL_RESULTS_DIR)
@@ -572,19 +598,17 @@ def maybe_persist_tool_result(
         _cleanup_tool_result_buckets(root, bucket)
     except Exception:
         logger.exception("Failed to clean stale tool result buckets in {}", root)
-    path = bucket / f"{safe_filename(tool_call_id)}.{suffix}"
+    path = bucket / f"{safe_filename(tool_call_id)}.txt"
     if not path.exists():
-        if suffix == "json" and isinstance(content, list):
-            _write_text_atomic(path, json.dumps(content, ensure_ascii=False, indent=2))
-        else:
-            _write_text_atomic(path, text_payload)
+        _write_text_atomic(path, content)
 
-    preview = text_payload[:_TOOL_RESULT_PREVIEW_CHARS]
+    preview = content[:_TOOL_RESULT_PREVIEW_CHARS]
     return _render_tool_result_reference(
-        path,
-        original_size=len(text_payload),
+        str(path.resolve()),
+        original_size=len(content),
         preview=preview,
-        truncated_preview=len(text_payload) > _TOOL_RESULT_PREVIEW_CHARS,
+        truncated_preview=len(content) > _TOOL_RESULT_PREVIEW_CHARS,
+        max_chars=max_chars,
     )
 
 
@@ -606,28 +630,76 @@ def split_message(content: str, max_len: int = 2000) -> list[str]:
         return [content]
     if len(content) <= max_len:
         return [content]
+    original_content = content
     chunks: list[str] = []
     while content:
         if len(content) <= max_len:
-            chunks.append(content)
+            if content.strip():
+                chunks.append(content)
             break
         cut = content[:max_len]
-        # Try to break at newline first, then space, then hard break
-        pos = cut.rfind("\n")
-        if pos <= 0:
-            pos = cut.rfind(" ")
-        if pos <= 0:
-            pos = max_len
-        chunks.append(content[:pos])
-        content = content[pos:].lstrip()
-    return chunks
+        # Consume only the newline itself so indentation starts the next chunk.
+        newline_pos = cut.rfind("\n")
+        if newline_pos >= 0:
+            # Exclude both bytes of a CRLF boundary from the emitted chunk.
+            line_end = newline_pos
+            if line_end > 0 and content[line_end - 1] == "\r":
+                line_end -= 1
+            chunk = content[:line_end]
+            if chunk.strip():
+                chunks.append(chunk)
+            content = content[newline_pos + 1 :]
+            continue
+
+        # Keep the existing word-boundary behavior, but avoid emitting a
+        # whitespace-only chunk when an indented line exceeds max_len.
+        space_pos = cut.rfind(" ")
+        if space_pos > 0 and cut[:space_pos].strip():
+            chunks.append(content[:space_pos])
+            content = content[space_pos:].lstrip(" \t")
+            # A space boundary may sit immediately before a line break. Drop
+            # that delimiter too, without stripping the next line's indent.
+            if content.startswith("\r\n"):
+                content = content[2:]
+            elif content.startswith("\n"):
+                content = content[1:]
+            continue
+
+        # Do not split between the two code points of a CRLF delimiter.
+        if cut.endswith("\r") and content[max_len : max_len + 1] == "\n":
+            chunk = cut[:-1]
+            if chunk.strip():
+                chunks.append(chunk)
+            content = content[max_len + 1 :]
+            continue
+
+        chunk = content[:max_len]
+        if chunk.strip():
+            chunks.append(chunk)
+        content = content[max_len:]
+        if not chunk.strip():
+            # Keep any remaining indentation so the final non-blank chunk can
+            # retain as much of it as the channel limit permits.
+            continue
+        # A delimiter can sit immediately after the hard-break boundary. Keep
+        # ordinary space trimming, but consume only the newline so indentation
+        # on the following line is preserved.
+        content = content.lstrip(" \t")
+        if content.startswith("\r\n"):
+            content = content[2:]
+        elif content.startswith("\n"):
+            content = content[1:]
+    # Preserve the historical non-empty-input contract for callers that take
+    # the first chunk directly. This fallback is only reachable for content
+    # made entirely of whitespace.
+    return chunks or [original_content[:max_len]]
 
 
 def build_assistant_message(
     content: str | None,
     tool_calls: list[dict[str, Any]] | None = None,
     reasoning_content: str | None = None,
-    thinking_blocks: list[dict] | None = None,
+    thinking_blocks: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a provider-safe assistant message with optional reasoning fields."""
     msg: dict[str, Any] = {"role": "assistant", "content": content or ""}
@@ -659,11 +731,12 @@ def _estimate_prompt_tokens_with_source(
         if isinstance(content, str):
             parts.append(content)
         elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    txt = part.get("text", "")
-                    if txt:
-                        parts.append(txt)
+            for raw_part in cast(list[object], content):
+                part = cast(dict[str, Any], raw_part) if isinstance(raw_part, dict) else None
+                if part is not None and part.get("type") == "text":
+                    text = part.get("text", "")
+                    if isinstance(text, str) and text:
+                        parts.append(text)
 
         tc = msg.get("tool_calls")
         if tc:
@@ -714,13 +787,14 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
     if isinstance(content, str):
         parts.append(content)
     elif isinstance(content, list):
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
+        for raw_part in cast(list[object], content):
+            part = cast(dict[str, Any], raw_part) if isinstance(raw_part, dict) else None
+            if part is not None and part.get("type") == "text":
                 text = part.get("text", "")
-                if text:
+                if isinstance(text, str) and text:
                     parts.append(text)
             else:
-                parts.append(json.dumps(part, ensure_ascii=False))
+                parts.append(json.dumps(raw_part, ensure_ascii=False))
     elif content is not None:
         parts.append(json.dumps(content, ensure_ascii=False))
 
@@ -746,7 +820,7 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
 
 
 def estimate_prompt_tokens_chain(
-    provider: Any,
+    provider: object,
     model: str | None,
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
@@ -755,7 +829,7 @@ def estimate_prompt_tokens_chain(
     provider_counter = getattr(provider, "estimate_prompt_tokens", None)
     if callable(provider_counter):
         with suppress(Exception):
-            tokens, source = provider_counter(messages, tools, model)
+            tokens, source = cast(tuple[object, object], provider_counter(messages, tools, model))
             if isinstance(tokens, (int, float)) and tokens > 0:
                 return int(tokens), str(source or "provider_counter")
     estimated, source = _estimate_prompt_tokens_with_source(messages, tools)
@@ -769,7 +843,7 @@ def build_status_content(
     version: str,
     model: str,
     start_time: float,
-    last_usage: dict[str, int],
+    last_usage: LLMUsage | None,
     context_window_tokens: int,
     session_msg_count: int,
     context_tokens_estimate: int,
@@ -790,9 +864,9 @@ def build_status_content(
         if uptime_s >= 3600
         else f"{uptime_s // 60}m {uptime_s % 60}s"
     )
-    last_in = last_usage.get("prompt_tokens", 0)
-    last_out = last_usage.get("completion_tokens", 0)
-    cached = last_usage.get("cached_tokens", 0)
+    last_in = last_usage.input_tokens if last_usage else 0
+    last_out = last_usage.output_tokens if last_usage else 0
+    cached = last_usage.cache_read_tokens if last_usage else None
     ctx_total = max(context_window_tokens, 0)
     # Budget mirrors Consolidator formula: ctx_window - max_completion - _SAFETY_BUFFER
     ctx_budget = max(ctx_total - int(max_completion_tokens) - 1024, 1)
@@ -833,7 +907,7 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
 
     added: list[str] = []
 
-    def _write(src, dest: Path):
+    def _write(src: Any, dest: Path) -> None:
         content = src.read_text(encoding="utf-8") if src else ""
         if dest.exists():
             return

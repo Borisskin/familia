@@ -1,12 +1,12 @@
-# nanobot baseline: 0.3.0
-# upstream commit: 3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
-diff --git ab/nanobot/nanobot/agent/outbound.py bb/nanobot/nanobot/agent/outbound.py
+diff --git a/nanobot/nanobot/agent/outbound.py b/nanobot/nanobot/agent/outbound.py
 new file mode 100644
-index 0000000..576746f
---- /dev/null
-+++ bb/nanobot/nanobot/agent/outbound.py
-@@ -0,0 +1,71 @@
+index 0000000..c493c67
+--- a/nanobot/nanobot/agent/outbound.py
++++ b/nanobot/nanobot/agent/outbound.py
+@@ -0,0 +1,62 @@
 +"""Neutral outbound policy request and decision types."""
 +
 +from __future__ import annotations
@@ -15,10 +15,11 @@ index 0000000..576746f
 +from dataclasses import dataclass, replace
 +from typing import TYPE_CHECKING, Literal
 +
-+from nanobot.agent.tools.context import RUNTIME_REQUEST_CONTEXT_KEY
-+
 +if TYPE_CHECKING:
 +    from nanobot.bus.events import OutboundMessage
++
++
++RUNTIME_REQUEST_CONTEXT_KEY = "_runtime_request_context"
 +
 +
 +@dataclass(frozen=True)
@@ -44,15 +45,15 @@ index 0000000..576746f
 +    outbound: OutboundMessage | None = None
 +
 +    @classmethod
-+    def allow(cls, outbound: OutboundMessage | None = None) -> OutboundDecision:
++    def allow(cls, outbound: OutboundMessage | None = None) -> "OutboundDecision":
 +        return cls(kind="allow", outbound=outbound)
 +
 +    @classmethod
-+    def deny(cls, reason: str) -> OutboundDecision:
++    def deny(cls, reason: str) -> "OutboundDecision":
 +        return cls(kind="deny", reason=reason)
 +
 +    @classmethod
-+    def asked(cls, reason: str, approvers_label: str) -> OutboundDecision:
++    def asked(cls, reason: str, approvers_label: str) -> "OutboundDecision":
 +        return cls(kind="asked", reason=reason, approvers_label=approvers_label)
 +
 +
@@ -68,14 +69,3 @@ index 0000000..576746f
 +def replace_outbound(request: OutboundRequest, outbound: OutboundMessage) -> OutboundRequest:
 +    """Return the same authorization request with a guarded message."""
 +    return replace(request, outbound=outbound)
-+
-+
-+__all__ = [
-+    "OutboundDecision",
-+    "OutboundGuard",
-+    "OutboundRequest",
-+    "RUNTIME_REQUEST_CONTEXT_KEY",
-+    "allow_outbound",
-+    "replace_outbound",
-+]
-

@@ -15,11 +15,10 @@ can actually route approval prompts.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -35,13 +34,13 @@ from familia.principals import (
 )
 from familia.tools.ask import AskPrincipalTool
 from familia.tools.buttons import SendButtonsTool
+from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.context import RequestContext, request_context
-from nanobot.agent.tools.context import RUNTIME_REQUEST_CONTEXT_KEY
 from nanobot.agent.turn_delivery import TurnDeliveryFactory
 from nanobot.agent.tools.message import MessageTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.bus.runtime_events import RuntimeEventBus
+from nanobot.runtime_adapters import RuntimeAdapters
 
 
 OWNER = "owner"
@@ -68,25 +67,25 @@ def policy(tmp_path: Path):
         """
 rules:
   - name: "owner: message/ask anywhere"
-    action: [message.send, ask.send]
+    action: [message.send, ask.send, turn.response]
     actor: owner
     decision: allow
 
   - name: "member_a -> owner allow"
-    action: [message.send, ask.send]
+    action: [message.send, ask.send, turn.response]
     actor: member_a
     to_chat: "1000001"
     decision: allow
 
   - name: "member_a -> stranger: deny"
-    action: [message.send, ask.send]
+    action: [message.send, ask.send, turn.response]
     actor: member_a
     to_chat: "9999999"
     decision: deny
     reason: "Member_a нельзя писать чужим"
 
   - name: "member_a: ask-for-approval catch-all"
-    action: [message.send, ask.send]
+    action: [message.send, ask.send, turn.response]
     actor: member_a
     decision: ask
     approver: owner
@@ -301,26 +300,39 @@ class TestGateOutboundSend:
 # ---------- send path: direct reply (agent loop) ----------
 
 
-async def _invoke_turn_delivery(inbound, outbound) -> list[OutboundMessage]:
-    """Publish one real turn response through MessageBus and its guard."""
-    bus = MessageBus(outbound_guard=familia_bootstrap.make_outbound_guard())
-    request_ctx = RequestContext(
+def _make_guarded_loop(bus: MessageBus, workspace: Path) -> AgentLoop:
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    return AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=workspace,
+        model="test-model",
+        turn_delivery_factory=TurnDeliveryFactory(bus),
+        runtime_adapters=RuntimeAdapters(
+            outbound_guard=familia_bootstrap.make_outbound_guard(),
+        ),
+    )
+
+
+async def _invoke_turn_delivery(
+    inbound: InboundMessage,
+    outbound: OutboundMessage,
+    workspace: Path,
+) -> list[OutboundMessage]:
+    """Publish one real turn response through AgentLoop's outbound guard."""
+    bus = MessageBus()
+    loop = _make_guarded_loop(bus, workspace)
+    delivery = loop.turn_delivery_factory.create(inbound, inbound.session_key)
+    with request_context(RequestContext(
         channel=inbound.channel,
         chat_id=inbound.chat_id,
         session_key=inbound.session_key,
         original_user_text=inbound.content,
-        metadata={"actor": inbound.actor},
         sender_id=inbound.sender_id,
         actor=inbound.actor,
-    )
-    outbound = replace(
-        outbound,
-        metadata={RUNTIME_REQUEST_CONTEXT_KEY: request_ctx},
-    )
-    delivery = TurnDeliveryFactory(bus, RuntimeEventBus()).create(
-        inbound, inbound.session_key,
-    )
-    await delivery.complete(outbound, publish_completion=False)
+    )):
+        await delivery.complete(outbound, publish_completion=False)
     published: list[OutboundMessage] = []
     while bus.outbound_size:
         published.append(await bus.consume_outbound())
@@ -346,33 +358,33 @@ def _inbound_from_member_a(chat_id: str = MEMBER_A_CHAT) -> InboundMessage:
 
 class TestDirectReplyPath:
     @pytest.mark.asyncio
-    async def test_self_reply_published(self, policy, registry, sink):
+    async def test_self_reply_published(self, policy, registry, sink, tmp_path):
         inbound = _inbound_from_member_a()
         outbound = OutboundMessage(channel="vk", chat_id=MEMBER_A_CHAT, content="hi back")
-        published = await _invoke_turn_delivery(inbound, outbound)
+        published = await _invoke_turn_delivery(inbound, outbound, tmp_path)
         assert [m.content for m in published] == ["hi back"]
 
     @pytest.mark.asyncio
-    async def test_cross_chat_allowed_published(self, policy, registry, sink):
+    async def test_cross_chat_allowed_published(self, policy, registry, sink, tmp_path):
         inbound = _inbound_from_member_a()
         outbound = OutboundMessage(channel="vk", chat_id=OWNER_CHAT, content="to owner")
-        published = await _invoke_turn_delivery(inbound, outbound)
+        published = await _invoke_turn_delivery(inbound, outbound, tmp_path)
         assert [m.content for m in published] == ["to owner"]
 
     @pytest.mark.asyncio
-    async def test_cross_chat_denied_dropped(self, policy, registry, sink):
+    async def test_cross_chat_denied_dropped(self, policy, registry, sink, tmp_path):
         inbound = _inbound_from_member_a()
         outbound = OutboundMessage(channel="vk", chat_id=STRANGER_CHAT, content="leak")
-        published = await _invoke_turn_delivery(inbound, outbound)
+        published = await _invoke_turn_delivery(inbound, outbound, tmp_path)
         assert published == []
 
     @pytest.mark.asyncio
     async def test_ask_sends_approval_prompt_and_parks_response(
-        self, policy, registry, sink,
+        self, policy, registry, sink, tmp_path,
     ):
         inbound = _inbound_from_member_a()
         outbound = OutboundMessage(channel="vk", chat_id="7777777", content="q")
-        published = await _invoke_turn_delivery(inbound, outbound)
+        published = await _invoke_turn_delivery(inbound, outbound, tmp_path)
         # The public turn path publishes the approval prompt; the original is parked.
         targets = [(m.chat_id, bool(m.metadata.get("approval_prompt"))) for m in published]
         assert (OWNER_CHAT, True) in targets
@@ -384,9 +396,22 @@ class TestDirectReplyPath:
 
 
 class TestMessageTool:
-    def _tool(self, bus: MessageBus, chat_id: str = MEMBER_A_CHAT) -> MessageTool:
+    def _tool(
+        self,
+        loop: AgentLoop,
+        inbound: InboundMessage,
+        chat_id: str = MEMBER_A_CHAT,
+    ) -> MessageTool:
+        async def publish(outbound: OutboundMessage) -> None:
+            await loop._publish_outbound(
+                outbound,
+                inbound=inbound,
+                actor=inbound.actor,
+                action="message.send",
+            )
+
         t = MessageTool(
-            send_callback=bus.publish_outbound,
+            send_callback=publish,
             default_channel="vk",
             default_chat_id=chat_id,
         )
@@ -401,9 +426,11 @@ class TestMessageTool:
         )
 
     @pytest.mark.asyncio
-    async def test_self_reply_published(self, policy, registry, sink):
-        bus = MessageBus(outbound_guard=familia_bootstrap.make_outbound_guard())
-        t = self._tool(bus, MEMBER_A_CHAT)
+    async def test_self_reply_published(self, policy, registry, sink, tmp_path):
+        inbound = _inbound_from_member_a()
+        bus = MessageBus()
+        loop = _make_guarded_loop(bus, tmp_path)
+        t = self._tool(loop, inbound, MEMBER_A_CHAT)
         with request_context(self._context(MEMBER_A_CHAT)):
             result = await t.execute(content="same chat")
         published = await _drain_bus(bus)
@@ -411,9 +438,11 @@ class TestMessageTool:
         assert [m.content for m in published] == ["same chat"]
 
     @pytest.mark.asyncio
-    async def test_cross_chat_allowed_published(self, policy, registry, sink):
-        bus = MessageBus(outbound_guard=familia_bootstrap.make_outbound_guard())
-        t = self._tool(bus, MEMBER_A_CHAT)
+    async def test_cross_chat_allowed_published(self, policy, registry, sink, tmp_path):
+        inbound = _inbound_from_member_a()
+        bus = MessageBus()
+        loop = _make_guarded_loop(bus, tmp_path)
+        t = self._tool(loop, inbound, MEMBER_A_CHAT)
         with request_context(self._context(MEMBER_A_CHAT)):
             result = await t.execute(content="hi owner", chat_id=OWNER_CHAT)
         published = await _drain_bus(bus)
@@ -421,20 +450,24 @@ class TestMessageTool:
         assert [m.chat_id for m in published] == [OWNER_CHAT]
 
     @pytest.mark.asyncio
-    async def test_cross_chat_denied(self, policy, registry, sink):
-        bus = MessageBus(outbound_guard=familia_bootstrap.make_outbound_guard())
-        t = self._tool(bus, MEMBER_A_CHAT)
+    async def test_cross_chat_denied(self, policy, registry, sink, tmp_path):
+        inbound = _inbound_from_member_a()
+        bus = MessageBus()
+        loop = _make_guarded_loop(bus, tmp_path)
+        t = self._tool(loop, inbound, MEMBER_A_CHAT)
         with request_context(self._context(MEMBER_A_CHAT)):
             result = await t.execute(content="nope", chat_id=STRANGER_CHAT)
         published = await _drain_bus(bus)
-        # The bus guard drops a denied message before the tool callback returns;
+        # AgentLoop's guard drops a denied message before the tool callback returns;
         # MessageTool's generic result text is not a policy verdict.
         assert published == []
 
     @pytest.mark.asyncio
-    async def test_ask_parks(self, policy, registry, sink):
-        bus = MessageBus(outbound_guard=familia_bootstrap.make_outbound_guard())
-        t = self._tool(bus, MEMBER_A_CHAT)
+    async def test_ask_parks(self, policy, registry, sink, tmp_path):
+        inbound = _inbound_from_member_a()
+        bus = MessageBus()
+        loop = _make_guarded_loop(bus, tmp_path)
+        t = self._tool(loop, inbound, MEMBER_A_CHAT)
         with request_context(self._context(MEMBER_A_CHAT)):
             result = await t.execute(content="pls", chat_id="7777777")
         published = await _drain_bus(bus)

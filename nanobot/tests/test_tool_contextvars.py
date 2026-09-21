@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -11,6 +12,7 @@ from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.cron.service import CronService
 from nanobot.providers.base import GenerationSettings, LLMProvider
+from nanobot.runtime_context import RUNTIME_CONTEXT_INPUT_META, RuntimeContextBlock
 from nanobot.session.keys import UNIFIED_SESSION_KEY
 from nanobot.utils.llm_runtime import LLMRuntime
 
@@ -56,7 +58,6 @@ async def test_message_tool_keeps_task_local_context() -> None:
 @pytest.mark.asyncio
 async def test_spawn_tool_keeps_task_local_context() -> None:
     seen: list[tuple[str, str, str]] = []
-    seen_contexts: list[RequestContext | None] = []
     entered = asyncio.Event()
     release = asyncio.Event()
 
@@ -78,10 +79,8 @@ async def test_spawn_tool_keeps_task_local_context() -> None:
             origin_message_id: str | None = None,
             temperature: float | None = None,
             workspace_scope=None,
-            origin_context: RequestContext | None = None,
         ) -> str:
             seen.append((origin_channel, origin_chat_id, session_key))
-            seen_contexts.append(origin_context)
             return f"{origin_channel}:{origin_chat_id}:{task}"
 
     tool = SpawnTool(_Manager())
@@ -112,11 +111,6 @@ async def test_spawn_tool_keeps_task_local_context() -> None:
     assert result_two == "telegram:chat-b:two"
     assert ("whatsapp", "chat-a", "whatsapp:chat-a") in seen
     assert ("telegram", "chat-b", "telegram:chat-b") in seen
-    assert {
-        (context.channel, context.chat_id)
-        for context in seen_contexts
-        if context is not None
-    } == {("whatsapp", "chat-a"), ("telegram", "chat-b")}
 
 
 @pytest.mark.asyncio
@@ -197,7 +191,6 @@ async def test_message_tool_default_values_without_request_context() -> None:
 async def test_spawn_tool_basic_request_context_and_execute() -> None:
     """A bound request context should provide the correct origin."""
     seen: list[tuple[str, str, str]] = []
-    seen_contexts: list[RequestContext | None] = []
 
     class _Manager:
         max_concurrent_subagents = 1
@@ -217,10 +210,8 @@ async def test_spawn_tool_basic_request_context_and_execute() -> None:
             origin_message_id=None,
             temperature=None,
             workspace_scope=None,
-            origin_context=None,
         ):
             seen.append((origin_channel, origin_chat_id, session_key))
-            seen_contexts.append(origin_context)
             return f"ok: {task}"
 
     tool = SpawnTool(_Manager())
@@ -232,9 +223,6 @@ async def test_spawn_tool_basic_request_context_and_execute() -> None:
         result = await tool.execute(task="do something")
     assert result == "ok: do something"
     assert seen == [("feishu", "chat-abc", "feishu:chat-abc")]
-    assert len(seen_contexts) == 1
-    assert seen_contexts[0] is not None
-    assert (seen_contexts[0].channel, seen_contexts[0].chat_id) == ("feishu", "chat-abc")
 
 
 @pytest.mark.asyncio
@@ -311,6 +299,41 @@ async def test_webui_cron_tool_uses_origin_session_when_unified_enabled(tmp_path
     assert jobs[0].payload.origin_channel == "websocket"
     assert jobs[0].payload.origin_chat_id == "chat-123"
     assert jobs[0].payload.origin_metadata == {"webui": True}
+
+
+@pytest.mark.asyncio
+async def test_cron_tool_snapshots_only_persistable_request_metadata(tmp_path) -> None:
+    """Live runtime context must not poison a persisted WebUI cron job."""
+    store_path = tmp_path / "jobs.json"
+    service = CronService(store_path)
+    tool = CronTool(service)
+    await service.start()
+    try:
+        with request_context(
+            RequestContext(
+                channel="websocket",
+                chat_id="chat-123",
+                metadata={
+                    "webui": True,
+                    RUNTIME_CONTEXT_INPUT_META: [
+                        RuntimeContextBlock(source="webui_quote", content="quoted reply")
+                    ],
+                    "opaque": object(),
+                },
+                session_key=UNIFIED_SESSION_KEY,
+            )
+        ):
+            result = await tool.execute(action="add", message="standup", every_seconds=300)
+
+        assert result.startswith("Created job")
+        jobs = service.list_jobs()
+        assert len(jobs) == 1
+        assert jobs[0].payload.origin_metadata == {"webui": True}
+
+        raw = json.loads(store_path.read_text(encoding="utf-8"))
+        assert raw["jobs"][0]["payload"]["originMetadata"] == {"webui": True}
+    finally:
+        service.stop()
 
 
 @pytest.mark.asyncio

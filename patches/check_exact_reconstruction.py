@@ -14,7 +14,6 @@ import hashlib
 import json
 import os
 import re
-import stat
 import subprocess
 import sys
 import tempfile
@@ -23,16 +22,15 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Sequence
 
 
-DEFAULT_UPSTREAM = "3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec"
-DEFAULT_VERSION = "0.3.0"
+DEFAULT_UPSTREAM = "1bb712d3488915ca4ed9ccc1a93067ff722f5ab9"
+DEFAULT_VERSION = "0.3.5"
 VALID_CATEGORIES = {
     "familia-invariant",
     "upstream-alignment",
     "generated-noise",
     "unknown",
 }
-TARGET_PREFIX = "nanobot/nanobot/"
-TARGET_ROOT_FILES = {"nanobot/pyproject.toml", "nanobot/README.md"}
+TARGET_PREFIX = "nanobot/"
 PATCH_HEADER_RE = re.compile(r"^@@(?: |$)", re.MULTILINE)
 
 
@@ -107,17 +105,11 @@ def _git(
 
 
 def _target_path(source_path: str) -> str:
-    if source_path.startswith("nanobot/"):
-        return f"nanobot/nanobot/{source_path.removeprefix('nanobot/')}"
-    if source_path == "pyproject.toml":
-        return "nanobot/pyproject.toml"
-    if source_path == "README.md":
-        return "nanobot/README.md"
-    raise ReconstructionError(f"path is outside declared upstream scope: {source_path}")
+    return f"{TARGET_PREFIX}{source_path}"
 
 
 def _is_target_path(path: str) -> bool:
-    return path.startswith(TARGET_PREFIX) or path in TARGET_ROOT_FILES
+    return path.startswith(TARGET_PREFIX)
 
 
 def _parse_stage_records(raw: bytes) -> dict[str, str]:
@@ -134,7 +126,9 @@ def _parse_stage_records(raw: bytes) -> dict[str, str]:
     return result
 
 
-def _baseline_tree(upstream_repo: Path, upstream: str) -> tuple[dict[str, TreeEntry], str]:
+def _baseline_tree(
+    upstream_repo: Path, upstream: str, excluded_upstream_paths: set[str]
+) -> tuple[dict[str, TreeEntry], str]:
     resolved = _git(upstream_repo, "rev-parse", "--verify", f"{upstream}^{{commit}}").stdout
     resolved_commit = resolved.decode("ascii").strip()
     object_format = (
@@ -147,11 +141,8 @@ def _baseline_tree(upstream_repo: Path, upstream: str) -> tuple[dict[str, TreeEn
         "ls-tree",
         "-rz",
         "--full-tree",
+        "-r",
         resolved_commit,
-        "--",
-        "nanobot",
-        "pyproject.toml",
-        "README.md",
     ).stdout
     tree: dict[str, TreeEntry] = {}
     for record in raw.split(b"\0"):
@@ -162,6 +153,8 @@ def _baseline_tree(upstream_repo: Path, upstream: str) -> tuple[dict[str, TreeEn
         if object_type != b"blob":
             continue
         source_path = raw_path.decode("utf-8", errors="surrogateescape")
+        if source_path in excluded_upstream_paths:
+            continue
         path = _target_path(source_path)
         data = _git(upstream_repo, "cat-file", "blob", oid.decode("ascii")).stdout
         tree[path] = TreeEntry(mode=mode.decode("ascii"), data=data)
@@ -170,8 +163,8 @@ def _baseline_tree(upstream_repo: Path, upstream: str) -> tuple[dict[str, TreeEn
     return tree, object_format
 
 
-def _current_tree(repo: Path) -> dict[str, TreeEntry]:
-    scopes = ["nanobot/nanobot", "nanobot/pyproject.toml", "nanobot/README.md"]
+def _current_tree(repo: Path, excluded_upstream_paths: set[str]) -> dict[str, TreeEntry]:
+    scopes = ["nanobot"]
     raw_paths = _git(
         repo,
         "ls-files",
@@ -192,14 +185,18 @@ def _current_tree(repo: Path) -> dict[str, TreeEntry]:
         path = raw_path.decode("utf-8", errors="surrogateescape").replace("\\", "/")
         if not _is_target_path(path):
             raise ReconstructionError(f"git returned an out-of-scope target path: {path}")
+        if path.removeprefix(TARGET_PREFIX) in excluded_upstream_paths:
+            raise ReconstructionError(f"excluded upstream path is present in the target: {path}")
         absolute = repo / PurePosixPath(path)
         if absolute.is_symlink():
             data = os.readlink(absolute).encode("utf-8", errors="surrogateescape")
             inferred_mode = "120000"
         elif absolute.is_file():
             data = absolute.read_bytes()
-            executable = bool(absolute.stat().st_mode & stat.S_IXUSR)
-            inferred_mode = "100755" if executable else "100644"
+            # Windows bind mounts commonly report every file as executable.
+            # Untracked files have no index mode to consult, so use the stable
+            # regular-file mode; executable tracked files are covered above.
+            inferred_mode = "100644"
         else:
             # A tracked worktree deletion is intentionally absent from the target set.
             continue
@@ -210,14 +207,11 @@ def _current_tree(repo: Path) -> dict[str, TreeEntry]:
 
 
 def patch_name_for(path: str) -> str:
-    if path == "nanobot/pyproject.toml":
-        return "pyproject.patch"
-    if path == "nanobot/README.md":
-        return "README.patch"
     if not path.startswith(TARGET_PREFIX):
         raise ReconstructionError(f"cannot name patch for out-of-scope path: {path}")
     relative = path.removeprefix("nanobot/")
-    relative = relative.removeprefix("nanobot/")
+    if relative.startswith("nanobot/"):
+        relative = relative.removeprefix("nanobot/")
     stem = relative.rsplit(".", 1)[0] if "." in PurePosixPath(relative).name else relative
     return f"{stem.replace('/', '_')}.patch"
 
@@ -245,9 +239,35 @@ def _load_ownership(path: Path, upstream: str) -> dict[str, Any]:
         raise ReconstructionError("ownership schema_version must be 1")
     if data.get("baseline", {}).get("commit") != upstream:
         raise ReconstructionError("ownership baseline commit does not match checker baseline")
+    if data.get("scope") != "nanobot/**":
+        raise ReconstructionError("ownership scope must be nanobot/**")
     if not isinstance(data.get("deltas"), list):
         raise ReconstructionError("ownership deltas must be a list")
     return data
+
+
+def _excluded_upstream_paths(manifest: dict[str, Any]) -> set[str]:
+    rows = manifest.get("excluded_upstream_paths")
+    if not isinstance(rows, list):
+        raise ReconstructionError("ownership excluded_upstream_paths must be a list")
+    paths: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ReconstructionError("invalid excluded upstream path record")
+        path = row.get("path")
+        if (
+            not isinstance(path, str)
+            or not path
+            or path.startswith("/")
+            or ".." in PurePosixPath(path).parts
+        ):
+            raise ReconstructionError(f"invalid excluded upstream path: {path!r}")
+        if path in paths:
+            raise ReconstructionError(f"duplicate excluded upstream path: {path}")
+        if not all(isinstance(row.get(field), str) and row[field].strip() for field in ("reason", "verification")):
+            raise ReconstructionError(f"excluded upstream path lacks reason or verification: {path}")
+        paths.add(path)
+    return paths
 
 
 def _patch_hunk_count(path: Path) -> int:
@@ -331,7 +351,7 @@ def _ownership_errors(
 def _direct_familia_imports(current: dict[str, TreeEntry]) -> list[str]:
     findings: list[str] = []
     for path, entry in sorted(current.items()):
-        if not path.startswith(TARGET_PREFIX) or not path.endswith(".py"):
+        if not path.startswith("nanobot/nanobot/") or not path.endswith(".py"):
             continue
         try:
             tree = ast.parse(entry.data.decode("utf-8-sig"), filename=path)
@@ -413,8 +433,12 @@ def check_exact_reconstruction(
     patch_dir: Path,
     ownership_path: Path,
 ) -> CheckResult:
-    baseline, _object_format = _baseline_tree(upstream_repo, upstream)
-    current = _current_tree(repo)
+    manifest = _load_ownership(ownership_path, upstream)
+    excluded_upstream_paths = _excluded_upstream_paths(manifest)
+    baseline, _object_format = _baseline_tree(
+        upstream_repo, upstream, excluded_upstream_paths
+    )
+    current = _current_tree(repo, excluded_upstream_paths)
     delta_paths = _delta_paths(baseline, current)
 
     expected_patch_by_path = {path: patch_name_for(path) for path in delta_paths}
@@ -438,7 +462,6 @@ def check_exact_reconstruction(
         if not patch_path.read_text(encoding="utf-8").startswith(expected_headers):
             header_errors.append(f"invalid patch header: {patch_path.name}")
 
-    manifest = _load_ownership(ownership_path, upstream)
     ownership_errors, unowned_delta_count, unowned_hunk_count, unknown_count = (
         _ownership_errors(
             manifest,

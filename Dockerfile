@@ -16,31 +16,31 @@ LABEL org.opencontainers.image.version="${FAMILIA_VERSION}"
 # Build-time mirror fallbacks. Defaults point at canonical upstreams;
 # operators on restricted networks (e.g. some RU egress paths where
 # deb.debian.org / pypi.org / registry.npmjs.org are throttled) can
-# pass ``--build-arg APT_MIRROR=https://mirror.yandex.ru/debian`` etc.
+# pass ``--build-arg APT_MIRROR=https://mirror.yandex.ru`` etc.
 # Empty values keep the upstream default.
 ARG APT_MIRROR=""
 ARG PIP_INDEX_URL=""
 ARG NPM_REGISTRY=""
 
-# Apply APT_MIRROR if set. ``sources.list`` on bookworm-slim points at
-# deb.debian.org/security.debian.org; we substitute the host portion.
+# Apply APT_MIRROR if set. It is a mirror origin, not a repository path:
+# Debian's existing ``/debian`` and ``/debian-security`` suffixes stay intact.
+# Strip a legacy trailing ``/debian`` so older saved settings do not produce
+# the invalid ``/debian/debian`` path.
 RUN if [ -n "$APT_MIRROR" ]; then \
-        sed -i "s|http://deb.debian.org|$APT_MIRROR|g; s|http://security.debian.org|$APT_MIRROR|g" \
-            /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
-        sed -i "s|http://deb.debian.org|$APT_MIRROR|g; s|http://security.debian.org|$APT_MIRROR|g" \
-            /etc/apt/sources.list 2>/dev/null || true; \
+        mirror="${APT_MIRROR%/}"; mirror="${mirror%/debian}"; \
+        if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+            sources=/etc/apt/sources.list.d/debian.sources; \
+        elif [ -f /etc/apt/sources.list ]; then \
+            sources=/etc/apt/sources.list; \
+        else \
+            echo "APT sources file not found" >&2; exit 1; \
+        fi; \
+        sed -i "s|http://deb.debian.org|$mirror|g; s|http://security.debian.org|$mirror|g" "$sources"; \
     fi
 
-# Install Node.js 20 for the WhatsApp bridge
+# Install runtime tools used by the native nanobot channels.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates gnupg git bubblewrap openssh-client ffmpeg && \
-    mkdir -p /etc/apt/keyrings && \
-    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
-    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends nodejs && \
-    apt-get purge -y gnupg && \
-    apt-get autoremove -y && \
+    apt-get install -y --no-install-recommends ca-certificates git bubblewrap openssh-client ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
 # Surface mirror fallbacks to pip/uv and npm for the rest of the build.
@@ -70,7 +70,7 @@ COPY familia/pyproject.toml familia/README.md /app/familia/
 # present file (familia/README.md again) along with the optional lock,
 # so the layer hash still depends on lock-file content when it exists.
 COPY familia/README.md familia/requirements.loc[k] /app/familia/
-RUN mkdir -p /app/nanobot/nanobot /app/nanobot/bridge /app/familia/src/familia && \
+RUN mkdir -p /app/nanobot/nanobot /app/familia/src/familia && \
     touch /app/nanobot/nanobot/__init__.py /app/familia/src/familia/__init__.py && \
     if [ -f /app/familia/requirements.lock ]; then \
         echo "+ installing from requirements.lock (reproducible)"; \
@@ -82,22 +82,14 @@ RUN mkdir -p /app/nanobot/nanobot /app/nanobot/bridge /app/familia/src/familia &
         echo "+ no lock file, resolving from pyproject ranges"; \
         uv pip install --system --no-cache /app/nanobot /app/familia; \
     fi && \
-    rm -rf /app/nanobot/nanobot /app/nanobot/bridge /app/familia/src
+    rm -rf /app/nanobot/nanobot /app/familia/src
 
 # Copy full sources and reinstall the two editable packages without
 # touching their (already-installed) dependency tree.
 COPY nanobot/hatch_build.py /app/nanobot/hatch_build.py
 COPY nanobot/nanobot/ /app/nanobot/nanobot/
-COPY nanobot/bridge/  /app/nanobot/bridge/
 COPY familia/src/     /app/familia/src/
 RUN uv pip install --system --no-cache --no-deps /app/nanobot /app/familia
-
-# Build the WhatsApp bridge
-WORKDIR /app/nanobot/bridge
-RUN git config --global --add url."https://github.com/".insteadOf ssh://git@github.com/ && \
-    git config --global --add url."https://github.com/".insteadOf git@github.com: && \
-    npm ci && npm run build
-WORKDIR /app
 
 # Create non-root user and config directory.
 #
@@ -118,7 +110,7 @@ RUN groupadd -g ${NANOBOT_GID} nanobot 2>/dev/null \
     mkdir -p /home/nanobot/.nanobot && \
     chown -R nanobot:nanobot /home/nanobot /app
 
-COPY nanobot/entrypoint-familia.sh /usr/local/bin/entrypoint.sh
+COPY nanobot/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
 USER nanobot

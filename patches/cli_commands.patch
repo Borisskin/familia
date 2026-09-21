@@ -1,221 +1,79 @@
-# nanobot baseline: 0.3.0
-# upstream commit: 3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
-diff --git aa/nanobot/nanobot/cli/commands.py bb/nanobot/nanobot/cli/commands.py
-index 71dd978..a6d9fb9 100644
---- aa/nanobot/nanobot/cli/commands.py
-+++ bb/nanobot/nanobot/cli/commands.py
-@@ -201,6 +201,31 @@ def _commit_dream_changes(memory: Any) -> str | None:
-     return memory.git.auto_commit(message)
- 
- 
-+_SYSTEM_JOB_ORIGIN_KEY = "_familia_system_job"
+diff --git a/nanobot/nanobot/cli/commands.py b/nanobot/nanobot/cli/commands.py
+index cb65541..720bcf7 100644
+--- a/nanobot/nanobot/cli/commands.py
++++ b/nanobot/nanobot/cli/commands.py
+@@ -74,6 +74,11 @@
+ )
+ from nanobot.config.paths import get_workspace_path  # noqa: E402
+ from nanobot.config.schema import Config  # noqa: E402
++from nanobot.runtime_adapters import (  # noqa: E402
++    RuntimeAdapterError,
++    load_runtime_adapters,
++    prepare_session_storage_root,
++)
+ from nanobot.security.network import is_loopback_host  # noqa: E402
+ from nanobot.utils.helpers import sanitize_surrogates as _sanitize_surrogates  # noqa: E402,F401
+ from nanobot.utils.helpers import (  # noqa: E402
+@@ -357,6 +362,10 @@
+     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+ ):
+     """Start the OpenAI-compatible API server (/v1/chat/completions)."""
++    _set_nanobot_logs(verbose)
 +
++    runtime_config = _load_runtime_config(config, workspace)
 +
-+def _is_trusted_system_cron_job(job: Any, expected_id: str) -> bool:
-+    """Match a server system record, not an arbitrary user-chosen name."""
-+    if getattr(job, "id", None) != expected_id:
-+        return False
-+    name = getattr(job, "name", None)
-+    if not isinstance(name, str) or name.strip().lower() != expected_id:
-+        return False
-+    payload = getattr(job, "payload", None)
-+    if getattr(payload, "kind", None) != "system_event":
-+        return False
-+    if any(
-+        getattr(payload, field, None) not in (None, "")
-+        for field in ("created_by", "creator_actor", "target_actor", "owner_actor")
-+    ):
-+        return False
-+    metadata = getattr(payload, "origin_metadata", None)
-+    if not isinstance(metadata, dict):
-+        return False
-+    marker = metadata.get(_SYSTEM_JOB_ORIGIN_KEY)
-+    return marker == expected_id and set(metadata) == {_SYSTEM_JOB_ORIGIN_KEY}
-+
-+
- class SafeFileHistory(FileHistory):
-     """FileHistory subclass that sanitizes surrogate characters on write.
- 
-@@ -1337,6 +1362,7 @@ def serve(
-     from nanobot.api.server import create_app
-     from nanobot.bus.queue import MessageBus
+     try:
+         from aiohttp import web  # noqa: F401
+     except ImportError:
+@@ -368,9 +377,6 @@
      from nanobot.providers.image_generation import image_gen_provider_configs
-+    from nanobot.runtime_adapters import RuntimeAdapterError, load_runtime_adapters
      from nanobot.session.manager import SessionManager
  
-     _set_nanobot_logs(verbose)
-@@ -1355,15 +1381,21 @@ def serve(
+-    _set_nanobot_logs(verbose)
+-
+-    runtime_config = _load_runtime_config(config, workspace)
+     api_cfg = runtime_config.api
+     host = host if host is not None else api_cfg.host
+     port = port if port is not None else api_cfg.port
+@@ -384,12 +390,19 @@
          raise typer.Exit(1)
      sync_workspace_templates(runtime_config.workspace_path)
      bus = MessageBus()
+-    session_manager = SessionManager(runtime_config.workspace_path)
 +    try:
 +        runtime_adapters = load_runtime_adapters(runtime_config, bus=bus)
-+    except RuntimeAdapterError as exc:
++        sessions_root = prepare_session_storage_root(runtime_config, runtime_adapters)
++    except (RuntimeAdapterError, ValueError) as exc:
 +        console.print(f"[red]Error: {exc}[/red]")
 +        raise typer.Exit(1) from exc
-     session_manager = SessionManager(runtime_config.workspace_path)
++    session_manager = SessionManager(runtime_config.workspace_path, sessions_root=sessions_root)
+     tools = ToolRegistry()
+     mcp_provider = MCPProvider.from_config(runtime_config, tools)
      try:
          agent_loop = AgentLoop.from_config(
              runtime_config, bus,
-             session_manager=session_manager,
 +            runtime_adapters=runtime_adapters,
+             session_manager=session_manager,
              image_generation_provider_configs=image_gen_provider_configs(runtime_config),
              hook_factories=[create_file_edit_activity_hook],
-         )
--    except ValueError as exc:
-+    except (RuntimeAdapterError, ValueError) as exc:
-         console.print(f"[red]Error: {exc}[/red]")
-         raise typer.Exit(1) from exc
- 
-@@ -1640,6 +1672,7 @@ def _run_gateway(
-     )
-     from nanobot.providers.fallback_provider import FallbackProvider
-     from nanobot.providers.image_generation import image_gen_provider_configs
-+    from nanobot.runtime_adapters import RuntimeAdapterError, load_runtime_adapters
+@@ -490,10 +503,15 @@
      from nanobot.session.manager import SessionManager
-     from nanobot.session.webui_turns import (
-         WebuiTurnCoordinator,
-@@ -1676,6 +1709,11 @@ def _run_gateway(
-     )
-     sync_workspace_templates(config.workspace_path)
-     bus = MessageBus()
+ 
+     runtime_config = _load_runtime_config(config, workspace)
+-    data_dir = runtime_config.runtime_data_dir
 +    try:
-+        runtime_adapters = load_runtime_adapters(config, bus=bus)
-+    except RuntimeAdapterError as exc:
-+        console.print(f"[red]Error: {exc}[/red]")
-+        raise typer.Exit(1) from exc
-     runtime_events = RuntimeEventBus()
-     fallback_model_observer = build_webui_fallback_model_observer(bus)
- 
-@@ -1737,6 +1775,7 @@ def _run_gateway(
-     # Create agent with cron service
-     agent = AgentLoop.from_config(
-         config, bus,
-+        runtime_adapters=runtime_adapters,
-         provider=provider_snapshot.provider,
-         model=provider_snapshot.model,
-         context_window_tokens=provider_snapshot.context_window_tokens,
-@@ -1798,7 +1837,7 @@ def _run_gateway(
-                 extra["media"] = list(msg.media)
-             session.add_message("assistant", msg.content, **extra)
-             session_manager.save(session)
--        await bus.publish_outbound(msg)
-+        await bus.publish_outbound(msg, action="message.send")
- 
-     message_tool = getattr(agent, "tools", {}).get("message")
-     if isinstance(message_tool, MessageTool):
-@@ -1810,8 +1849,31 @@ def _run_gateway(
-         async def _silent(*_args, **_kwargs):
-             pass
- 
--        # Dream is an internal job — run directly, not through the agent loop.
--        if job.name == "dream":
-+        # Familia owns the complete scheduled dispatch, including trusted
-+        # system classification and owner fan-out.  Run this before the
-+        # stock name-based handlers so a user job named "dream" stays bound
-+        # to its own session.
-+        if callable(getattr(agent.runtime_adapters, "run_scheduled", None)):
-+            result = await agent.run_scheduled(job)
-+            if isinstance(result, OutboundMessage):
-+                return result.content
-+            return None if result is None else str(result)
-+
-+        # Dream is an adapter-owned job in product mode.  The stock path below
-+        # remains unchanged for ordinary nanobot.
-+        if _is_trusted_system_cron_job(job, "dream"):
-+            if agent.runtime_adapters.run_dream is not None:
-+                payload = getattr(job, "payload", None)
-+                owner = ""
-+                for field_name in ("owner_actor", "target_actor", "creator_actor"):
-+                    candidate = getattr(payload, field_name, None)
-+                    if isinstance(candidate, str) and candidate.strip():
-+                        owner = candidate.strip()
-+                        break
-+                result = await agent.run_dream(owner)
-+                if isinstance(result, OutboundMessage):
-+                    return result.content
-+                return None if result is None else str(result)
-             from nanobot.agent.memory import MemoryStore
- 
-             dream_session_key = MemoryStore.dream_session_key
-@@ -1871,7 +1933,13 @@ def _run_gateway(
-             return None
- 
-         # Heartbeat is a system job that checks HEARTBEAT.md for active tasks.
--        if job.name == "heartbeat":
-+        if _is_trusted_system_cron_job(job, "heartbeat"):
-+            if agent.runtime_adapters.run_heartbeat is not None:
-+                actor = str(getattr(config.gateway.heartbeat, "target_actor", "") or "")
-+                result = await agent.run_heartbeat(actor)
-+                if isinstance(result, OutboundMessage):
-+                    return result.content
-+                return None if result is None else str(result)
-             heartbeat_file = config.workspace_path / "HEARTBEAT.md"
-             try:
-                 content = heartbeat_file.read_text(encoding="utf-8")
-@@ -1979,6 +2047,7 @@ def _run_gateway(
-         webui_static_dist=webui_static_dist,
-         webui_runtime_surface=webui_runtime_surface,
-         webui_runtime_capabilities=webui_runtime_capabilities,
-+        runtime_adapters=runtime_adapters,
-     )
- 
-     def _pick_heartbeat_target() -> tuple[str, str]:
-@@ -2065,7 +2134,10 @@ def _run_gateway(
-             id="dream",
-             name="dream",
-             schedule=dream_cfg.build_schedule(config.agents.defaults.timezone),
--            payload=CronPayload(kind="system_event"),
-+            payload=CronPayload(
-+                kind="system_event",
-+                origin_metadata={_SYSTEM_JOB_ORIGIN_KEY: "dream"},
-+            ),
-         ))
-         console.print(f"[green]✓[/green] Dream: {dream_cfg.describe_schedule()}")
-     else:
-@@ -2082,7 +2154,10 @@ def _run_gateway(
-                 every_ms=hb_cfg.interval_s * 1000,
-                 tz=config.agents.defaults.timezone,
-             ),
--            payload=CronPayload(kind="system_event"),
-+            payload=CronPayload(
-+                kind="system_event",
-+                origin_metadata={_SYSTEM_JOB_ORIGIN_KEY: "heartbeat"},
-+            ),
-         ))
- 
-     async def _open_browser_when_ready() -> None:
-@@ -2245,11 +2320,17 @@ def agent(
-     from nanobot.bus.queue import MessageBus
-     from nanobot.cron.service import CronService
-     from nanobot.providers.image_generation import image_gen_provider_configs
-+    from nanobot.runtime_adapters import RuntimeAdapterError, load_runtime_adapters
- 
-     config = _load_runtime_config(config, workspace)
-     sync_workspace_templates(config.workspace_path)
- 
-     bus = MessageBus()
-+    try:
-+        runtime_adapters = load_runtime_adapters(config, bus=bus)
-+    except RuntimeAdapterError as exc:
-+        console.print(f"[red]Error: {exc}[/red]")
-+        raise typer.Exit(1) from exc
- 
-     # Preserve existing single-workspace installs, but keep custom workspaces clean.
-     if is_default_workspace(config.workspace_path):
-@@ -2264,11 +2345,12 @@ def agent(
-     try:
-         agent_loop = AgentLoop.from_config(
-             config, bus,
-+            runtime_adapters=runtime_adapters,
-             cron_service=cron,
-             image_generation_provider_configs=image_gen_provider_configs(config),
-             hook_factories=[create_file_edit_activity_hook],
-         )
--    except ValueError as exc:
++        runtime_adapters = load_runtime_adapters(runtime_config)
++        sessions_root = prepare_session_storage_root(runtime_config, runtime_adapters)
 +    except (RuntimeAdapterError, ValueError) as exc:
-         console.print(f"[red]Error: {exc}[/red]")
-         raise typer.Exit(1) from exc
-     restart_notice = consume_restart_notice_from_env()
-
++        console.print(f"[red]Error: {exc}[/red]")
++        raise typer.Exit(1) from exc
+     manager = SessionManager(
+         runtime_config.workspace_path,
+-        sessions_root=data_dir / "sessions" if data_dir is not None else None,
++        sessions_root=sessions_root,
+     )
+     result = manager.restore_sessions_to_workspace()
+     console.print(

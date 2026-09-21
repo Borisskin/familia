@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -159,7 +160,7 @@ async def test_dream_writer_tracks_exception_before_reraising(monkeypatch) -> No
     )
 
 
-def test_cron_identity_round_trip_restart_and_dedupe(tmp_path, monkeypatch) -> None:
+def test_cron_identity_round_trip_restart_and_route_distinction(tmp_path, monkeypatch) -> None:
     from familia.nanobot_extension import cron as familia_cron
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronSchedule
@@ -185,12 +186,7 @@ def test_cron_identity_round_trip_restart_and_dedupe(tmp_path, monkeypatch) -> N
         "channel": "tg",
         "to": "2000001",
         "delete_after_run": False,
-        "created_by": "owner",
-        "creator_actor": "owner",
-        "target_actor": "owner",
-        "owner_actor": "owner",
         "origin_metadata": {"actor": "owner"},
-        "tags": ["family", "calendar"],
     }
 
     service = CronService(store_path)
@@ -202,9 +198,6 @@ def test_cron_identity_round_trip_restart_and_dedupe(tmp_path, monkeypatch) -> N
     loaded = restarted.get_job(original.id)
 
     assert loaded is not None
-    assert loaded.payload.creator_actor == "owner"
-    assert loaded.payload.target_actor == "owner"
-    assert loaded.payload.owner_actor == "owner"
     # Legacy delivery fields are normalized to a session-bound record.
     assert loaded.payload.deliver is False
     assert loaded.payload.channel is None
@@ -212,24 +205,26 @@ def test_cron_identity_round_trip_restart_and_dedupe(tmp_path, monkeypatch) -> N
     assert loaded.payload.session_key == "tg:2000001"
     assert loaded.payload.origin_channel == "tg"
     assert loaded.payload.origin_chat_id == "2000001"
-    assert loaded.payload.tags == ["family", "calendar"]
 
     owner, private_key = familia_cron._job_actor_and_session(loaded)
     assert owner == "owner"
     assert private_key == "familia:owner:tg:2000001"
 
     duplicate = restarted.add_job(**job_kwargs)
-    different_target = restarted.add_job(**{**job_kwargs, "target_actor": "member_a"})
+    different_target = restarted.add_job(**{**job_kwargs, "to": "2000002"})
 
-    assert duplicate.id == original.id
+    assert duplicate.id != original.id
     assert different_target.id != original.id
-    assert len(restarted.list_jobs()) == 2
+    assert different_target.id != duplicate.id
+    assert len(restarted.list_jobs()) == 3
 
     persisted = json.loads(store_path.read_text(encoding="utf-8"))
-    assert persisted["version"] == 2
+    assert persisted["version"] == 1
     saved_payload = next(job["payload"] for job in persisted["jobs"] if job["id"] == original.id)
-    assert saved_payload["creatorActor"] == "owner"
-    assert saved_payload["targetActor"] == "owner"
+    assert saved_payload["sessionKey"] == "tg:2000001"
+    assert saved_payload["originChannel"] == "tg"
+    assert saved_payload["originChatId"] == "2000001"
+    assert saved_payload["originMetadata"] == {"actor": "owner"}
 
 
 def test_cron_owner_rejects_unproven_or_mismatched_origin(monkeypatch) -> None:
@@ -302,9 +297,89 @@ def test_legacy_cron_creator_is_preserved_without_inventing_target(tmp_path) -> 
     loaded = service.get_job("legacy-1")
 
     assert loaded is not None
-    assert loaded.payload.creator_actor == "owner"
-    assert loaded.payload.target_actor is None
-    assert service._load_store().version == 2
+    assert loaded.payload.session_key is None
+    assert loaded.enabled is False
+    assert loaded.state.last_status == "error"
+    assert loaded.state.last_error is not None
+    assert "missing bound session" in loaded.state.last_error
+    assert service._load_store().version == 1
+
+
+def test_legacy_cron_owner_fields_and_tags_survive_save_reload_and_execution(tmp_path) -> None:
+    from nanobot.cron.service import CronService
+
+    store_path = tmp_path / "cron" / "jobs.json"
+    store_path.parent.mkdir(parents=True)
+    store_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "jobs": [
+                    {
+                        "id": "legacy-owners",
+                        "name": "legacy owner reminder",
+                        "schedule": {"kind": "every", "everyMs": 60000},
+                        "payload": {
+                            "message": "legacy",
+                            "sessionKey": "telegram:100",
+                            "originChannel": "telegram",
+                            "originChatId": "100",
+                            "createdBy": "creator",
+                            "creatorActor": "creator",
+                            "ownerActor": "owner",
+                            "targetActor": "target",
+                            "tags": ["shared", "topic"],
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed: list[tuple[str | None, str | None, str | None, str | None, list[str]]] = []
+
+    async def on_job(job) -> None:
+        observed.append(
+            (
+                job.payload.created_by,
+                job.payload.creator_actor,
+                job.payload.owner_actor,
+                job.payload.target_actor,
+                job.payload.tags,
+            )
+        )
+
+    service = CronService(store_path, on_job=on_job)
+    service._running = True
+    service._arm_timer = lambda: None
+    assert service.get_job("legacy-owners") is not None
+    service._save_store()
+
+    reloaded = CronService(store_path, on_job=on_job)
+    reloaded._running = True
+    reloaded._arm_timer = lambda: None
+    loaded = reloaded.get_job("legacy-owners")
+
+    assert loaded is not None
+    assert (
+        loaded.payload.created_by,
+        loaded.payload.creator_actor,
+        loaded.payload.owner_actor,
+        loaded.payload.target_actor,
+        loaded.payload.tags,
+    ) == ("creator", "creator", "owner", "target", ["shared", "topic"])
+    assert asyncio.run(reloaded.run_job("legacy-owners"))
+    assert observed == [("creator", "creator", "owner", "target", ["shared", "topic"])]
+
+    final = CronService(store_path).get_job("legacy-owners")
+    assert final is not None
+    assert (
+        final.payload.created_by,
+        final.payload.creator_actor,
+        final.payload.owner_actor,
+        final.payload.target_actor,
+        final.payload.tags,
+    ) == ("creator", "creator", "owner", "target", ["shared", "topic"])
 
 
 def test_cron_owner_actor_round_trip_supports_snake_and_camel_fields(tmp_path) -> None:
@@ -323,11 +398,6 @@ def test_cron_owner_actor_round_trip_supports_snake_and_camel_fields(tmp_path) -
         origin_channel="telegram",
         origin_chat_id="2000001",
         origin_metadata={"actor": "owner"},
-        created_by="owner",
-        creator_actor="owner",
-        target_actor="owner",
-        owner_actor="owner",
-        tags=["private"],
     )
 
     restarted = CronService(store_path)
@@ -336,14 +406,14 @@ def test_cron_owner_actor_round_trip_supports_snake_and_camel_fields(tmp_path) -
     loaded = restarted.get_job(job.id)
 
     assert loaded is not None
-    assert loaded.payload.owner_actor == "owner"
-    assert loaded.payload.creator_actor == "owner"
-    assert loaded.payload.target_actor == "owner"
-    assert loaded.payload.created_by == "owner"
-    assert loaded.payload.tags == ["private"]
+    assert loaded.payload.session_key == "familia:owner:telegram:2000001"
+    assert loaded.payload.origin_channel == "telegram"
+    assert loaded.payload.origin_chat_id == "2000001"
+    assert loaded.payload.origin_metadata == {"actor": "owner"}
     persisted = json.loads(store_path.read_text(encoding="utf-8"))
-    assert persisted["version"] == 2
+    assert persisted["version"] == 1
     saved_payload = persisted["jobs"][0]["payload"]
-    assert saved_payload["ownerActor"] == "owner"
-    assert saved_payload["creatorActor"] == "owner"
-    assert saved_payload["targetActor"] == "owner"
+    assert saved_payload["sessionKey"] == "familia:owner:telegram:2000001"
+    assert saved_payload["originChannel"] == "telegram"
+    assert saved_payload["originChatId"] == "2000001"
+    assert saved_payload["originMetadata"] == {"actor": "owner"}

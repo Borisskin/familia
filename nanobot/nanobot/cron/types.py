@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast, overload
 
 from nanobot.utils.dict_keys import get_camel_snake
+
+
+@overload
+def _store_int(value: Any, default: Literal[None]) -> int | None: ...
+
+
+@overload
+def _store_int(value: Any, default: int = 0) -> int: ...
 
 
 def _store_int(value: Any, default: int | None = 0) -> int | None:
@@ -48,82 +56,48 @@ class CronPayload:
     deliver: bool = False
     channel: str | None = None  # e.g. "whatsapp"
     to: str | None = None  # e.g. phone number
+    created_by: str | None = None
+    creator_actor: str | None = None
+    owner_actor: str | None = None
+    target_actor: str | None = None
+    tags: list[str] = field(default_factory=list)
     channel_meta: dict[str, Any] = field(default_factory=dict)
     session_key: str | None = None  # original session key for correct session recording
     origin_channel: str | None = None
     origin_chat_id: str | None = None
     origin_metadata: dict[str, Any] = field(default_factory=dict)
-    # Typed ownership metadata survives cron save/load.  The runtime still
-    # validates these ids against the server registry before using them.
-    created_by: str | None = None
-    tags: list[str] = field(default_factory=list)
-    creator_actor: str | None = None
-    target_actor: str | None = None
-    owner_actor: str | None = None
 
     @classmethod
     def from_store_dict(cls, data: dict[str, Any]) -> CronPayload:
-        raw_origin_metadata = get_camel_snake(
-            data, "originMetadata", "origin_metadata", {}
-        )
-        origin_metadata = (
-            dict(raw_origin_metadata) if isinstance(raw_origin_metadata, dict) else {}
-        )
-        created_by = get_camel_snake(data, "createdBy", "created_by")
-        if created_by is None:
-            created_by = get_camel_snake(origin_metadata, "createdBy", "created_by")
-        if not isinstance(created_by, str) or not created_by.strip():
-            created_by = None
-        else:
-            created_by = created_by.strip()
-        creator_actor = get_camel_snake(data, "creatorActor", "creator_actor")
-        if creator_actor is None:
-            creator_actor = get_camel_snake(
-                origin_metadata, "creatorActor", "creator_actor"
-            )
-        if not isinstance(creator_actor, str) or not creator_actor.strip():
-            creator_actor = created_by
-        else:
-            creator_actor = creator_actor.strip()
-        owner_actor = get_camel_snake(data, "ownerActor", "owner_actor")
-        if owner_actor is None:
-            owner_actor = get_camel_snake(origin_metadata, "ownerActor", "owner_actor")
-        if not isinstance(owner_actor, str) or not owner_actor.strip():
-            owner_actor = None
-        else:
-            owner_actor = owner_actor.strip()
-        raw_tags = get_camel_snake(data, "tags", "tags", [])
-        tags = (
-            [tag.strip() for tag in raw_tags if isinstance(tag, str) and tag.strip()]
-            if isinstance(raw_tags, list)
-            else []
-        )
-        target_actor = get_camel_snake(data, "targetActor", "target_actor")
-        if target_actor is None:
-            target_actor = get_camel_snake(origin_metadata, "targetActor", "target_actor")
-        if not isinstance(target_actor, str) or not target_actor.strip():
-            target_actor = None
-        else:
-            target_actor = target_actor.strip()
         return cls(
             kind=data.get("kind", "agent_turn"),
             message=data.get("message", ""),
             deliver=data.get("deliver", False),
             channel=data.get("channel"),
             to=data.get("to"),
+            created_by=get_camel_snake(data, "createdBy", "created_by"),
+            creator_actor=get_camel_snake(data, "creatorActor", "creator_actor"),
+            owner_actor=get_camel_snake(data, "ownerActor", "owner_actor"),
+            target_actor=get_camel_snake(data, "targetActor", "target_actor"),
+            tags=list(data.get("tags") or []),
             channel_meta=dict(
                 get_camel_snake(data, "channelMeta", "channel_meta", {}) or {}
             ),
             session_key=get_camel_snake(data, "sessionKey", "session_key"),
             origin_channel=get_camel_snake(data, "originChannel", "origin_channel"),
             origin_chat_id=get_camel_snake(data, "originChatId", "origin_chat_id"),
-            origin_metadata=origin_metadata,
-            created_by=created_by,
-            tags=tags,
-            creator_actor=creator_actor,
-            target_actor=target_actor,
-            owner_actor=owner_actor,
+            origin_metadata=dict(
+                get_camel_snake(data, "originMetadata", "origin_metadata", {}) or {}
+            ),
         )
+
+
+@dataclass
+class CronRunResult:
+    """Result and durable record identity returned by a cron executor."""
+
+    run_id: str
+    response: str
 
 
 @dataclass
@@ -133,14 +107,17 @@ class CronRunRecord:
     status: Literal["ok", "error", "skipped"]
     duration_ms: int = 0
     error: str | None = None
+    run_id: str | None = None
 
     @classmethod
     def from_store_dict(cls, data: dict[str, Any]) -> CronRunRecord:
+        run_id = get_camel_snake(data, "runId", "run_id")
         return cls(
             run_at_ms=_store_int(get_camel_snake(data, "runAtMs", "run_at_ms", 0)),
             status=data["status"],
             duration_ms=_store_int(get_camel_snake(data, "durationMs", "duration_ms", 0)),
             error=data.get("error"),
+            run_id=run_id if isinstance(run_id, str) else None,
         )
 
 
@@ -155,7 +132,10 @@ class CronJobState:
 
     @classmethod
     def from_store_dict(cls, data: dict[str, Any]) -> CronJobState:
-        history = get_camel_snake(data, "runHistory", "run_history", []) or []
+        history = cast(
+            list[object],
+            get_camel_snake(data, "runHistory", "run_history", []) or [],
+        )
         return cls(
             next_run_at_ms=_store_int(
                 get_camel_snake(data, "nextRunAtMs", "next_run_at_ms"), None
@@ -168,7 +148,7 @@ class CronJobState:
             run_history=[
                 record
                 if isinstance(record, CronRunRecord)
-                else CronRunRecord.from_store_dict(record)
+                else CronRunRecord.from_store_dict(cast(dict[str, Any], record))
                 for record in history
                 if isinstance(record, (dict, CronRunRecord))
             ],
@@ -189,16 +169,20 @@ class CronJob:
     delete_after_run: bool = False
 
     @classmethod
-    def from_dict(cls, kwargs: dict):
-        state_kwargs = dict(kwargs.get("state", {}))
+    def from_dict(cls, kwargs: dict[str, Any]) -> CronJob:
+        state_kwargs = dict(cast(dict[str, Any], kwargs.get("state", {})))
         state_kwargs["run_history"] = [
-            record if isinstance(record, CronRunRecord) else CronRunRecord(**record)
-            for record in state_kwargs.get("run_history", [])
+            record
+            if isinstance(record, CronRunRecord)
+            else CronRunRecord(**cast(dict[str, Any], record))
+            for record in cast(list[object], state_kwargs.get("run_history", []))
         ]
-        kwargs["schedule"] = CronSchedule(**kwargs.get("schedule", {"kind": "every"}))
-        kwargs["payload"] = CronPayload(**kwargs.get("payload", {}))
+        kwargs["schedule"] = CronSchedule(
+            **cast(dict[str, Any], kwargs.get("schedule", {"kind": "every"}))
+        )
+        kwargs["payload"] = CronPayload(**cast(dict[str, Any], kwargs.get("payload", {})))
         kwargs["state"] = CronJobState(**state_kwargs)
-        return cls(**kwargs)
+        return cls(**cast(Any, kwargs))
 
     @classmethod
     def from_store_dict(cls, data: dict[str, Any]) -> CronJob:
@@ -221,5 +205,5 @@ class CronJob:
 @dataclass
 class CronStore:
     """Persistent store for cron jobs."""
-    version: int = 2
+    version: int = 1
     jobs: list[CronJob] = field(default_factory=list)

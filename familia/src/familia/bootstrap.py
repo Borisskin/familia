@@ -86,6 +86,12 @@ def _server_actor(msg: Any) -> str | None:
     supplied = getattr(msg, "actor", None)
     trusted = _trusted_runtime_context(msg)
     trusted_actor = getattr(trusted, "actor", None)
+    trusted_metadata = getattr(trusted, "metadata", None)
+    is_server_cron = (
+        trusted is not None
+        and isinstance(trusted_metadata, dict)
+        and trusted_metadata.get("_familia_server_cron") is True
+    )
     if supplied is not None:
         # InboundMessage.actor is written by trusted channel/background code;
         # client metadata never reaches this branch.  Still require registry
@@ -94,8 +100,11 @@ def _server_actor(msg: Any) -> str | None:
             return None
         if resolved is None and not (trusted is not None and supplied == trusted_actor):
             return None
-        if resolved is not None and supplied != resolved:
+        if is_server_cron and get_registry().resolve_unique(channel, sender_id) is None:
             return None
+        if resolved is not None and supplied != resolved:
+            if not (is_server_cron and supplied == trusted_actor):
+                return None
         return supplied
     if trusted is not None:
         return trusted_actor
@@ -151,6 +160,12 @@ async def _admit_message(msg: Any) -> Any:
     # The in-process context proves admission but must never enter serialized
     # history, logs, or outbound payloads.
     metadata.pop("_runtime_request_context", None)
+    metadata.pop("_familia_server_cron", None)
+    if (
+        isinstance(getattr(trusted, "metadata", None), dict)
+        and trusted.metadata.get("_familia_server_cron") is True
+    ):
+        metadata["_familia_server_cron"] = True
     admitted = replace(msg, actor=actor, metadata=metadata)
     return Admission(
         actor=actor,
@@ -205,8 +220,6 @@ def _turn_scope(ctx: Any) -> Any:
                 lexical_root,
                 "restricted",
                 source_channel=ctx.channel,
-                allow_shared_extras=False,
-                sandbox_mask_root=base,
             )
             scope_token = bind_workspace_scope(scope)
             from nanobot.agent.tools.context import request_context
@@ -309,6 +322,31 @@ async def _archive_messages(owner: str, messages: Any) -> Any:
     committed = isinstance(result, str) and result.startswith("committed:")
     retryable = isinstance(result, str) and result.startswith(("error:", "retryable_failure:"))
     return ArchiveResult(committed=committed, retryable=retryable)
+
+
+def _archive_owner(session_key: str) -> str | None:
+    """Resolve a trusted owner for an idle archive without trusting messages."""
+    from familia.principals import get_registry
+    from familia.session_identity import parse_private_session_key
+
+    parsed = parse_private_session_key(session_key)
+    if parsed is None or get_registry().get(parsed[0]) is None:
+        return None
+    actor = get_current_actor()
+    if actor is not None and actor != parsed[0]:
+        return None
+    return parsed[0]
+
+
+def _session_access(_operation: str) -> bool:
+    """Disable user-facing cross-session SDK access in Familia mode."""
+    return False
+
+
+def _channel_enabled(name: str, configured: bool) -> bool:
+    """Keep optional WebSocket off unless the user explicitly configured it."""
+    return configured or name != "websocket"
+
 
 _dream_principal: ContextVar[str | None] = ContextVar(
     "familia_dream_principal",
@@ -701,6 +739,16 @@ def install_tools(context_or_loop: Any, registry: Any | None = None) -> Any:
     registry.register(AdminListTool())
     registry.register(AdminSetTzTool())
 
+    for name in (
+        "search_sessions",
+        "read_session",
+        "list_sessions",
+        "send_session_message",
+    ):
+        unregister = getattr(registry, "unregister", None)
+        if callable(unregister):
+            unregister(name)
+
     names = tuple(registry.tool_names)
     if not legacy_loop:
         logger.debug("familia.bootstrap: tools registered through RuntimeAdapters")
@@ -959,7 +1007,7 @@ def make_reachable_tags_getter() -> Any:
 
 
 def make_principal_chat_validator() -> Any:
-    """Return ``(channel, chat_id) -> bool``: True iff some principal owns it.
+    """Return ``(channel, chat_id) -> bool``: True iff one principal owns it.
 
     Plugged into ``CronTool`` so the LLM can't redirect cron deliveries to
     chat ids outside the family graph (e.g. via prompt injection). Looks
@@ -971,15 +1019,7 @@ def make_principal_chat_validator() -> Any:
     def _validate(channel: str, chat_id: str) -> bool:
         if not channel or not chat_id:
             return False
-        reg = get_registry()
-        for pid in reg.ids:
-            p = reg.get(pid)
-            if p is None:
-                continue
-            for ident in p.identities:
-                if ident.channel == channel and str(ident.sender_id) == str(chat_id):
-                    return True
-        return False
+        return get_registry().resolve_unique(channel, chat_id) is not None
 
     return _validate
 
@@ -1075,7 +1115,7 @@ def _callback_handler(bus: Any) -> Any:
 
 
 def make_runtime_adapters(config: Any, bus: Any = None) -> Any:
-    """Build the complete Familia adapter object for nanobot 0.3.0."""
+    """Build the complete Familia adapter object for nanobot 0.3.5."""
     _Admission, _ArchiveResult, RuntimeAdapters, _default_context_factory = _runtime_types()
     from nanobot.agent.outbound import OutboundDecision
 
@@ -1104,6 +1144,14 @@ def make_runtime_adapters(config: Any, bus: Any = None) -> Any:
         return replace(ctx, workspace=Path(workspace))
 
     hooks = _runtime_service_hooks(config, bus)
+    try:
+        from familia.session_storage import prepare_familia_session_storage
+    except ImportError as exc:
+        from nanobot.runtime_adapters import RuntimeAdapterError
+
+        raise RuntimeAdapterError(
+            "Familia session storage preparation is unavailable"
+        ) from exc
     # Dream/heartbeat/scheduling are owned by the sibling service adapter;
     # selected Familia mode must fail closed until all three are present.
     missing_service_hooks = {
@@ -1125,6 +1173,10 @@ def make_runtime_adapters(config: Any, bus: Any = None) -> Any:
         "install_tools": install_tools,
         "turn_scope": _turn_scope,
         "archive": _archive_messages,
+        "archive_owner": _archive_owner,
+        "prepare_session_storage": prepare_familia_session_storage,
+        "session_access": _session_access,
+        "channel_enabled": _channel_enabled,
         "channel_plugins": hooks.pop("channel_plugins", _channel_plugins),
         "register_channel_descriptor": hooks.pop(
             "register_channel_descriptor", _register_channel_descriptor

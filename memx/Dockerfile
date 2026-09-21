@@ -7,10 +7,15 @@ FROM python:3.12-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da87
 ARG APT_MIRROR=""
 ARG PIP_INDEX_URL=""
 RUN if [ -n "$APT_MIRROR" ]; then \
-        sed -i "s|http://deb.debian.org|$APT_MIRROR|g; s|http://security.debian.org|$APT_MIRROR|g" \
-            /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
-        sed -i "s|http://deb.debian.org|$APT_MIRROR|g; s|http://security.debian.org|$APT_MIRROR|g" \
-            /etc/apt/sources.list 2>/dev/null || true; \
+        mirror="${APT_MIRROR%/}"; mirror="${mirror%/debian}"; \
+        if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+            sources=/etc/apt/sources.list.d/debian.sources; \
+        elif [ -f /etc/apt/sources.list ]; then \
+            sources=/etc/apt/sources.list; \
+        else \
+            echo "APT sources file not found" >&2; exit 1; \
+        fi; \
+        sed -i "s|http://deb.debian.org|$mirror|g; s|http://security.debian.org|$mirror|g" "$sources"; \
     fi
 ENV PIP_INDEX_URL=${PIP_INDEX_URL:+$PIP_INDEX_URL}
 

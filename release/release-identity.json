@@ -5,17 +5,16 @@
   "release_scope": "backend-only",
   "component_versions": {
     "familia": "0.4.2",
-    "vendored_nanobot": "0.3.0",
+    "vendored_nanobot": "0.3.5",
     "memx": "0.1.0",
-    "memx_sdk": "0.1.1",
-    "bridge": "0.1.0"
+    "memx_sdk": "0.1.1"
   },
   "included_components": [
     "tracked backend",
     "vendored nanobot baseline",
     "Familia adapters",
     "memX",
-    "bridge",
+    "native nanobot channels",
     "Compose",
     "memory migration and repair tooling",
     "operator documentation"
@@ -24,13 +23,13 @@
     "ignored local admin/"
   ],
   "vendored_nanobot": {
-    "version": "0.3.0",
-    "baseline_commit": "3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec",
+    "version": "0.3.5",
+    "baseline_commit": "1bb712d3488915ca4ed9ccc1a93067ff722f5ab9",
     "behavioral_equivalence_claimed": false
   },
   "deferred": {
     "admin_independent_audit": true,
-    "later_nanobot_target_selected": true,
+    "later_nanobot_target_selected": false,
     "version_synchronization_work_item": "RP-120"
   },
   "memory_contract": {

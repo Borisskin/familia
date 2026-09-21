@@ -36,7 +36,7 @@ import httpx
 from loguru import logger
 from nanobot.bus.events import CallbackEvent, OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.base import BaseChannel
+from nanobot.channels.base import BaseChannel, DeliveryUnavailableError
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
 from nanobot.utils.helpers import split_message
@@ -53,6 +53,14 @@ VK_MAX_MESSAGE_LEN = 4000
 # ``config.channels.transcriptionAudioBudgetS``). The admin's STT
 # settings card writes a per-VM value that overrides this.
 VK_AUDIO_BUDGET_S_DEFAULT = 300
+
+
+class VKAPIError(RuntimeError):
+    """VK returned a confirmed API rejection."""
+
+
+class _VKPartialDeliveryError(VKAPIError):
+    """VK rejected a later fragment after accepting an earlier one."""
 
 
 class _AudioBudget:
@@ -197,6 +205,9 @@ class VKChannel(BaseChannel):
         # message_new started it.
         self._typing_tasks: dict[str, asyncio.Task[None]] = {}
 
+    def should_retry_send_error(self, error: Exception) -> bool:
+        return not isinstance(error, _VKPartialDeliveryError) and super().should_retry_send_error(error)
+
     async def start(self) -> None:
         if not self.config.access_token or not self.config.group_id:
             logger.error("VK: access_token or group_id not configured")
@@ -261,7 +272,7 @@ class VKChannel(BaseChannel):
         r = await self._client.post(f"{VK_API_BASE}/{method}", data=params)
         payload = r.json()
         if "error" in payload:
-            raise RuntimeError(f"VK {method}: {payload['error']}")
+            raise VKAPIError(f"VK {method}: {payload['error']}")
         return payload.get("response")
 
     # --- Typing indicator --------------------------------------------------
@@ -317,7 +328,7 @@ class VKChannel(BaseChannel):
         self._stop_typing(str(msg.chat_id))
         if not self._client:
             logger.warning("VK: client not running")
-            return
+            raise DeliveryUnavailableError("VK client not running")
         if not msg.content and not msg.media:
             return
 
@@ -345,15 +356,20 @@ class VKChannel(BaseChannel):
         chunks = split_message(text, VK_MAX_MESSAGE_LEN) if text else [""]
         last = len(chunks) - 1
         for idx, chunk in enumerate(chunks):
-            await self._api(
-                "messages.send",
-                peer_id=msg.chat_id,
-                message=chunk,
-                random_id=random.randint(1, 2**31 - 1),
-                disable_mentions=1,
-                attachment=",".join(attachments) if attachments and idx == last else None,
-                keyboard=keyboard_json if idx == last else None,
-            )
+            try:
+                await self._api(
+                    "messages.send",
+                    peer_id=msg.chat_id,
+                    message=chunk,
+                    random_id=random.randint(1, 2**31 - 1),
+                    disable_mentions=1,
+                    attachment=",".join(attachments) if attachments and idx == last else None,
+                    keyboard=keyboard_json if idx == last else None,
+                )
+            except VKAPIError as error:
+                if idx == 0:
+                    raise DeliveryUnavailableError(str(error)) from error
+                raise _VKPartialDeliveryError(str(error)) from error
 
     async def _upload_media(self, peer_id: int, path: str) -> str:
         """Upload a local file to VK and return its ``<type><owner>_<id>`` ref."""

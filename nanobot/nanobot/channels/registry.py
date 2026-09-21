@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import pkgutil
-from collections.abc import Callable, Mapping
-from functools import cache
-from importlib.metadata import entry_points
 from typing import TYPE_CHECKING
 
 from loguru import logger
@@ -20,22 +17,6 @@ if TYPE_CHECKING:
     from nanobot.channels.base import BaseChannel
 
 
-@cache
-def _warn_legacy_channel_entry_points() -> None:
-    # TODO(v0.2.4): Remove this detection and warning. v0.2.3 is the final
-    # migration window for installed legacy channel entry points.
-    names = sorted({entry_point.name for entry_point in entry_points(group="nanobot.channels")})
-    if not names:
-        return
-    logger.warning(
-        "Legacy channel entry points were detected but will not be loaded: {}. "
-        "The '{}' entry-point group is no longer supported; use a built-in channel or "
-        "migrate it into nanobot/channels/<channel>/.",
-        ", ".join(names),
-        "nanobot.channels",
-    )
-
-
 def _channel_package_names() -> list[str]:
     import nanobot.channels as package
 
@@ -48,35 +29,12 @@ def _channel_package_names() -> list[str]:
 
 def discover_plugins(
     enabled_names: set[str] | None = None,
-    *,
-    external_loader: Callable[
-        [set[str] | None], Mapping[str, ChannelPlugin]
-    ] | None = None,
 ) -> dict[str, ChannelPlugin]:
     """Load dependency-free descriptors from self-contained channel packages."""
-    _warn_legacy_channel_entry_points()
     plugins: dict[str, ChannelPlugin] = {}
-    if external_loader is not None:
-        external = external_loader(enabled_names)
-        if not isinstance(external, Mapping):
-            raise TypeError("external channel plugin loader must return a mapping")
-        for name, plugin in external.items():
-            if not isinstance(name, str) or not isinstance(plugin, ChannelPlugin):
-                raise TypeError(
-                    "external channel plugin loader must return string names and ChannelPlugin values"
-                )
-            if plugin.name != name:
-                raise ValueError(
-                    f"external channel plugin key '{name}' does not match descriptor name '{plugin.name}'"
-                )
-            if enabled_names is None or name in enabled_names:
-                plugins[name] = plugin
-
     for name in _channel_package_names():
         if enabled_names is not None and name not in enabled_names:
             continue
-        if name in plugins:
-            raise ValueError(f"channel plugin name collision: {name}")
         try:
             plugin = load_channel_package(name)
             if plugin is not None:

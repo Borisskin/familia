@@ -5,22 +5,27 @@ from __future__ import annotations
 import dataclasses
 import time
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from nanobot.agent.outbound import RUNTIME_REQUEST_CONTEXT_KEY
-from nanobot.agent.tools.context import RequestContext
 from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.notification_delivery import notification_is_deliverable
 from nanobot.bus.outbound_events import (
-    RetryWaitEvent,
+    RetryStatusEvent,
     StreamDeltaEvent,
     StreamedResponseEvent,
     StreamEndEvent,
-    outbound_message_for_event,
 )
-from nanobot.bus.progress import build_bus_progress_callback
 from nanobot.bus.queue import MessageBus
-from nanobot.bus.runtime_events import RuntimeEventBus, RuntimeEventPublisher
+from nanobot.bus.runtime_events import RuntimeEventPublisher
+from nanobot.channels.notification_routes import notification_metadata
+from nanobot.events import AgentEvent, EventSink
+from nanobot.providers.base import LLMUsage
+from nanobot.session.keys import UNIFIED_SESSION_KEY, last_channel_from_metadata
+
+if TYPE_CHECKING:
+    from nanobot.utils.llm_runtime import LLMRuntime
 
 
 @dataclass(frozen=True)
@@ -34,25 +39,61 @@ class TurnRoute:
 
 
 TurnRoutePolicy = Callable[[InboundMessage, str, TurnRoute], TurnRoute]
-ProgressCallback = Callable[..., Awaitable[None]]
-StreamCallback = Callable[[str], Awaitable[None]]
-StreamEndCallback = Callable[..., Awaitable[None]]
-RetryWaitCallback = Callable[[str], Awaitable[None]]
+
+
+class OutboundPublisher(Protocol):
+    def __call__(
+        self,
+        outbound: OutboundMessage,
+        *,
+        actor: str | None = None,
+        inbound: InboundMessage | None = None,
+        action: str = "turn.response",
+    ) -> Awaitable[None]: ...
+
+
+def _bind_events(
+    bus: MessageBus, route: TurnRoute,
+) -> EventSink:
+    channel, chat_id = route.channel, route.chat_id
+    metadata = deepcopy(route.metadata)
+
+    def accepts(event_type: type[AgentEvent]) -> bool:
+        return notification_is_deliverable(
+            event_type, channel=channel, publish_lifecycle=route.publish_lifecycle,
+        )
+
+    async def publish(event: AgentEvent) -> None:
+        if not accepts(type(event)):
+            return
+        await bus.publish_event(
+            event, channel=channel, chat_id=chat_id, metadata=deepcopy(metadata),
+        )
+
+    return EventSink(publish, accepts)
+
+
+def _turn_outcome(stop_reason: object) -> tuple[str, str | None]:
+    if stop_reason == "error":
+        return "failed", "model"
+    if stop_reason == "tool_error":
+        return "failed", "tool"
+    return "completed", None
 
 
 class TurnDeliveryFactory:
-    """Create per-turn delivery objects from an optional edge-owned route policy."""
+    """Route turn delivery and session-level notifications."""
 
     def __init__(
         self,
         bus: MessageBus,
-        runtime_events: RuntimeEventBus,
         route_policy: TurnRoutePolicy | None = None,
+        outbound_publisher: OutboundPublisher | None = None,
     ) -> None:
         self.bus = bus
-        self.runtime_events = runtime_events
-        self.runtime_event_publisher = RuntimeEventPublisher(runtime_events)
+        self.runtime_event_publisher = RuntimeEventPublisher(bus)
         self.route_policy = route_policy
+        self.outbound_publisher = outbound_publisher
 
     def create(
         self,
@@ -64,7 +105,7 @@ class TurnDeliveryFactory:
         route = self._default_route(msg, session_key)
         if self.route_policy is not None:
             route = self.route_policy(msg, session_key, route)
-            if not isinstance(route, TurnRoute):
+            if not isinstance(cast(object, route), TurnRoute):
                 raise TypeError("turn route policy must return TurnRoute")
         return TurnDelivery(
             bus=self.bus,
@@ -73,6 +114,7 @@ class TurnDeliveryFactory:
             session_key=session_key,
             route=route,
             enable_stream=enable_stream,
+            outbound_publisher=self.outbound_publisher,
         )
 
     def unrouted(self, msg: InboundMessage, session_key: str) -> TurnDelivery:
@@ -87,7 +129,40 @@ class TurnDeliveryFactory:
                 chat_id=msg.chat_id,
                 metadata=dict(msg.metadata or {}),
             ),
+            outbound_publisher=self.outbound_publisher,
         )
+
+    def session_events(
+        self,
+        session_key: str,
+        session_metadata: dict[str, Any],
+    ) -> EventSink:
+        """Bind idle notifications to one route without acquiring a turn owner."""
+        saved_route = session_metadata.get("_compaction_route")
+        if isinstance(saved_route, dict):
+            saved_route = cast(dict[str, Any], saved_route)
+            channel, chat_id = saved_route.get("channel"), saved_route.get("chat_id")
+            metadata = saved_route.get("metadata", {})
+            if not isinstance(channel, str) or not isinstance(chat_id, str):
+                return EventSink()
+            if not isinstance(metadata, dict):
+                return EventSink()
+            metadata = cast(dict[str, Any], metadata)
+        else:
+            # Older sessions have no route snapshot. Only direct clients have a
+            # session key that is also an unambiguous delivery address.
+            route = (
+                last_channel_from_metadata(session_metadata)
+                if session_key == UNIFIED_SESSION_KEY
+                else tuple(session_key.split(":", 1))
+            )
+            if not route or len(route) != 2 or route[0] not in {"websocket", "cli"}:
+                return EventSink()
+            channel, chat_id = route
+            metadata = {}
+        metadata = deepcopy(metadata)
+
+        return _bind_events(self.bus, TurnRoute(channel, chat_id, metadata))
 
     @staticmethod
     def _default_route(msg: InboundMessage, session_key: str) -> TurnRoute:
@@ -124,37 +199,26 @@ class TurnDelivery:
     session_key: str
     route: TurnRoute
     enable_stream: bool = False
+    outbound_publisher: OutboundPublisher | None = None
     delivery_message: InboundMessage = field(init=False)
     lifecycle_message: InboundMessage = field(init=False)
     _stream_base_id: str | None = field(init=False, default=None)
     _stream_segment: int = field(init=False, default=0)
+    _stream_open: bool = field(init=False, default=False)
+    events: EventSink = field(init=False)
+    _routed_events: EventSink = field(init=False)
+    _stop_reason: str | None = field(init=False, default=None)
+    _failure_error_kind: str | None = field(init=False, default=None)
+    _retry_status: RetryStatusEvent | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
-        route_metadata = dict(self.route.metadata)
-        for key in (
-            RUNTIME_REQUEST_CONTEXT_KEY,
-            "_runtime_actor",
-            "_runtime_action",
-            "_runtime_inbound_channel",
-            "_runtime_inbound_chat_id",
-        ):
-            route_metadata.pop(key, None)
-        if self.input_message.actor:
-            route_metadata[RUNTIME_REQUEST_CONTEXT_KEY] = RequestContext(
-                channel=self.input_message.channel,
-                chat_id=self.input_message.chat_id,
-                message_id=(self.input_message.metadata or {}).get("message_id"),
-                session_key=self.session_key,
-                original_user_text=self.input_message.content,
-                metadata={"actor": self.input_message.actor},
-                sender_id=self.input_message.sender_id,
-                actor=self.input_message.actor,
-            )
+        self._routed_events = _bind_events(self.bus, self.route)
+        self.events = EventSink(self._publish_event, self._routed_events.accepts)
         self.delivery_message = dataclasses.replace(
             self.input_message,
             channel=self.route.channel,
             chat_id=self.route.chat_id,
-            metadata=route_metadata,
+            metadata=dict(self.route.metadata),
         )
         self.lifecycle_message = (
             self.delivery_message if self.route.publish_lifecycle else self.input_message
@@ -163,34 +227,17 @@ class TurnDelivery:
             self._stream_base_id = f"{self.session_key}:{time.time_ns()}"
 
     @property
-    def on_stream(self) -> StreamCallback | None:
-        return self._publish_stream if self._stream_base_id is not None else None
+    def streaming(self) -> bool:
+        return self._stream_base_id is not None
 
-    @property
-    def on_stream_end(self) -> StreamEndCallback | None:
-        return self._publish_stream_end if self._stream_base_id is not None else None
-
-    def progress_callback(self) -> ProgressCallback | None:
-        if not self.route.publish_lifecycle:
-            return None
-        return build_bus_progress_callback(self.bus, self.delivery_message)
-
-    def retry_wait_callback(self) -> RetryWaitCallback | None:
-        if not self.route.publish_lifecycle:
-            return None
-
-        async def _on_retry_wait(content: str) -> None:
-            await self.bus.publish_outbound(
-                outbound_message_for_event(
-                    channel=self.delivery_message.channel,
-                    chat_id=self.delivery_message.chat_id,
-                    event=RetryWaitEvent(content=content),
-                    metadata=self.delivery_message.metadata,
-                ),
-                action="message.send",
-            )
-
-        return _on_retry_wait
+    def remember_session_route(self, session_metadata: dict[str, Any]) -> None:
+        """Keep only routing fields needed to deliver a later idle notification."""
+        # Keep the storage key readable by older gateways.
+        session_metadata["_compaction_route"] = {
+            "channel": self.route.channel,
+            "chat_id": self.route.chat_id,
+            "metadata": notification_metadata(self.route.channel, self.route.metadata),
+        }
 
     async def started(self) -> None:
         if self.route.publish_lifecycle:
@@ -208,11 +255,31 @@ class TurnDelivery:
                 started_at=started_at,
             )
 
-    def record_runtime(self, runtime: Any) -> None:
+    async def runtime_admitted(self, runtime: LLMRuntime) -> None:
+        """Record the immutable runtime and expose it at the lifecycle seam."""
+        if self.route.publish_lifecycle:
+            await self.runtime_event_publisher.turn_runtime_admitted(
+                self.delivery_message,
+                self.session_key,
+                runtime,
+            )
+            return
         self.runtime_event_publisher.record_turn_runtime(self.session_key, runtime)
 
     def record_latency(self, latency_ms: int | None) -> None:
         self.runtime_event_publisher.record_turn_latency(self.session_key, latency_ms)
+
+    def record_usage(self, round_usages: list[LLMUsage]) -> None:
+        self.runtime_event_publisher.record_turn_usage(self.session_key, round_usages)
+
+    def record_stop_reason(
+        self,
+        stop_reason: str,
+        *,
+        failure_error_kind: str | None = None,
+    ) -> None:
+        self._stop_reason = stop_reason
+        self._failure_error_kind = failure_error_kind
 
     def background_response(
         self,
@@ -246,39 +313,52 @@ class TurnDelivery:
         *,
         publish_completion: bool,
     ) -> None:
+        stop_reason = self._stop_reason
+        if stop_reason is None and response is not None:
+            stop_reason = cast(str | None, response.metadata.get("_stop_reason"))
         completed_channel = self.lifecycle_message.channel
         completed_chat_id = self.lifecycle_message.chat_id
         if response is not None:
-            await self.bus.publish_outbound(response, action="message.send")
             completed_channel = response.channel
             completed_chat_id = response.chat_id
+            if response.channel != "websocket" or stop_reason != "error":
+                await self._publish_outbound(response, "turn.response")
         elif self.lifecycle_message.channel == "cli":
-            await self.bus.publish_outbound(
+            await self._publish_outbound(
                 OutboundMessage(
                     channel=self.lifecycle_message.channel,
                     chat_id=self.lifecycle_message.chat_id,
                     content="",
                     metadata=dict(self.lifecycle_message.metadata or {}),
                 ),
-                action="message.send",
+                "turn.response",
             )
         if publish_completion:
+            outcome, failure_kind = _turn_outcome(stop_reason)
             await self.runtime_event_publisher.turn_completed(
                 channel=completed_channel,
                 chat_id=completed_chat_id,
                 session_key=self.session_key,
                 metadata=self.lifecycle_message.metadata,
+                outcome=outcome,
+                failure_kind=failure_kind,
+                failure_error_kind=(self._failure_error_kind or (
+                    self._retry_status.error_kind if failure_kind == "model" and self._retry_status else None
+                )),
+                failure_attempts=(
+                    self._retry_status.attempt if failure_kind == "model" and self._retry_status else None
+                ),
             )
 
     async def fail(self, *, publish_completion: bool) -> None:
-        await self.bus.publish_outbound(
+        await self._publish_outbound(
             OutboundMessage(
                 channel=self.lifecycle_message.channel,
                 chat_id=self.lifecycle_message.chat_id,
                 content="Sorry, I encountered an error.",
                 metadata=dict(self.lifecycle_message.metadata or {}),
             ),
-            action="message.send",
+            "turn.error",
         )
         if publish_completion:
             await self.runtime_event_publisher.turn_completed(
@@ -286,6 +366,8 @@ class TurnDelivery:
                 chat_id=self.lifecycle_message.chat_id,
                 session_key=self.session_key,
                 metadata=self.lifecycle_message.metadata,
+                outcome="failed",
+                failure_kind="internal",
             )
 
     async def idle(self) -> None:
@@ -300,28 +382,33 @@ class TurnDelivery:
         assert self._stream_base_id is not None
         return f"{self._stream_base_id}:{self._stream_segment}"
 
-    async def _publish_stream(self, delta: str) -> None:
-        await self.bus.publish_outbound(
-            outbound_message_for_event(
-                channel=self.delivery_message.channel,
-                chat_id=self.delivery_message.chat_id,
-                event=StreamDeltaEvent(content=delta, stream_id=self._stream_id()),
-                metadata=self.delivery_message.metadata,
-            ),
-            action="message.send",
-        )
+    async def _publish_event(self, event: AgentEvent) -> None:
+        if isinstance(event, RetryStatusEvent):
+            self._retry_status = event if event.state == "exhausted" else None
+        if isinstance(event, StreamDeltaEvent | StreamEndEvent):
+            if not self.streaming:
+                return
+            event = dataclasses.replace(event, stream_id=self._stream_id())
+        if self._routed_events.publish is not None:
+            await self._routed_events.publish(event)
+        if isinstance(event, StreamDeltaEvent):
+            self._stream_open = True
+        elif isinstance(event, StreamEndEvent):
+            self._stream_open = event.merge_next
+            if not event.merge_next:
+                self._stream_segment += 1
 
-    async def _publish_stream_end(self, *, resuming: bool = False) -> None:
-        await self.bus.publish_outbound(
-            outbound_message_for_event(
-                channel=self.delivery_message.channel,
-                chat_id=self.delivery_message.chat_id,
-                event=StreamEndEvent(
-                    stream_id=self._stream_id(),
-                    resuming=resuming,
-                ),
-                metadata=self.delivery_message.metadata,
-            ),
-            action="message.send",
-        )
-        self._stream_segment += 1
+    async def _publish_outbound(self, message: OutboundMessage, action: str) -> None:
+        if self.outbound_publisher is not None:
+            await self.outbound_publisher(
+                message,
+                inbound=self.input_message,
+                action=action,
+            )
+            return
+        await self.bus.publish_outbound(message)
+
+    async def abort_stream(self) -> None:
+        """Close an interrupted stream so stateful channels can release its buffer."""
+        if self._stream_open:
+            await self._publish_event(StreamEndEvent())

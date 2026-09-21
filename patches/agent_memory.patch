@@ -1,11 +1,11 @@
-# nanobot baseline: 0.3.0
-# upstream commit: 3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
-diff --git aa/nanobot/nanobot/agent/memory.py bb/nanobot/nanobot/agent/memory.py
-index 4e6c2e0..f528c73 100644
---- aa/nanobot/nanobot/agent/memory.py
-+++ bb/nanobot/nanobot/agent/memory.py
-@@ -3,6 +3,7 @@
+diff --git a/nanobot/nanobot/agent/memory.py b/nanobot/nanobot/agent/memory.py
+index 0e738e3..48055fd 100644
+--- a/nanobot/nanobot/agent/memory.py
++++ b/nanobot/nanobot/agent/memory.py
+@@ -8,12 +8,15 @@
  from __future__ import annotations
  
  import asyncio
@@ -13,239 +13,235 @@ index 4e6c2e0..f528c73 100644
  import json
  import os
  import re
-@@ -15,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator
- 
- from loguru import logger
- 
-+from nanobot.runtime_adapters import ArchiveHandler, ArchiveResult
- from nanobot.runtime_context import public_history_messages
- from nanobot.session.manager import Session, SessionManager
- from nanobot.utils.gitstore import GitStore
-@@ -753,6 +755,7 @@ class Consolidator:
+ import threading
+ import weakref
+-from contextlib import suppress
++from collections.abc import Mapping, Sequence
++from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
++from copy import deepcopy
+ from datetime import datetime
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any, Callable, Iterator, cast
+@@ -769,22 +772,44 @@
+         build_messages: Callable[..., list[dict[str, Any]]],
          get_tool_definitions: Callable[[], list[dict[str, Any]]],
-         consolidation_ratio: float = 0.5,
-         unified_session: bool = False,
-+        archive_handler: ArchiveHandler | None = None,
+         resolve_prompt_context: Callable[[Session], tuple[str | None, Path | None]] | None = None,
++        archive_handler: Callable[
++            [str, Sequence[Mapping[str, Any]]], Any
++        ] | None = None,
++        archive_owner: Callable[[str], str | None] | None = None,
+     ) -> None:
+         self.store = store
+         self._build_messages = build_messages
+         self._get_tool_definitions = get_tool_definitions
+         self._resolve_prompt_context = resolve_prompt_context
+-
+-    def _raw_checkpoint(
++        self._archive_handler = archive_handler
++        self._archive_owner = archive_owner
++
++    async def _commit_source(self, messages: list[dict[str, Any]], session_key: str) -> bool:
++        if self._archive_handler is None:
++            return True
++        owner = self._archive_owner(session_key) if self._archive_owner is not None else None
++        if not isinstance(owner, str) or not owner:
++            return False
++        result = self._archive_handler(owner, messages)
++        if inspect.isawaitable(result):
++            result = await result
++        return bool(getattr(result, "committed", False))
++
++    async def _raw_checkpoint(
+         self,
+         messages: list[dict[str, Any]],
+         *,
+         session_key: str,
+         previous_summary: str | None,
+         max_tokens: int,
+-    ) -> str:
++    ) -> str | None:
+         """Persist the failed chunk and return a bounded replacement checkpoint."""
+-        raw = self.store.raw_archive(messages, session_key=session_key)
++        if not await self._commit_source(messages, session_key):
++            return None
++        if self._archive_handler is None:
++            raw = self.store.raw_archive(messages, session_key=session_key)
++        else:
++            raw = json.dumps(messages, ensure_ascii=False, sort_keys=True, default=str)
+         return self._combine_raw_checkpoint(
+             raw,
+             previous_summary=previous_summary,
+@@ -840,8 +865,8 @@
+         if not source_messages:
+             return None
+ 
+-        def raw_fallback() -> str:
+-            return self._raw_checkpoint(
++        async def raw_fallback() -> str | None:
++            return await self._raw_checkpoint(
+                 source_messages,
+                 session_key=session_key,
+                 previous_summary=previous_summary,
+@@ -882,7 +907,7 @@
+                 context_window_tokens=runtime.context_window_tokens,
+             )
+             if provider_context is None or provider_context.conversation_state is None:
+-                return raw_fallback()
++                return await raw_fallback()
+             call_tools = []
+         else:
+             request_messages = [
+@@ -904,7 +929,7 @@
+                     input_token_budget,
+                     source,
+                 )
+-                return raw_fallback()
++                return await raw_fallback()
+ 
+         response: LLMResponse | None = None
+         for attempt in range(2):
+@@ -925,7 +950,7 @@
+                     "Memory archive {} failed, raw-dumping to history",
+                     phase,
+                 )
+-                return raw_fallback()
++                return await raw_fallback()
+             if response.should_execute_tools is not True or attempt == 1:
+                 break
+ 
+@@ -970,26 +995,28 @@
+                     context_window_tokens=runtime.context_window_tokens,
+                 )
+                 if provider_context is None or provider_context.conversation_state is None:
+-                    return raw_fallback()
++                    return await raw_fallback()
+         assert response is not None
+         if response.finish_reason in {"error", "length"}:
+             logger.warning(
+                 "Memory archive provider did not complete ({}), raw-dumping to history",
+                 response.finish_reason,
+             )
+-            return raw_fallback()
++            return await raw_fallback()
+         if response.has_tool_calls is True:
+             logger.warning("Memory archive provider returned tool calls, raw-dumping to history")
+-            return raw_fallback()
++            return await raw_fallback()
+         summary = response.content
+         if not summary or not summary.strip():
+             logger.warning("Memory archive provider returned no summary, raw-dumping to history")
+-            return raw_fallback()
++            return await raw_fallback()
+         summary = self.store._normalize_history_entry(summary)
+         if not summary:
+             logger.warning("Memory archive provider summary was not safe to replay, raw-dumping")
+-            return raw_fallback()
+-        if summary != "(nothing)":
++            return await raw_fallback()
++        if not await self._commit_source(source_messages, session_key):
++            return None
++        if summary != "(nothing)" and self._archive_handler is None:
+             self.store.append_history(summary, session_key=session_key)
+         return summary
+ 
+@@ -1019,7 +1046,7 @@
+                 "Memory archive has no safe input budget for {}; raw-dumping",
+                 session.key,
+             )
+-            return self._raw_checkpoint(
++            return await self._raw_checkpoint(
+                 messages,
+                 session_key=session.key,
+                 previous_summary=previous_summary,
+@@ -1040,7 +1067,7 @@
+                 "Memory archive cannot replay the full chunk for {}; raw-dumping",
+                 session.key,
+             )
+-            return self._raw_checkpoint(
++            return await self._raw_checkpoint(
+                 messages,
+                 session_key=session.key,
+                 previous_summary=previous_summary,
+@@ -1081,6 +1108,12 @@
+         build_messages: Callable[..., list[dict[str, Any]]],
+         get_tool_definitions: Callable[[], list[dict[str, Any]]],
+         resolve_prompt_context: Callable[[Session], tuple[str | None, Path | None]] | None = None,
++        archive_handler: Callable[
++            [str, Sequence[Mapping[str, Any]]], Any
++        ] | None = None,
++        archive_owner: Callable[[str], str | None] | None = None,
++        lock_provider: Callable[[str], asyncio.Lock] | None = None,
++        lock_context_provider: Callable[[str], AbstractAsyncContextManager[None]] | None = None,
      ):
          self.store = store
          self.sessions = sessions
-@@ -760,6 +763,8 @@ class Consolidator:
-         self.unified_session = unified_session
-         self._build_messages = build_messages
-         self._get_tool_definitions = get_tool_definitions
-+        self.archive_handler = archive_handler
-+        self._last_archive_result = ArchiveResult(committed=True)
+@@ -1091,14 +1124,29 @@
+             build_messages=build_messages,
+             get_tool_definitions=get_tool_definitions,
+             resolve_prompt_context=resolve_prompt_context,
++            archive_handler=archive_handler,
++            archive_owner=archive_owner,
+         )
          self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
              weakref.WeakValueDictionary()
          )
-@@ -768,6 +773,26 @@ class Consolidator:
++        self._lock_provider = lock_provider
++        self._lock_context_provider = lock_context_provider
+ 
+     def get_lock(self, session_key: str) -> asyncio.Lock:
          """Return the shared consolidation lock for one session."""
++        if self._lock_provider is not None:
++            return self._lock_provider(session_key)
          return self._locks.setdefault(session_key, asyncio.Lock())
++
++    @asynccontextmanager
++    async def _session_lock(self, session_key: str):
++        if self._lock_context_provider is not None:
++            async with self._lock_context_provider(session_key):
++                yield
++            return
++        async with self.get_lock(session_key):
++            yield
  
-+    @property
-+    def last_archive_result(self) -> ArchiveResult:
-+        """Return the outcome of the most recent archive call."""
-+        return self._last_archive_result
-+
-+    @staticmethod
-+    def _session_owner(session: Session) -> str:
-+        owner = session.metadata.get("actor") if isinstance(session.metadata, dict) else None
-+        return owner.strip() if isinstance(owner, str) else ""
-+
-+    async def _save_session(self, session: Session) -> None:
-+        """Use the async cap boundary when the session manager provides it."""
-+        saver = getattr(self.sessions, "save_async", None)
-+        if callable(saver):
-+            result = saver(session)
-+            if inspect.isawaitable(result):
-+                await result
-+                return
-+        self.sessions.save(session)
-+
-     def pick_consolidation_boundary(
+     async def summarize_transcript(
          self,
-         session: Session,
-@@ -793,12 +818,14 @@ class Consolidator:
-     @staticmethod
-     def _full_unconsolidated_history(
-         session: Session,
-+        *,
-+        actor: str | None = None,
-     ) -> list[dict[str, Any]]:
-         """Return the whole unconsolidated tail for consolidation decisions."""
-         unconsolidated_count = len(session.messages) - session.last_consolidated
-         if unconsolidated_count <= 0:
-             return []
--        return session.get_history(max_messages=unconsolidated_count)
-+        return session.get_history(max_messages=unconsolidated_count, actor=actor)
- 
-     @staticmethod
-     def _replay_overflow_boundary(
-@@ -861,9 +888,17 @@ class Consolidator:
-             chunk,
-             runtime=runtime,
-             session_key=session.key,
-+            owner=self._session_owner(session),
-         )
-+        if not self.last_archive_result.committed:
-+            logger.warning(
-+                "Replay-window archive not committed for {}; cursor remains at {}",
-+                session.key,
-+                session.last_consolidated,
-+            )
-+            return None
-         session.last_consolidated = end_idx
--        self.sessions.save(session)
-+        await self._save_session(session)
-         return summary
- 
-     def _persist_last_summary(self, session: Session, summary: str | None) -> None:
-@@ -872,7 +907,9 @@ class Consolidator:
-                 "text": summary,
-                 "last_active": session.updated_at.isoformat(),
-             }
--            self.sessions.save(session)
-+            # The enclosing async consolidation/save boundary owns file-cap
-+            # archiving; do not invoke a sync Familia hook here.
-+            self.sessions.save(session, skip_file_cap=True)
- 
-     def estimate_session_prompt_tokens(
-         self,
-@@ -881,7 +918,10 @@ class Consolidator:
-         runtime: LLMRuntime,
-     ) -> tuple[int, str]:
-         """Estimate prompt size from the full unconsolidated session tail."""
--        history = self._full_unconsolidated_history(session)
-+        history = self._full_unconsolidated_history(
-+            session,
-+            actor=self._session_owner(session) or None,
-+        )
-         channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
-         # Include archived summary in estimation so the budget accounts for it.
-         meta = session.metadata.get("_last_summary")
-@@ -925,6 +965,7 @@ class Consolidator:
-         *,
-         runtime: LLMRuntime,
-         session_key: str | None = None,
-+        owner: str | None = None,
-         summary_messages: list[dict] | None = None,
-     ) -> str | None:
-         """Summarize messages via LLM and append to history.jsonl.
-@@ -937,6 +978,15 @@ class Consolidator:
-         Returns the summary text on success, None if nothing to archive.
+@@ -1232,8 +1280,7 @@
+         ``max_suffix`` is accepted for SDK compatibility and no longer retains
+         archived messages. All compaction triggers share checkpoint replay.
          """
-         if not messages:
-+            self._last_archive_result = ArchiveResult(committed=True)
-+            return None
-+        if self.archive_handler is not None:
-+            result = self.archive_handler(owner or "", messages)
-+            if inspect.isawaitable(result):
-+                result = await result
-+            if not isinstance(result, ArchiveResult):
-+                raise TypeError("archive handler must return ArchiveResult")
-+            self._last_archive_result = result
-             return None
-         messages_to_summarize = public_history_messages(
-             summary_messages if summary_messages is not None else messages
-@@ -965,11 +1015,21 @@ class Consolidator:
+-        lock = self.get_lock(session_key)
+-        async with lock:
++        async with self._session_lock(session_key):
+             self.sessions.invalidate(session_key)
+             session = self.sessions.get_or_create(session_key)
+ 
+@@ -1252,6 +1299,12 @@
              )
-         except Exception:
-             logger.warning("Consolidation provider call failed, raw-dumping to history")
--            self.store.raw_archive(messages, session_key=session_key)
-+            try:
-+                self.store.raw_archive(messages, session_key=session_key)
-+            except Exception:
-+                self._last_archive_result = ArchiveResult(committed=False, retryable=True)
-+                return None
-+            self._last_archive_result = ArchiveResult(committed=True)
-             return None
-         if response.finish_reason == "error":
-             logger.warning("Consolidation provider returned an error, raw-dumping to history")
--            self.store.raw_archive(messages, session_key=session_key)
-+            try:
-+                self.store.raw_archive(messages, session_key=session_key)
-+            except Exception:
-+                self._last_archive_result = ArchiveResult(committed=False, retryable=True)
-+                return None
-+            self._last_archive_result = ArchiveResult(committed=True)
-             return None
-         summary = response.content or "[no summary]"
-         self.store.append_history(
-@@ -977,6 +1037,7 @@ class Consolidator:
-             max_chars=_ARCHIVE_SUMMARY_MAX_CHARS,
-             session_key=session_key,
-         )
-+        self._last_archive_result = ArchiveResult(committed=True)
-         return summary
- 
-     async def maybe_consolidate_by_tokens(
-@@ -1062,15 +1123,19 @@ class Consolidator:
-                     chunk,
-                     runtime=runtime,
-                     session_key=session.key,
-+                    owner=self._session_owner(session),
-                 )
--                # Advance the cursor either way: on success the chunk was
--                # summarized; on failure archive() already raw-archived it as
--                # a breadcrumb. Re-archiving the same chunk on the next call
--                # would just emit duplicate [RAW] entries.
-+                if not self.last_archive_result.committed:
-+                    logger.warning(
-+                        "Token archive not committed for {}; cursor remains at {}",
-+                        session.key,
-+                        session.last_consolidated,
-+                    )
-+                    break
-                 if summary:
-                     last_summary = summary
-                 session.last_consolidated = end_idx
--                self.sessions.save(session)
-+                await self._save_session(session)
-                 if not summary:
-                     # LLM is degraded — stop hammering it this call;
-                     # the next invocation can retry a fresh chunk.
-@@ -1109,7 +1174,7 @@ class Consolidator:
- 
-             messages_to_summarize = list(session.messages[session.last_consolidated:])
-             if not messages_to_summarize:
--                self.sessions.save(session)
-+                await self._save_session(session)
-                 return ""
- 
-             probe = Session(
-@@ -1125,7 +1190,7 @@ class Consolidator:
-             messages_to_remove = result.dropped[result.already_consolidated_count:]
- 
-             if not messages_to_remove and not messages_to_keep:
--                self.sessions.save(session)
-+                await self._save_session(session)
-                 return ""
- 
              last_active = session.updated_at
-@@ -1137,8 +1202,16 @@ class Consolidator:
-                     messages_to_remove,
-                     runtime=runtime,
-                     session_key=session_key,
-+                    owner=self._session_owner(session),
-                     summary_messages=messages_to_summarize,
-                 )
-+                if not self.last_archive_result.committed:
-+                    logger.warning(
-+                        "Idle-session archive not committed for {}; keeping messages",
-+                        session_key,
-+                    )
-+                    await self._save_session(session)
-+                    return None
- 
-             if summary and summary != "(nothing)":
-                 session.metadata["_last_summary"] = {
-@@ -1148,7 +1221,7 @@ class Consolidator:
- 
-             session.messages = messages_to_keep
-             session.last_consolidated = 0
--            self.sessions.save(session)
-+            await self._save_session(session)
- 
-             if messages_to_remove:
-                 logger.info(
-
+             archive_end = archive_start + len(messages_to_archive)
++            original_messages = list(session.messages)
++            original_metadata = deepcopy(session.metadata)
++            original_last_archived = session.last_archived
++            original_provider_state = session.provider_state
++            original_updated_at = session.updated_at
++            summary: str | None = None
+             try:
+                 summary = await self.archive_session(
+                     session, archive_end=archive_end, runtime=runtime,
+@@ -1265,6 +1318,16 @@
+                     session.provider_state = None
+                     self.sessions.save(session)
+             except (Exception, asyncio.CancelledError) as exc:
++                # The checkpoint is a transaction: a failed durable write must
++                # leave the live object replayable at the old boundary.
++                session.messages = original_messages
++                session.metadata = original_metadata
++                session.last_archived = original_last_archived
++                session.provider_state = original_provider_state
++                session.updated_at = original_updated_at
++                remember = getattr(self.sessions, "_remember", None)
++                if callable(remember):
++                    remember(session)
+                 await events.emit(
+                     ContextCompactionEvent(
+                         compaction_id=compaction_id,
