@@ -6,6 +6,7 @@ openspec/
 !docker-compose.memx.local.yml
 .tmp-*
 _tmp_*
+/NUL
 audit_*.txt
 audit_*.jsonl
 
