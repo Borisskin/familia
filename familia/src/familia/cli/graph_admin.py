@@ -49,7 +49,6 @@ from familia.acl.schema import (
 )
 from familia.cli.model_catalog import (
     CatalogRequest,
-    CatalogSnapshot,
     list_providers,
     load_catalog,
     provider_key_for_model,

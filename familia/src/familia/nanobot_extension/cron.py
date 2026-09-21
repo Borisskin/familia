@@ -26,6 +26,7 @@ from familia.principals import (
     set_current_channel,
 )
 
+
 def _identity_matches(identity: Any, channel: str, chat_id: str) -> bool:
     if getattr(identity, "channel", None) != channel:
         return False
@@ -94,7 +95,7 @@ def make_cron_job_access(
         if isinstance(tags, list) and tags:
             try:
                 return bool(set(tags) & set(reachable_tags(actor) or ()))
-            except Exception:
+            except Exception:  # noqa: BLE001
                 return False
         return False
 
@@ -318,12 +319,12 @@ class _CronDeliveryObserver:
 
     async def _publish_next(self, context: _CronDeliveryContext, message: Any) -> None:
         from nanobot.agent.outbound import OutboundDecision
-        from nanobot.bus.events import InboundMessage
         from nanobot.agent.tools.context import (
             RequestContext,
             bind_request_context,
             reset_request_context,
         )
+        from nanobot.bus.events import InboundMessage
 
         if context.candidate_index >= len(context.candidates):
             context.finished = True
@@ -358,7 +359,7 @@ class _CronDeliveryObserver:
                 inbound=inbound,
                 action="message.send",
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.exception("Cron delivery fallback could not enter outbound policy")
             context.finished = True
             return
@@ -403,7 +404,7 @@ def make_cron_delivery_observer(
 ) -> Callable[[Any, str], Any]:
     """Create and attach the one process-local observer for bound cron runs."""
     observer = _CronDeliveryObserver(publish_outbound, enabled_channels)
-    setattr(cron, "_familia_cron_delivery_observer", observer)
+    cron._familia_cron_delivery_observer = observer
     return observer
 
 

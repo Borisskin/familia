@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from .session_migration import (
+    SOURCE_SNAPSHOT_DIR,
     MigrationPlan,
     MigrationResult,
-    SOURCE_SNAPSHOT_DIR,
     analyze_sessions,
     apply_migration,
 )

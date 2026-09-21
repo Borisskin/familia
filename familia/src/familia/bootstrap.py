@@ -102,9 +102,8 @@ def _server_actor(msg: Any) -> str | None:
             return None
         if is_server_cron and get_registry().resolve_unique(channel, sender_id) is None:
             return None
-        if resolved is not None and supplied != resolved:
-            if not (is_server_cron and supplied == trusted_actor):
-                return None
+        if resolved is not None and supplied != resolved and not (is_server_cron and supplied == trusted_actor):
+            return None
         return supplied
     if trusted is not None:
         return trusted_actor

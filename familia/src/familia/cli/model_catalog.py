@@ -11,9 +11,10 @@ import hashlib
 import json
 import os
 import time
+from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, Mapping, MutableMapping, Sequence
+from typing import Any, Literal
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -88,7 +89,7 @@ class CatalogRequest:
     current_model: str | None = None
 
     @classmethod
-    def from_value(cls, value: "CatalogRequest | Mapping[str, Any]") -> "CatalogRequest":
+    def from_value(cls, value: CatalogRequest | Mapping[str, Any]) -> CatalogRequest:
         if isinstance(value, cls):
             return value
         return cls(
@@ -152,7 +153,7 @@ def _provider_specs() -> tuple[Any, ...]:
         from nanobot.providers.registry import PROVIDERS
 
         return tuple(PROVIDERS)
-    except Exception:  # pragma: no cover - only used by a missing optional host
+    except Exception:  # noqa: BLE001  # pragma: no cover - only used by a missing optional host
         return ()
 
 
@@ -161,7 +162,7 @@ def _transcription_specs() -> tuple[Any, ...]:
         from nanobot.audio.transcription_registry import TRANSCRIPTION_PROVIDERS
 
         return tuple(TRANSCRIPTION_PROVIDERS)
-    except Exception:  # pragma: no cover - only used by a missing optional host
+    except Exception:  # noqa: BLE001  # pragma: no cover - only used by a missing optional host
         return ()
 
 
@@ -321,7 +322,6 @@ def _agent_slot_values(config: Any) -> tuple[tuple[str, str], ...]:
 
 
 def _current_values(config: Any, kind: CatalogKind) -> tuple[str, str]:
-    raw = _config_mapping(config)
     if kind == "transcription":
         transcription = _config_section(config, "transcription")
         channels = _config_section(config, "channels")
@@ -628,7 +628,7 @@ def load_catalog(
         pair = _dynamic_chat_pair(req.provider)
     if pair is None:
         return _snapshot(req, status="unsupported", source="none", message="Каталог для поставщика не поддерживается")
-    spec, meta = pair
+    _spec, meta = pair
     section = _provider_config_for(config, req.kind, req.provider)
     api_key = req.api_key if req.api_key is not None else _value(section, "api_key", "apiKey")
     api_base = (req.api_base if req.api_base is not None else _value(section, "api_base", "apiBase")) or meta.default_api_base
@@ -678,7 +678,7 @@ def load_catalog(
                 {"id": item.id, "label": getattr(item, "label", ""), "purpose": "chat"}
                 for item in oauth.models
             ]
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("OAuth model catalog failed: type={}", type(exc).__name__)
             if isinstance(old, Mapping):
                 models = _cached_models(old)
@@ -702,7 +702,7 @@ def load_catalog(
             models = _cached_models(old)
             return _snapshot(req, status="rejected", source="stale", models=models, fetched_at_ms=int(old.get("fetched_at_ms") or 0), stale=True, message=_safe_message(exc))
         return _snapshot(req, status="rejected", source="none", message=_safe_message(exc))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning("Model catalog refresh failed: provider={} kind={} type={}", req.provider, req.kind, type(exc).__name__)
         if isinstance(old, Mapping):
             models = _cached_models(old)
