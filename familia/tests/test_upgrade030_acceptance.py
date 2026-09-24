@@ -212,7 +212,8 @@ def test_admin_model_config_round_trip_keeps_fallback_and_uses_main(
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     assert raw["agents"]["defaults"]["model"] == "openai/main-selected"
     assert raw["agents"]["defaults"]["unknownFamiliaField"] == {"keep": True}
-    assert raw["agents"]["familia_fallback"]["model"] == "openai/fallback-selected"
+    assert raw["agents"]["defaults"]["fallback_models"][0]["model"] == "openai/fallback-selected"
+    assert "familia_fallback" not in raw["agents"]
 
     result = graph_admin.main(["agents", "get", "--json"])
     assert result == 0
