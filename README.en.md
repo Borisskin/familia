@@ -10,9 +10,9 @@ or kids.
   <img src=".github/assets/familia-readme.jpg" alt="Familia assistant preview" width="960">
 </p>
 
-Repo: <https://github.com/Verconto/familia>. Latest published
-[release — `v0.5.73`](https://github.com/Verconto/familia/releases/tag/v0.5.73),
-backend `0.4.2`.
+Repo: <https://github.com/Verconto/familia>. Current source versions:
+admin build `v0.5.74`, backend `0.4.3`. [Latest published
+release](https://github.com/Verconto/familia/releases/latest).
 
 ## Try it live
 

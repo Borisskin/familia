@@ -10,9 +10,9 @@ Telegram и ВКонтакте, помнит каждого отдельно, и
   <img src=".github/assets/familia-readme.jpg" alt="Изображение семейного ИИ-помощника Familia" width="960">
 </p>
 
-Репозиторий: <https://github.com/Verconto/familia>. Последний опубликованный
-[релиз — `v0.5.73`](https://github.com/Verconto/familia/releases/tag/v0.5.73),
-серверная часть `0.4.2`.
+Репозиторий: <https://github.com/Verconto/familia>. Текущие исходники:
+сборка админки `v0.5.74`, серверная часть `0.4.3`. [Последний опубликованный
+выпуск](https://github.com/Verconto/familia/releases/latest).
 
 ## Попробовать вживую
 
