@@ -51,7 +51,13 @@ from familia.cli.model_catalog import (
     CatalogRequest,
     list_providers,
     load_catalog,
-    provider_key_for_model,
+)
+from familia.model_settings import (
+    ModelSettingsError,
+    apply_slot,
+    clear_fallback,
+    read_model_settings,
+    resolve_slot,
 )
 
 FAMILY_KEY = "shared:family.graph"
@@ -1814,6 +1820,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help="API key for the provider (omit for OAuth providers)")
     p_ag_set.add_argument("--api-base", default="", dest="api_base",
                           help="custom API base URL (optional)")
+    p_ag_set.add_argument(
+        "--request-stdin",
+        action="store_true",
+        help="read secret fields from a JSON request body instead of argv",
+    )
     p_ag_set.set_defaults(func=cmd_agents_set)
 
     p_ag_clear = pag_sub.add_parser("clear",
@@ -2990,46 +3001,15 @@ def cmd_channels_test(args: argparse.Namespace) -> int:
 # agents (LLM slots: main + fallback)
 # ---------------------------------------------------------------------------
 
-def _provider_for_model(model: str) -> str:
-    return provider_key_for_model(model)
-
-
-def _redact(s: str | None) -> str | None:
-    if not s:
-        return s
-    if len(s) <= 8:
-        return "***"
-    return f"***{s[-4:]}"
-
 
 def cmd_agents_get(args: argparse.Namespace) -> int:
-    """Read main + fallback slot from nanobot config.json. fallback is
-    a familia-specific block (``agents.familia_fallback``) — nanobot
-    ignores unknown keys."""
+    """Read the effective Nanobot model chain without changing config."""
     _path, raw = _load_config_json()
-    agents = raw.get("agents") or {}
-    main = (agents.get("defaults") or {})
-    fallback = (agents.get("familia_fallback") or {})
-    providers = raw.get("providers") or {}
-
-    def _slot(d: dict[str, Any]) -> dict[str, Any]:
-        provider = d.get("provider") or ""
-        if provider in ("", "auto"):
-            provider = _provider_for_model(d.get("model") or "")
-        prov_cfg = providers.get(provider, {}) if isinstance(providers, dict) else {}
-        return {
-            "model":    d.get("model", ""),
-            "provider": provider,
-            "api_key":  _redact(prov_cfg.get("api_key")) if isinstance(prov_cfg, dict) else None,
-            "api_base": prov_cfg.get("api_base") if isinstance(prov_cfg, dict) else None,
-            "context_window_tokens": d.get("context_window_tokens"),
-        }
-
-    out = {
-        "schema_version": 1,
-        "main":      _slot(main),
-        "fallback":  _slot(fallback) if fallback else None,
-    }
+    try:
+        out = read_model_settings(raw)
+    except ModelSettingsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     if args.json:
         print(json.dumps(out, ensure_ascii=False))
@@ -3039,47 +3019,57 @@ def cmd_agents_get(args: argparse.Namespace) -> int:
 
 
 def cmd_agents_set(args: argparse.Namespace) -> int:
-    slot = args.slot
-    model = args.model.strip()
-    provider = args.provider.strip() or _provider_for_model(model)
-    if not model:
-        print("error: --model is required", file=sys.stderr)
-        return 2
+    if getattr(args, "request_stdin", False):
+        try:
+            body = json.load(sys.stdin)
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"error: request body is not valid JSON: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(body, dict):
+            print("error: request body must be a JSON object", file=sys.stderr)
+            return 2
+        # The body is the only accepted source for secrets in the RPC path.
+        args.api_key = body.get("api_key") or ""
+        args.api_base = body.get("api_base") or ""
     path, raw = _load_config_json()
-    raw.setdefault("agents", {})
-    raw.setdefault("providers", {})
-    target_key = "defaults" if slot == "main" else "familia_fallback"
-    section = raw["agents"].get(target_key) or {}
-    section["model"] = model
-    section["provider"] = provider or "auto"
-    raw["agents"][target_key] = section
-
-    if provider and (args.api_key or args.api_base):
-        prov = raw["providers"].get(provider) or {}
-        if args.api_key:
-            prov["api_key"] = args.api_key
-        if args.api_base:
-            prov["api_base"] = args.api_base
-        raw["providers"][provider] = prov
-
+    try:
+        snapshot = apply_slot(
+            raw,
+            slot=args.slot,
+            model=args.model,
+            provider=args.provider,
+            api_key=args.api_key,
+            api_base=args.api_base,
+        )
+    except ModelSettingsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     _save_config_json(path, raw)
+    selected = snapshot.get("main" if args.slot == "main" else "fallback") or {}
+    provider = selected.get("provider") or "auto"
     audit.log_event(
         "agent_slot_set",
         actor=None,
-        reason=f"slot={slot} model={model} provider={provider or 'auto'}",
+        reason=f"slot={args.slot} model={args.model.strip()} provider={provider or 'auto'}",
     )
-    print(f"agent slot {slot!r} set: model={model} provider={provider or 'auto'} "
-          f"(gateway restart required)")
+    if getattr(args, "request_stdin", False):
+        print(json.dumps({"ok": True}, ensure_ascii=False))
+    else:
+        print(f"agent slot {args.slot!r} set: model={args.model.strip()} provider={provider or 'auto'} "
+              f"(gateway restart required)")
     return 0
 
 
 def cmd_agents_clear(args: argparse.Namespace) -> int:
     path, raw = _load_config_json()
-    agents = raw.get("agents") or {}
     if args.slot == "fallback":
-        if "familia_fallback" in agents:
-            del agents["familia_fallback"]
-            raw["agents"] = agents
+        try:
+            before = read_model_settings(raw)
+            clear_fallback(raw)
+        except ModelSettingsError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if before["fallback"] is not None:
             _save_config_json(path, raw)
             audit.log_event("agent_slot_cleared", actor=None, reason="slot=fallback")
             print("fallback slot cleared (gateway restart required)")
@@ -3095,22 +3085,23 @@ def cmd_agents_test(args: argparse.Namespace) -> int:
     OpenAI-compat / Anthropic SDK paths where possible. For OAuth
     providers (codex, copilot) the test reports ``not implemented``."""
     _, raw = _load_config_json()
-    agents = raw.get("agents") or {}
-    target_key = "defaults" if args.slot == "main" else "familia_fallback"
-    section = agents.get(target_key) or {}
-    if not section:
+    try:
+        section = resolve_slot(raw, args.slot)
+    except ModelSettingsError as exc:
+        print(json.dumps({"ok": False, "message": str(exc)}, ensure_ascii=False))
+        return 0
+    if section is None:
         out = {"ok": False, "message": f"slot {args.slot!r} is empty"}
         print(json.dumps(out, ensure_ascii=False))
         return 0
 
-    model = section.get("model") or ""
-    provider = section.get("provider") or _provider_for_model(model)
-    providers = raw.get("providers") or {}
-    prov_cfg = (providers.get(provider) or {}) if isinstance(providers, dict) else {}
-    api_key = (prov_cfg.get("api_key") or "").strip()
-    api_base = (prov_cfg.get("api_base") or "").strip()
+    model = section["model"]
+    provider = section["provider"]
+    api_key = section["api_key"].strip()
+    api_base = section["api_base"].strip()
+    provider_kind = provider.replace("-", "_").lower()
 
-    if provider == "openai_codex":
+    if provider_kind == "openai_codex":
         # Live ping against the Codex Responses API using the cached
         # OAuth token. No api_key is needed.
         try:
@@ -3179,7 +3170,7 @@ def cmd_agents_test(args: argparse.Namespace) -> int:
             print(json.dumps({"ok": False, "message": f"error: {exc}"}, ensure_ascii=False))
             return 0
 
-    if provider == "github_copilot":
+    if provider_kind == "github_copilot":
         try:
             from nanobot.providers.github_copilot_provider import (  # type: ignore
                 _load_github_token,
