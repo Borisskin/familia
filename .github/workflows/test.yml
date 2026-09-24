@@ -70,7 +70,7 @@ jobs:
             nanobot/tests/cron/test_cron_tool_schema_contract.py
 
       - name: Verify exact nanobot patch reconstruction
-        run: python patches/test_check_exact_reconstruction.py -v
+        run: python -m patches.test_check_exact_reconstruction -v
 
       - name: Verify patch header normalization
         run: pytest -q patches/test_regenerate_headers.py
