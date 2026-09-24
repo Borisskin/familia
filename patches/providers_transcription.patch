@@ -14,7 +14,7 @@ index 555f433..f2bf1d9 100644
  WebUI upload validation, and channel integration live in
  ``nanobot.audio.transcription``.
  """
-@@ -11,6 +11,8 @@
+@@ -11,6 +11,8 @@ import base64
  import json
  import mimetypes
  import os
@@ -23,7 +23,7 @@ index 555f433..f2bf1d9 100644
  from collections.abc import Callable
  from pathlib import Path
  from typing import Any, cast
-@@ -21,6 +23,11 @@
+@@ -21,6 +23,11 @@ from loguru import logger
  _CHAT_COMPLETIONS_PATH = "chat/completions"
  _TRANSCRIPTIONS_PATH = "audio/transcriptions"
  _STEPFUN_ASR_PATH = "audio/asr/sse"
@@ -35,12 +35,10 @@ index 555f433..f2bf1d9 100644
  _ASSEMBLYAI_DEFAULT_API_BASE = "https://api.assemblyai.com/v2"
  _ASSEMBLYAI_POLL_ATTEMPTS = 60
  _ASSEMBLYAI_POLL_INTERVAL_S = 2.0
-@@ -92,6 +99,108 @@
-     """Map an audio file's extension to an OpenRouter ``format`` value."""
-     ext = path.suffix.lstrip(".").lower()
+@@ -94,6 +101,108 @@ def _audio_format(path: Path) -> str:
      return _FORMAT_ALIASES.get(ext, ext)
-+
-+
+ 
+ 
 +async def probe_audio_duration_s(path: Path) -> float | None:
 +    """Return an audio duration from ffprobe, or ``None`` when unavailable."""
 +    if shutil.which("ffprobe") is None:
@@ -141,15 +139,15 @@ index 555f433..f2bf1d9 100644
 +def _cleanup_chunks(chunks: list[Path] | None) -> None:
 +    if chunks:
 +        shutil.rmtree(chunks[0].parent, ignore_errors=True)
- 
- 
++
++
  # Up to 3 retries (4 attempts total) with exponential backoff on transient
-@@ -230,6 +339,48 @@
-         return {"url": url, "headers": headers, "files": files, "timeout": 60.0}
- 
+ # failures. Whisper endpoints occasionally return 502/503 under load, and
+ # mobile-network transcription callers hit sporadic connect/read errors.
+@@ -232,6 +341,48 @@ async def _post_transcription_with_retry(
      return await _post_with_retry(build_request, provider_label, _text_from_transcription_payload)
-+
-+
+ 
+ 
 +async def _post_yandex_transcription_with_retry(
 +    url: str,
 +    *,
@@ -190,10 +188,12 @@ index 555f433..f2bf1d9 100644
 +        return ""
 +    text = payload.get("result")
 +    return text.strip() if isinstance(text, str) else ""
- 
- 
++
++
  async def _post_json_transcription_with_retry(
-@@ -622,6 +773,90 @@
+     url: str,
+     *,
+@@ -622,6 +773,90 @@ class AssemblyAITranscriptionProvider:
              return ""
  
  

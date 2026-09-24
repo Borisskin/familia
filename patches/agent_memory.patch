@@ -2,7 +2,7 @@
 # upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
 diff --git a/nanobot/nanobot/agent/memory.py b/nanobot/nanobot/agent/memory.py
-index 0e738e3..48055fd 100644
+index 0e738e3..4dd2326 100644
 --- a/nanobot/nanobot/agent/memory.py
 +++ b/nanobot/nanobot/agent/memory.py
 @@ -8,12 +8,15 @@
@@ -22,7 +22,22 @@ index 0e738e3..48055fd 100644
  from datetime import datetime
  from pathlib import Path
  from typing import TYPE_CHECKING, Any, Callable, Iterator, cast
-@@ -769,22 +772,44 @@
+@@ -26,7 +29,13 @@ from nanobot.llm_usage.context import llm_usage_source
+ from nanobot.providers.base import LLMResponse, ProviderConversationState
+ from nanobot.providers.conversation_state import ProviderConversationStateController
+ from nanobot.runtime_context import public_history_messages
+-from nanobot.session.manager import Session, SessionManager
++from nanobot.session.manager import (
++    SESSION_FILE_CAP_CHECKED_KEY,
++    SESSION_FILE_CAP_MAX_MESSAGES,
++    SESSION_FILE_CAP_PENDING_KEY,
++    Session,
++    SessionManager,
++)
+ from nanobot.session.summary import is_summary_checkpoint, session_summary_from_metadata
+ from nanobot.utils.gitstore import GitStore
+ from nanobot.utils.helpers import (
+@@ -769,22 +778,44 @@ class MemoryArchiver:
          build_messages: Callable[..., list[dict[str, Any]]],
          get_tool_definitions: Callable[[], list[dict[str, Any]]],
          resolve_prompt_context: Callable[[Session], tuple[str | None, Path | None]] | None = None,
@@ -35,8 +50,6 @@ index 0e738e3..48055fd 100644
          self._build_messages = build_messages
          self._get_tool_definitions = get_tool_definitions
          self._resolve_prompt_context = resolve_prompt_context
--
--    def _raw_checkpoint(
 +        self._archive_handler = archive_handler
 +        self._archive_owner = archive_owner
 +
@@ -50,7 +63,8 @@ index 0e738e3..48055fd 100644
 +        if inspect.isawaitable(result):
 +            result = await result
 +        return bool(getattr(result, "committed", False))
-+
+ 
+-    def _raw_checkpoint(
 +    async def _raw_checkpoint(
          self,
          messages: list[dict[str, Any]],
@@ -71,7 +85,7 @@ index 0e738e3..48055fd 100644
          return self._combine_raw_checkpoint(
              raw,
              previous_summary=previous_summary,
-@@ -840,8 +865,8 @@
+@@ -840,8 +871,8 @@ class MemoryArchiver:
          if not source_messages:
              return None
  
@@ -82,7 +96,7 @@ index 0e738e3..48055fd 100644
                  source_messages,
                  session_key=session_key,
                  previous_summary=previous_summary,
-@@ -882,7 +907,7 @@
+@@ -882,7 +913,7 @@ class MemoryArchiver:
                  context_window_tokens=runtime.context_window_tokens,
              )
              if provider_context is None or provider_context.conversation_state is None:
@@ -91,7 +105,7 @@ index 0e738e3..48055fd 100644
              call_tools = []
          else:
              request_messages = [
-@@ -904,7 +929,7 @@
+@@ -904,7 +935,7 @@ class MemoryArchiver:
                      input_token_budget,
                      source,
                  )
@@ -100,7 +114,7 @@ index 0e738e3..48055fd 100644
  
          response: LLMResponse | None = None
          for attempt in range(2):
-@@ -925,7 +950,7 @@
+@@ -925,7 +956,7 @@ class MemoryArchiver:
                      "Memory archive {} failed, raw-dumping to history",
                      phase,
                  )
@@ -109,7 +123,7 @@ index 0e738e3..48055fd 100644
              if response.should_execute_tools is not True or attempt == 1:
                  break
  
-@@ -970,26 +995,28 @@
+@@ -970,26 +1001,28 @@ class MemoryArchiver:
                      context_window_tokens=runtime.context_window_tokens,
                  )
                  if provider_context is None or provider_context.conversation_state is None:
@@ -144,7 +158,7 @@ index 0e738e3..48055fd 100644
              self.store.append_history(summary, session_key=session_key)
          return summary
  
-@@ -1019,7 +1046,7 @@
+@@ -1019,7 +1052,7 @@ class MemoryArchiver:
                  "Memory archive has no safe input budget for {}; raw-dumping",
                  session.key,
              )
@@ -153,7 +167,7 @@ index 0e738e3..48055fd 100644
                  messages,
                  session_key=session.key,
                  previous_summary=previous_summary,
-@@ -1040,7 +1067,7 @@
+@@ -1040,7 +1073,7 @@ class MemoryArchiver:
                  "Memory archive cannot replay the full chunk for {}; raw-dumping",
                  session.key,
              )
@@ -162,7 +176,7 @@ index 0e738e3..48055fd 100644
                  messages,
                  session_key=session.key,
                  previous_summary=previous_summary,
-@@ -1081,6 +1108,12 @@
+@@ -1081,6 +1114,12 @@ class Consolidator:
          build_messages: Callable[..., list[dict[str, Any]]],
          get_tool_definitions: Callable[[], list[dict[str, Any]]],
          resolve_prompt_context: Callable[[Session], tuple[str | None, Path | None]] | None = None,
@@ -175,7 +189,7 @@ index 0e738e3..48055fd 100644
      ):
          self.store = store
          self.sessions = sessions
-@@ -1091,14 +1124,29 @@
+@@ -1091,15 +1130,30 @@ class Consolidator:
              build_messages=build_messages,
              get_tool_definitions=get_tool_definitions,
              resolve_prompt_context=resolve_prompt_context,
@@ -193,7 +207,7 @@ index 0e738e3..48055fd 100644
 +        if self._lock_provider is not None:
 +            return self._lock_provider(session_key)
          return self._locks.setdefault(session_key, asyncio.Lock())
-+
+ 
 +    @asynccontextmanager
 +    async def _session_lock(self, session_key: str):
 +        if self._lock_context_provider is not None:
@@ -202,10 +216,11 @@ index 0e738e3..48055fd 100644
 +            return
 +        async with self.get_lock(session_key):
 +            yield
- 
++
      async def summarize_transcript(
          self,
-@@ -1232,8 +1280,7 @@
+         accepted_messages: list[dict[str, Any]],
+@@ -1232,8 +1286,7 @@ class Consolidator:
          ``max_suffix`` is accepted for SDK compatibility and no longer retains
          archived messages. All compaction triggers share checkpoint replay.
          """
@@ -215,7 +230,7 @@ index 0e738e3..48055fd 100644
              self.sessions.invalidate(session_key)
              session = self.sessions.get_or_create(session_key)
  
-@@ -1252,6 +1299,12 @@
+@@ -1252,6 +1305,12 @@ class Consolidator:
              )
              last_active = session.updated_at
              archive_end = archive_start + len(messages_to_archive)
@@ -228,7 +243,7 @@ index 0e738e3..48055fd 100644
              try:
                  summary = await self.archive_session(
                      session, archive_end=archive_end, runtime=runtime,
-@@ -1265,6 +1318,16 @@
+@@ -1265,6 +1324,16 @@ class Consolidator:
                      session.provider_state = None
                      self.sessions.save(session)
              except (Exception, asyncio.CancelledError) as exc:
@@ -245,3 +260,126 @@ index 0e738e3..48055fd 100644
                  await events.emit(
                      ContextCompactionEvent(
                          compaction_id=compaction_id,
+@@ -1295,3 +1364,122 @@ class Consolidator:
+             )
+ 
+             return summary
++
++    async def enforce_file_cap(
++        self,
++        session_key: str,
++        *,
++        runtime: LLMRuntime,
++    ) -> bool:
++        """Archive and drop only complete, confirmed prefixes above the file cap."""
++        async with self._session_lock(session_key):
++            self.sessions.invalidate(session_key)
++            session = self.sessions.get_or_create(session_key)
++            if not session.policy.persist:
++                return False
++
++            if len(session.messages) <= SESSION_FILE_CAP_MAX_MESSAGES:
++                session.metadata[SESSION_FILE_CAP_CHECKED_KEY] = True
++                session.metadata.pop(SESSION_FILE_CAP_PENDING_KEY, None)
++                self.sessions.save(session)
++                return True
++
++            if (
++                session.metadata.get(SESSION_FILE_CAP_CHECKED_KEY) is not True
++                or session.metadata.get(SESSION_FILE_CAP_PENDING_KEY) is not True
++            ):
++                session.metadata[SESSION_FILE_CAP_CHECKED_KEY] = True
++                session.metadata[SESSION_FILE_CAP_PENDING_KEY] = True
++                self.sessions.save(session)
++
++            # A live recovery checkpoint may still refer to the full transcript.
++            if session.metadata.get("pending_user_turn") or session.metadata.get("runtime_checkpoint"):
++                return False
++
++            threshold = len(session.messages) - SESSION_FILE_CAP_MAX_MESSAGES + 1
++            user_starts = [
++                index
++                for index, message in enumerate(session.messages)
++                if index > 0
++                and index <= threshold
++                and message.get("role") == "user"
++                and not message.get("_command")
++                and not is_summary_checkpoint(message)
++            ]
++            later_user_starts = [
++                index
++                for index, message in enumerate(session.messages)
++                if index > threshold
++                and message.get("role") == "user"
++                and not message.get("_command")
++                and not is_summary_checkpoint(message)
++            ]
++            cut = min(later_user_starts) if later_user_starts else max(user_starts, default=0)
++            if cut > 0 and session.messages[cut - 1].get("_channel_delivery"):
++                cut -= 1
++
++            watermark = session.last_archived
++            has_summary = session_summary_from_metadata(
++                session.metadata,
++                fallback_last_active=session.updated_at,
++            ) is not None
++            archive_end: int | None = cut if cut > watermark else None
++            if archive_end is None and not (watermark > 0 and has_summary):
++                return False
++
++            archived_summary: str | None = None
++            last_active = session.updated_at
++            if archive_end is not None:
++                archived_summary = await self.archive_session(
++                    session,
++                    archive_end=archive_end,
++                    runtime=runtime,
++                )
++                if not archived_summary:
++                    return False
++
++            if session.metadata.get("pending_user_turn") or session.metadata.get("runtime_checkpoint"):
++                return False
++
++            # Snapshot after the await so concurrent appends are part of the
++            # rollback state and cannot disappear if the atomic save fails.
++            original_messages = list(session.messages)
++            original_metadata = deepcopy(session.metadata)
++            original_last_archived = session.last_archived
++            original_provider_state = session.provider_state
++            original_updated_at = session.updated_at
++            try:
++                if archived_summary is not None and archive_end is not None:
++                    session.commit_summary_checkpoint(
++                        archived_summary,
++                        insert_at=archive_end,
++                        last_active=last_active,
++                    )
++                    prune_end = archive_end
++                else:
++                    prune_end = watermark
++                session.messages = session.messages[prune_end:]
++                session.last_archived = 0
++                session.provider_state = None
++                session.metadata[SESSION_FILE_CAP_CHECKED_KEY] = True
++                session.metadata.pop(SESSION_FILE_CAP_PENDING_KEY, None)
++                self.sessions.save(session)
++            except (Exception, asyncio.CancelledError):
++                session.messages = original_messages
++                session.metadata = original_metadata
++                session.last_archived = original_last_archived
++                session.provider_state = original_provider_state
++                session.updated_at = original_updated_at
++                remember = getattr(self.sessions, "_remember", None)
++                if callable(remember):
++                    remember(session)
++                raise
++
++            logger.info(
++                "Session file-cap retention for {}: cut={}, retained={}, archived={}",
++                session_key,
++                archive_end or watermark,
++                len(session.messages),
++                archived_summary is not None,
++            )
++            return True

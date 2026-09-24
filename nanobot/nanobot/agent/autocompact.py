@@ -9,7 +9,13 @@ from typing import TYPE_CHECKING, Any, Callable, Coroutine
 from loguru import logger
 
 from nanobot.events import NO_EVENTS, EventSink
-from nanobot.session.manager import Session, SessionManager
+from nanobot.session.manager import (
+    SESSION_FILE_CAP_CHECKED_KEY,
+    SESSION_FILE_CAP_MAX_MESSAGES,
+    SESSION_FILE_CAP_PENDING_KEY,
+    Session,
+    SessionManager,
+)
 from nanobot.session.summary import (
     SessionSummary,
     is_summary_checkpoint,
@@ -79,6 +85,19 @@ class AutoCompact:
                 continue
             if key in active_session_keys:
                 continue
+            read_metadata = getattr(self.sessions, "read_session_metadata", None)
+            metadata_payload = read_metadata(key) if callable(read_metadata) else None
+            metadata = (
+                metadata_payload.get("metadata", {})
+                if metadata_payload
+                else {SESSION_FILE_CAP_CHECKED_KEY: True}
+            )
+            if (
+                metadata.get(SESSION_FILE_CAP_CHECKED_KEY) is not True
+                or metadata.get(SESSION_FILE_CAP_PENDING_KEY) is True
+            ):
+                self._schedule_file_cap(key, schedule_background, resolve_runtime)
+                continue
             updated_at = info.get("updated_at")
             if self._is_expired(updated_at, now) and self._has_unarchived_messages(key):
                 session = self.sessions.get_or_create(key)
@@ -89,6 +108,63 @@ class AutoCompact:
                     continue
                 self._archiving.add(key)
                 schedule_background(self._archive(key, runtime=runtime))
+
+    def schedule_file_cap_after_turn(
+        self,
+        key: str,
+        schedule_background: Callable[[Coroutine[Any, Any, None]], None],
+        resolve_runtime: Callable[[Session], LLMRuntime],
+    ) -> None:
+        """Schedule retention after a completed save, including busy sessions."""
+        session = self.sessions.get_cached(key)
+        if (
+            session is None
+            or self._is_internal_session(key)
+            or key in self._archiving
+            or (
+                len(session.messages) <= SESSION_FILE_CAP_MAX_MESSAGES
+                and not session.metadata.get(SESSION_FILE_CAP_PENDING_KEY)
+            )
+        ):
+            return
+        self._schedule_file_cap(key, schedule_background, resolve_runtime)
+
+    def _schedule_file_cap(
+        self,
+        key: str,
+        schedule_background: Callable[[Coroutine[Any, Any, None]], None],
+        resolve_runtime: Callable[[Session], LLMRuntime],
+    ) -> None:
+        if self._is_internal_session(key) or key in self._archiving:
+            return
+        self._archiving.add(key)
+        schedule_background(self._enforce_file_cap(key, resolve_runtime))
+
+    async def _enforce_file_cap(
+        self,
+        key: str,
+        resolve_runtime: Callable[[Session], LLMRuntime],
+    ) -> None:
+        try:
+            session = self.sessions.get_or_create(key)
+            if len(session.messages) <= SESSION_FILE_CAP_MAX_MESSAGES:
+                session.metadata[SESSION_FILE_CAP_CHECKED_KEY] = True
+                session.metadata.pop(SESSION_FILE_CAP_PENDING_KEY, None)
+                self.sessions.save(session)
+                return
+
+            session.metadata[SESSION_FILE_CAP_CHECKED_KEY] = True
+            session.metadata[SESSION_FILE_CAP_PENDING_KEY] = True
+            self.sessions.save(session)
+            try:
+                runtime = resolve_runtime(session)
+            except (KeyError, ValueError):
+                return
+            await self.consolidator.enforce_file_cap(key, runtime=runtime)
+        except Exception:
+            logger.exception("Auto-compact: file-cap retention failed for {}", key)
+        finally:
+            self._archiving.discard(key)
 
     async def _archive(self, key: str, *, runtime: LLMRuntime) -> None:
         if self._is_internal_session(key):

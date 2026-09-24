@@ -2420,6 +2420,11 @@ class AgentLoop:
             session.updated_at = original_updated_at
             raise
         if not ctx.ephemeral:
+            self.auto_compact.schedule_file_cap_after_turn(
+                ctx.session_key,
+                self.schedule_background,
+                self.runtime_for_session,
+            )
             await self.runtime_event_publisher.session_turn_persisted(
                 ctx.msg,
                 ctx.session_key,

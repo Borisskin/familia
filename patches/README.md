@@ -70,3 +70,10 @@ Phase 10 must still do hunk-by-hunk review:
 save rollback, and the injected Dream restore policy in
 `nanobot/nanobot/command/builtin.py`. These are Familia-owned behavioral
 invariants in `ownership.yaml`.
+
+The upstream `nanobot/tests/agent/test_new_command_archival.py` is intentionally
+not selected in Familia's integration job. Its `/new` cases require background
+archival and clearing after an unconfirmed write, which contradict the
+Familia-owned archive-before-clear contract. Tracked acceptance coverage lives
+in `familia/tests/test_nanobot_035_acceptance.py`; the separate background-task
+shutdown check there does not couple task draining to `/new`.

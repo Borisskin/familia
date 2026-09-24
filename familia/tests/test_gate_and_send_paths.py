@@ -18,7 +18,7 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -35,6 +35,7 @@ from familia.principals import (
 from familia.tools.ask import AskPrincipalTool
 from familia.tools.buttons import SendButtonsTool
 from nanobot.agent.loop import AgentLoop
+from nanobot.agent.outbound import OutboundDecision, OutboundRequest
 from nanobot.agent.tools.context import RequestContext, request_context
 from nanobot.agent.turn_delivery import TurnDeliveryFactory
 from nanobot.agent.tools.message import MessageTool
@@ -295,6 +296,89 @@ class TestGateOutboundSend:
         # The outbound itself was parked, not delivered.
         assert all(p.content != "spy" for p in sink.published)
         assert len(list(get_pending_store()._by_token)) == 1  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_runtime_action_metadata_cannot_override_request_action(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        async def capture_gate(**kwargs: object) -> OutboundDecision:
+            captured.update(kwargs)
+            return OutboundDecision.allow()
+
+        monkeypatch.setattr("familia.policy.gate_outbound_send", capture_gate)
+        guard = familia_bootstrap.make_outbound_guard()
+        outbound = OutboundMessage(
+            channel="vk",
+            chat_id=MEMBER_A_CHAT,
+            content="reply",
+            metadata={"_runtime_action": "pair.grant"},
+        )
+        request = OutboundRequest(
+            action="message.send",
+            outbound=outbound,
+            inbound_channel="vk",
+            inbound_chat_id=MEMBER_A_CHAT,
+            publish_outbound=AsyncMock(),
+        )
+
+        decision = await guard(request)
+
+        assert decision.kind == "allow"
+        assert captured["action"] == "message.send"
+        assert captured["outbound"] is outbound
+
+    @pytest.mark.asyncio
+    async def test_connected_runtime_adapter_ignores_runtime_action_metadata(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        async def capture_gate(**kwargs: object) -> OutboundDecision:
+            captured.update(kwargs)
+            return OutboundDecision.allow()
+
+        monkeypatch.setattr(
+            "familia.nanobot_extension.runtime_services.gate_outbound_send",
+            capture_gate,
+        )
+        bus = MessageBus()
+        adapters = familia_bootstrap.make_runtime_adapters(
+            SimpleNamespace(workspace_path=None),
+            bus,
+        )
+        inbound = InboundMessage(
+            channel="vk",
+            sender_id=MEMBER_A,
+            chat_id=MEMBER_A_CHAT,
+            content="hello",
+            metadata={"_runtime_action": "pair.grant"},
+        )
+        outbound = OutboundMessage(
+            channel="vk",
+            chat_id=MEMBER_A_CHAT,
+            content="reply",
+            metadata={"_runtime_action": "pair.grant"},
+        )
+
+        decision = await adapters.outbound_guard(
+            OutboundRequest(
+                action="message.send",
+                outbound=outbound,
+                actor=None,
+                inbound_channel=inbound.channel,
+                inbound_chat_id=inbound.chat_id,
+                metadata=dict(inbound.metadata),
+                publish_outbound=bus.publish_outbound,
+            )
+        )
+
+        assert decision.kind == "allow"
+        assert captured["action"] == "message.send"
+        assert captured["outbound"] is outbound
 
 
 # ---------- send path: direct reply (agent loop) ----------

@@ -42,6 +42,9 @@ from nanobot.utils.helpers import (
 from nanobot.utils.subagent_channel_display import scrub_subagent_announce_body
 
 SESSION_CACHE_MAX_SIZE = 128
+SESSION_FILE_CAP_MAX_MESSAGES = 2000
+SESSION_FILE_CAP_CHECKED_KEY = "_file_cap_checked"
+SESSION_FILE_CAP_PENDING_KEY = "_file_cap_pending"
 _MESSAGE_TIME_PREFIX_RE = re.compile(r"^\[Message Time: [^\]]+\]\n?")
 _LOCAL_IMAGE_BREADCRUMB_RE = re.compile(r"^\[image: (?:/|~)[^\]]+\]\s*$")
 _TOOL_CALL_ECHO_RE = re.compile(r'^\s*(?:generate_image|message)\([^)]*\)\s*$')
@@ -1316,6 +1319,15 @@ class JsonlSessionStore:
         tmp_path = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
 
         try:
+            if session.messages:
+                session.metadata[SESSION_FILE_CAP_CHECKED_KEY] = True
+                if len(session.messages) > SESSION_FILE_CAP_MAX_MESSAGES:
+                    session.metadata[SESSION_FILE_CAP_PENDING_KEY] = True
+                else:
+                    session.metadata.pop(SESSION_FILE_CAP_PENDING_KEY, None)
+            else:
+                session.metadata.pop(SESSION_FILE_CAP_CHECKED_KEY, None)
+                session.metadata.pop(SESSION_FILE_CAP_PENDING_KEY, None)
             with open(tmp_path, "x", encoding="utf-8") as f:
                 metadata_line = {
                     "_type": "metadata",

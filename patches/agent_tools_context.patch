@@ -5,7 +5,7 @@ diff --git a/nanobot/nanobot/agent/tools/context.py b/nanobot/nanobot/agent/tool
 index 5124f77..0f9c7bc 100644
 --- a/nanobot/nanobot/agent/tools/context.py
 +++ b/nanobot/nanobot/agent/tools/context.py
-@@ -15,6 +15,7 @@
+@@ -15,6 +15,7 @@ if TYPE_CHECKING:
      from nanobot.bus.queue import MessageBus
      from nanobot.config.schema import ProviderConfig, ToolsConfig
      from nanobot.cron.service import CronService
@@ -13,7 +13,7 @@ index 5124f77..0f9c7bc 100644
      from nanobot.providers.factory import ProviderSnapshot
      from nanobot.security.workspace_access import WorkspaceSandboxStatus
      from nanobot.session.manager import SessionManager
-@@ -40,6 +41,7 @@
+@@ -40,6 +41,7 @@ class RequestContext:
      turn_id: str | None = None
      workspace: Path | None = None
      attributes: dict[str, Any] = field(default_factory=dict)
@@ -21,7 +21,7 @@ index 5124f77..0f9c7bc 100644
  
  
  @runtime_checkable
-@@ -90,3 +92,4 @@
+@@ -90,3 +92,4 @@ class ToolContext:
      timezone: str = "UTC"
      workspace_sandbox: WorkspaceSandboxStatus | None = None
      runtime_control: RuntimeControl | None = None

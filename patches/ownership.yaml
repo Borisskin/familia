@@ -40,9 +40,9 @@
       "patch": "agent_loop.patch",
       "owner": "familia-core",
       "category": "familia-invariant",
-      "behavior": "Поток хода агента сохраняет продуктовые хуки Familia для контекста, памяти и доставки.",
+      "behavior": "Поток хода агента сохраняет продуктовые хуки Familia, подтверждает очистку /new и запускает сокращение истории после сохранения хода.",
       "native_gap": "В upstream нет admission/runtime-политики Familia; delta оставляет точку расширения.",
-      "verification": "Docker exact reconstruction; tests/test_nanobot_context_extension.py",
+      "verification": "Docker exact reconstruction; familia/tests/test_nanobot_035_acceptance.py",
       "hunks": [
         {
           "range": "all",
@@ -55,9 +55,39 @@
       "patch": "agent_memory.patch",
       "owner": "familia-core",
       "category": "familia-invariant",
-      "behavior": "Память агента получает контракт Familia для записи хода и области данных.",
+      "behavior": "Память агента получает контракт Familia для записи хода и области данных; старый префикс сеанса удаляется только после подтверждённой архивации.",
       "native_gap": "Нативная память nanobot не знает политику идентичности Familia.",
-      "verification": "Docker exact reconstruction; nanobot/tests/agent/test_memory.py",
+      "verification": "Docker exact reconstruction; familia/tests/test_nanobot_035_acceptance.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/agent/autocompact.py",
+      "patch": "agent_autocompact.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "Периодическая и послеповоротная обработка обнаруживает старые сеансы без проверки ограничения файла и повторяет незавершённое сокращение.",
+      "native_gap": "Upstream не выполняет ограничение размера сохранённого JSONL-сеанса и миграцию прежних файлов.",
+      "verification": "Docker exact reconstruction; familia/tests/test_nanobot_035_acceptance.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/session/manager.py",
+      "patch": "session_manager.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "Формат JSONL сохранён; служебные отметки позволяют обнаружить превышение 2000 сообщений и повторить безопасное сокращение.",
+      "native_gap": "В Nanobot 0.3.5 нет ограничения сохранённого файла и отметки миграции старых сеансов.",
+      "verification": "Docker exact reconstruction; familia/tests/test_nanobot_035_acceptance.py",
       "hunks": [
         {
           "range": "all",
@@ -310,9 +340,9 @@
       "patch": "command_builtin.patch",
       "owner": "familia-core",
       "category": "familia-invariant",
-      "behavior": "Встроенные команды соблюдают product command policy Familia.",
-      "native_gap": "Upstream builtin commands не покрывают product-owned policy.",
-      "verification": "Docker exact reconstruction; nanobot/tests/command/test_builtin.py",
+      "behavior": "Встроенные команды соблюдают product command policy Familia; /new archives successfully before clearing and preserves history when archival fails.",
+      "native_gap": "Upstream builtin commands не покрывают product-owned policy; upstream test_new_command_archival expects background archive and clear-on-failure behavior that conflicts with Familia's /new contract.",
+      "verification": "Docker exact reconstruction; nanobot/tests/command/test_builtin.py; familia/tests/test_nanobot_035_acceptance.py",
       "hunks": [
         {
           "range": "all",

@@ -377,6 +377,10 @@ def _write_baseline_index(root: Path, baseline: dict[str, TreeEntry]) -> None:
         absolute = root / PurePosixPath(path)
         absolute.parent.mkdir(parents=True, exist_ok=True)
         absolute.write_bytes(entry.data)
+        if entry.mode == "100755":
+            absolute.chmod(0o755)
+        elif entry.mode == "100644":
+            absolute.chmod(0o644)
     _run(["git", "add", "--force", "-A"], cwd=root)
     for path, entry in baseline.items():
         if entry.mode == "100755":

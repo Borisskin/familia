@@ -5,7 +5,7 @@ diff --git a/nanobot/nanobot/cron/types.py b/nanobot/nanobot/cron/types.py
 index 789e7a7..492a301 100644
 --- a/nanobot/nanobot/cron/types.py
 +++ b/nanobot/nanobot/cron/types.py
-@@ -56,6 +56,11 @@
+@@ -56,6 +56,11 @@ class CronPayload:
      deliver: bool = False
      channel: str | None = None  # e.g. "whatsapp"
      to: str | None = None  # e.g. phone number
@@ -17,7 +17,7 @@ index 789e7a7..492a301 100644
      channel_meta: dict[str, Any] = field(default_factory=dict)
      session_key: str | None = None  # original session key for correct session recording
      origin_channel: str | None = None
-@@ -70,6 +75,11 @@
+@@ -70,6 +75,11 @@ class CronPayload:
              deliver=data.get("deliver", False),
              channel=data.get("channel"),
              to=data.get("to"),

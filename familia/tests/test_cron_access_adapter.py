@@ -61,6 +61,8 @@ def _execute(tool: CronTool, context: RequestContext, **params: object) -> str:
 
 
 def _familia_cron_tool(tmp_path, monkeypatch) -> tuple[CronService, CronTool]:
+    monkeypatch.setenv("DREAM_CONSOLIDATOR_MEMX_KEY", "test-dream-key")
+    monkeypatch.setattr("familia.acl.graph_io.get_raw", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("familia.principals._registry", _registry())
     monkeypatch.setattr(
         "familia.roles.get_effective_roles",

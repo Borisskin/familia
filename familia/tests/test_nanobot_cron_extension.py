@@ -100,6 +100,19 @@ def test_make_dream_tool_installers_registers_dream_memory_tool(
     assert registry.tools[0]._profile_version_getter is profile_version_getter
 
 
+def test_missing_dream_memx_key_fails_before_registering_memory_tool(monkeypatch) -> None:
+    from familia.nanobot_extension import cron
+
+    monkeypatch.delenv("DREAM_CONSOLIDATOR_MEMX_KEY", raising=False)
+    registry = MagicMock()
+    installer = cron.make_dream_tool_installers()[0]
+
+    with pytest.raises(RuntimeError, match="DREAM_CONSOLIDATOR_MEMX_KEY is not configured"):
+        installer(registry, None)
+
+    registry.register.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_dream_writer_tracks_exception_before_reraising(monkeypatch) -> None:
     from familia import memx_client, principal_memory_ingestor
@@ -121,6 +134,7 @@ async def test_dream_writer_tracks_exception_before_reraising(monkeypatch) -> No
     failure = RuntimeError("ingestor unavailable")
     ingestor.ingest = AsyncMock(side_effect=failure)
     tracker = MagicMock()
+    monkeypatch.setenv("DREAM_CONSOLIDATOR_MEMX_KEY", "test-dream-key")
     monkeypatch.setattr(memx_client, "memx_base_url", lambda: "http://mock-memx:8000")
     monkeypatch.setattr(
         principal_memory_ingestor,

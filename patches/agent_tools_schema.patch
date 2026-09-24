@@ -1,0 +1,17 @@
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
+
+diff --git a/nanobot/nanobot/agent/tools/schema.py b/nanobot/nanobot/agent/tools/schema.py
+index 6ce1102..3452735 100644
+--- a/nanobot/nanobot/agent/tools/schema.py
++++ b/nanobot/nanobot/agent/tools/schema.py
+@@ -90,8 +90,8 @@ class NumberSchema(Schema):
+ 
+     def __init__(
+         self,
+-        *,
+         description: str = "",
++        *,
+         minimum: float | None = None,
+         maximum: float | None = None,
+         enum: tuple[float, ...] | list[float] | None = None,

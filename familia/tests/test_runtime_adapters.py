@@ -4,6 +4,8 @@ import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from nanobot.agent.tools.context import RequestContext, current_request_context
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
@@ -310,7 +312,41 @@ def test_archive_rejects_mixed_or_malformed_batch_before_write(monkeypatch) -> N
         assert result.retryable is False
 
 
-def test_tool_installer_uses_request_context_and_returns_names() -> None:
+def test_archive_handler_records_commit_failure_and_retry(monkeypatch) -> None:
+    from familia import memx_client, principal_memory_ingestor
+    from familia.tools import memory as memory_mod
+
+    monkeypatch.setattr("familia.principals._registry", _registry("owner"))
+    monkeypatch.setattr(memx_client, "memx_base_url", lambda: "http://mock-memx:8000")
+    monkeypatch.setattr(memory_mod, "_check_memory_write_policy", lambda **_kwargs: None)
+
+    class Ingestor:
+        outcomes = iter(("committed:first", "error:temporary", "committed:retry"))
+        calls: list[dict[str, object]] = []
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def ingest(self, **kwargs):
+            self.calls.append(kwargs)
+            return next(self.outcomes)
+
+    monkeypatch.setattr(principal_memory_ingestor, "PrincipalMemoryIngestor", Ingestor)
+    messages = [{"role": "user", "content": "private archive", "actor": "owner"}]
+
+    first = asyncio.run(bootstrap._archive_messages("owner", messages))
+    failed = asyncio.run(bootstrap._archive_messages("owner", messages))
+    retried = asyncio.run(bootstrap._archive_messages("owner", messages))
+
+    assert first.committed is True and first.retryable is False
+    assert failed.committed is False and failed.retryable is True
+    assert retried.committed is True and retried.retryable is False
+    assert len(Ingestor.calls) == 3
+    assert all(call["server_principal"] == "owner" for call in Ingestor.calls)
+
+
+def test_tool_installer_uses_request_context_and_returns_names(monkeypatch) -> None:
+    monkeypatch.setenv("DREAM_CONSOLIDATOR_MEMX_KEY", "test-dream-key")
     class Bus:
         async def publish_outbound(self, message):
             return None
@@ -335,6 +371,43 @@ def test_tool_installer_uses_request_context_and_returns_names() -> None:
     assert "memory_get" in names
     assert "memory_set" in names
     assert all(hasattr(tool, "set_context") is False or callable(tool.set_context) for tool in registry.tools)
+
+
+def test_tool_installer_rejects_invalid_dream_key_before_registration(monkeypatch) -> None:
+    monkeypatch.setenv("DREAM_CONSOLIDATOR_MEMX_KEY", "not a valid key")
+
+    class Registry:
+        def register(self, _tool):
+            raise AssertionError("tools must not register before key validation")
+
+    class Context:
+        bus = None
+        config = object()
+
+    with pytest.raises(RuntimeError, match="DREAM_CONSOLIDATOR_MEMX_KEY has an invalid format"):
+        bootstrap.install_tools(Context(), Registry())
+
+
+def test_tool_installer_rejects_memx_denied_key_before_registration(monkeypatch) -> None:
+    from familia.acl.graph_io import GraphIOError
+
+    monkeypatch.setenv("DREAM_CONSOLIDATOR_MEMX_KEY", "well-formed-but-denied")
+
+    def deny(*_args, **_kwargs):
+        raise GraphIOError("memX denied access (403)")
+
+    monkeypatch.setattr("familia.acl.graph_io.get_raw", deny)
+
+    class Registry:
+        def register(self, _tool):
+            raise AssertionError("tools must not register before memX validation")
+
+    class Context:
+        bus = None
+        config = object()
+
+    with pytest.raises(RuntimeError, match="DREAM_CONSOLIDATOR_MEMX_KEY was rejected"):
+        bootstrap.install_tools(Context(), Registry())
 
 
 def test_familia_exec_sandbox_default_and_explicit_opt_in(monkeypatch) -> None:

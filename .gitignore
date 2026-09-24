@@ -52,3 +52,5 @@ __pycache__/
 # Editor / IDE
 .idea/
 .vscode/
+# Local Pi runtime state
+.atl/

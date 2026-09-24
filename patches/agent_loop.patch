@@ -2,10 +2,10 @@
 # upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
 diff --git a/nanobot/nanobot/agent/loop.py b/nanobot/nanobot/agent/loop.py
-index a9d75da..e38b88b 100644
+index a9d75da..a4e0dba 100644
 --- a/nanobot/nanobot/agent/loop.py
 +++ b/nanobot/nanobot/agent/loop.py
-@@ -6,11 +6,20 @@
+@@ -6,11 +6,20 @@ from __future__ import annotations
  
  import asyncio
  import dataclasses
@@ -27,7 +27,7 @@ index a9d75da..e38b88b 100644
  from dataclasses import dataclass, field
  from datetime import datetime
  from enum import Enum, auto
-@@ -36,10 +45,16 @@
+@@ -36,10 +45,16 @@ from nanobot.agent.runner import (
      AgentRunSpec,
  )
  from nanobot.agent.subagent import SubagentManager
@@ -45,11 +45,10 @@ index a9d75da..e38b88b 100644
  from nanobot.agent.tools.registry import ToolRegistry
  from nanobot.agent.tools.runtime_control import AgentRuntimeControl
  from nanobot.agent.turn_delivery import (
-@@ -70,6 +85,16 @@
-     append_runtime_context,
+@@ -71,6 +86,16 @@ from nanobot.runtime_context import (
      resolve_runtime_context,
      runtime_context_blocks_from_metadata,
-+)
+ )
 +from nanobot.runtime_adapters import (
 +    Admission,
 +    OutboundDecision,
@@ -59,10 +58,11 @@ index a9d75da..e38b88b 100644
 +    load_runtime_adapters,
 +    prepare_session_storage_root,
 +    validate_prepared_session_manager,
- )
++)
  from nanobot.security.workspace_access import (
      WorkspaceScopeResolver,
-@@ -299,12 +324,23 @@
+     bind_workspace_scope,
+@@ -299,12 +324,23 @@ class AgentLoop:
          local_trigger_store: LocalTriggerStore | None = None,
          idle_compact_check_interval_seconds: int = 0,
          recovery_admission: RecoveryAdmission | None = None,
@@ -86,7 +86,7 @@ index a9d75da..e38b88b 100644
          self._recovery_admission = recovery_admission
          if turn_delivery_factory is not None:
              if turn_delivery_factory.bus is not bus:
-@@ -312,6 +348,7 @@
+@@ -312,6 +348,7 @@ class AgentLoop:
              self.turn_delivery_factory = turn_delivery_factory
          else:
              self.turn_delivery_factory = TurnDeliveryFactory(bus)
@@ -94,7 +94,7 @@ index a9d75da..e38b88b 100644
          self.runtime_event_publisher = self.turn_delivery_factory.runtime_event_publisher
          self.channels_config = channels_config
          self.restart_mode = restart_mode
-@@ -371,7 +408,12 @@
+@@ -371,7 +408,12 @@ class AgentLoop:
          self._extra_hooks: list[AgentHook] = hooks or []
          self._hook_factories: list[AgentTurnHookFactory] = hook_factories or []
  
@@ -108,7 +108,7 @@ index a9d75da..e38b88b 100644
          self.sessions = session_manager or SessionManager(workspace)
          # One file-read/write tracker per logical session. The tool registry is
          # shared by this loop, so tools resolve the active state via contextvars.
-@@ -395,14 +437,19 @@
+@@ -395,14 +437,19 @@ class AgentLoop:
          )
          self._unified_session = unified_session
          self._running = False
@@ -129,7 +129,7 @@ index a9d75da..e38b88b 100644
          # Per-session pending queues for mid-turn message injection.
          # When a session has an active task, new messages for that session
          # are routed here instead of creating a new task.
-@@ -435,6 +482,10 @@
+@@ -435,6 +482,10 @@ class AgentLoop:
              sessions=self.sessions,
              build_messages=self.context.build_messages,
              get_tool_definitions=self.tools.get_definitions,
@@ -140,7 +140,7 @@ index a9d75da..e38b88b 100644
              resolve_prompt_context=PersistedPromptContextResolver(
                  workspace_scopes=self.workspace_scopes,
                  unified_session=unified_session,
-@@ -476,12 +527,30 @@
+@@ -476,12 +527,30 @@ class AgentLoop:
  
          if bus is None:
              bus = MessageBus()
@@ -174,7 +174,7 @@ index a9d75da..e38b88b 100644
              )
          provider = extra.pop("provider", None) or make_provider(config)
          resolved = config.resolve_preset()
-@@ -637,6 +706,20 @@
+@@ -637,6 +706,20 @@ class AgentLoop:
          )
          loader = ToolLoader()
          registered = loader.load(ctx, self.tools)
@@ -195,7 +195,7 @@ index a9d75da..e38b88b 100644
  
          logger.info("Registered {} tools: {}", len(registered), registered)
  
-@@ -730,6 +813,38 @@
+@@ -730,6 +813,38 @@ class AgentLoop:
  
      def _request_context_for_turn(self, ctx: TurnContext) -> RequestContext:
          assert ctx.session is not None
@@ -234,7 +234,7 @@ index a9d75da..e38b88b 100644
          scope = self.workspace_scopes.for_turn(
              channel=ctx.delivery.route.channel,
              message_metadata=ctx.msg.metadata,
-@@ -747,6 +862,7 @@
+@@ -747,6 +862,7 @@ class AgentLoop:
              sender_id=ctx.msg.sender_id,
              turn_id=ctx.turn_id,
              workspace=scope.project_path,
@@ -242,7 +242,7 @@ index a9d75da..e38b88b 100644
          )
  
      async def _resolve_runtime_context_for_turn(
-@@ -785,7 +901,8 @@
+@@ -785,7 +901,8 @@ class AgentLoop:
          dispatch_fn: Callable[[CommandContext], Awaitable[OutboundMessage | None]],
      ) -> None:
          """Dispatch a command directly from the run() loop and publish the result."""
@@ -252,7 +252,7 @@ index a9d75da..e38b88b 100644
              # Compaction must wait for the active turn to commit its session.
              task = asyncio.create_task(self._dispatch(msg))
              self._track_active_task(key, task)
-@@ -797,9 +914,23 @@
+@@ -797,10 +914,24 @@ class AgentLoop:
              ctx = CommandContext(msg=msg, session=None, key=key, raw=raw, loop=self)
              result = await dispatch_fn(ctx)
              if result:
@@ -265,7 +265,7 @@ index a9d75da..e38b88b 100644
 +                )
              else:
                  logger.warning("Command '{}' matched but dispatch returned None", raw)
-+
+ 
 +        if normalized_command == "/new":
 +            # Reset only after the active turn has released its session lock.
 +            # Cancellation comes first so a running turn cannot hold the lock
@@ -274,10 +274,11 @@ index a9d75da..e38b88b 100644
 +            async with self._session_lock(key):
 +                await dispatch_and_publish()
 +            return
- 
++
          # A shell command may run for up to the configured exec timeout. Keep
          # the inbound consumer responsive when it runs beside an active turn.
-@@ -991,44 +1122,72 @@
+         if (msg.metadata or {}).get(INBOUND_META_USER_SHELL) is True:
+@@ -991,44 +1122,72 @@ class AgentLoop:
                  return []
  
              async def _to_user_message(pending_msg: InboundMessage) -> dict[str, Any]:
@@ -378,7 +379,7 @@ index a9d75da..e38b88b 100644
                      blocks = await self._resolve_runtime_context_for_request(
                          pending_request,
                          effective_tools,
-@@ -1133,6 +1292,9 @@
+@@ -1133,6 +1292,9 @@ class AgentLoop:
          request_token = bind_request_context(request_ctx)
          workspace_token = bind_workspace_scope(effective_scope)
          turn_scope_stack = ExitStack()
@@ -388,7 +389,7 @@ index a9d75da..e38b88b 100644
          # Compute lazily because create_goal may create goal metadata during this run.
          def _goal_continue() -> str | None:
              _goal_lines = goal_state_runtime_lines(session.metadata if session is not None else None)
-@@ -1147,8 +1309,16 @@
+@@ -1147,8 +1309,16 @@ class AgentLoop:
  
          session_metadata = session.metadata if session is not None else None
          try:
@@ -407,7 +408,7 @@ index a9d75da..e38b88b 100644
              hook = build_agent_turn_hook(AgentTurnHookSpec(
                  events=events,
                  streaming=streaming,
-@@ -1218,7 +1388,10 @@
+@@ -1218,7 +1388,10 @@ class AgentLoop:
                  events=events,
              ))
          finally:
@@ -419,7 +420,7 @@ index a9d75da..e38b88b 100644
              reset_workspace_scope(workspace_token)
              reset_request_context(request_token)
              reset_file_states(file_state_token)
-@@ -1258,10 +1431,74 @@
+@@ -1258,10 +1431,74 @@ class AgentLoop:
              active_session_keys=self._pending_queues.keys(),
          )
  
@@ -494,7 +495,7 @@ index a9d75da..e38b88b 100644
              logger.info("Agent loop started")
  
              while self._running:
-@@ -1283,6 +1520,14 @@
+@@ -1283,6 +1520,14 @@ class AgentLoop:
                      logger.warning("Error consuming inbound message: {}, continuing...", e)
                      continue
  
@@ -509,7 +510,7 @@ index a9d75da..e38b88b 100644
                  raw = msg.content.strip()
                  effective_key = self._effective_session_key(msg)
                  if await agent_context.handle_runtime_control(self, msg, self.tools):
-@@ -1378,6 +1623,67 @@
+@@ -1378,6 +1623,67 @@ class AgentLoop:
          finally:
              await self.aclose()
  
@@ -577,7 +578,7 @@ index a9d75da..e38b88b 100644
      def preserve_inflight_turns_on_shutdown(self) -> None:
          """Keep durable checkpoints when the owning gateway exits.
  
-@@ -1390,6 +1696,10 @@
+@@ -1390,6 +1696,10 @@ class AgentLoop:
  
      async def _dispatch(self, msg: InboundMessage) -> None:
          """Process a message: per-session serial, cross-session concurrent."""
@@ -588,7 +589,7 @@ index a9d75da..e38b88b 100644
          session_key = self._effective_session_key(msg)
          if session_key != msg.session_key:
              msg = dataclasses.replace(msg, session_key_override=session_key)
-@@ -1408,14 +1718,13 @@
+@@ -1408,14 +1718,13 @@ class AgentLoop:
                  if recovery_task_registered and current_task is not None:
                      recovery_admission.unregister_recovery_task(session_key, current_task)
                  return
@@ -604,7 +605,7 @@ index a9d75da..e38b88b 100644
                  # Only the task that owns the session lock may publish the
                  # active mid-turn injection queue for this session.
                  pending = asyncio.Queue(maxsize=20)
-@@ -1566,6 +1875,11 @@
+@@ -1566,6 +1875,11 @@ class AgentLoop:
          finally:
              self._background_tasks.clear()
  
@@ -616,7 +617,7 @@ index a9d75da..e38b88b 100644
          cleanup_steps = (
              self.subagents.close,
              self._exec_session_manager.close_all,
-@@ -1749,14 +2063,6 @@
+@@ -1749,14 +2063,6 @@ class AgentLoop:
          """Restore checkpoint / pending user turn; reference non-image attachments."""
          msg = ctx.msg
  
@@ -631,7 +632,7 @@ index a9d75da..e38b88b 100644
          if ctx.session is None:
              if msg.require_existing_session:
                  ctx.session = self.sessions.get_cached(ctx.session_key)
-@@ -1765,6 +2071,41 @@
+@@ -1765,6 +2071,41 @@ class AgentLoop:
              else:
                  ctx.session = self.sessions.get_or_create(ctx.session_key)
          session = ctx.session
@@ -673,11 +674,10 @@ index a9d75da..e38b88b 100644
          ctx.ephemeral = ctx.ephemeral or not session.policy.persist
          tools = ctx.tools or self.tools
          if session.policy.disabled_tools:
-@@ -1801,6 +2142,17 @@
-             and restore_pending_interruption(session)
+@@ -1802,6 +2143,17 @@ class AgentLoop:
          ):
              self.sessions.save(session)
-+
+ 
 +    def _prepare_message_media(
 +        self,
 +        content: str,
@@ -688,10 +688,11 @@ index a9d75da..e38b88b 100644
 +            content,
 +            materialize_message_media(media),
 +        )
- 
++
      async def _compact_session(self, ctx: TurnContext) -> None:
          session = ctx.require_session()
-@@ -2013,6 +2365,11 @@
+         ctx.session, pending = self.auto_compact.prepare_session(
+@@ -2013,6 +2365,11 @@ class AgentLoop:
  
      async def _persist_turn(self, ctx: TurnContext) -> None:
          session = ctx.require_session()
@@ -703,7 +704,7 @@ index a9d75da..e38b88b 100644
          turn_continuation.prepare_save_boundary(ctx)
  
          if (
-@@ -2051,7 +2408,17 @@
+@@ -2051,8 +2408,23 @@ class AgentLoop:
          ctx.delivery.record_latency(ctx.turn_latency_ms)
          self._clear_pending_user_turn(session)
          self._clear_runtime_checkpoint(session)
@@ -720,9 +721,15 @@ index a9d75da..e38b88b 100644
 +            session.updated_at = original_updated_at
 +            raise
          if not ctx.ephemeral:
++            self.auto_compact.schedule_file_cap_after_turn(
++                ctx.session_key,
++                self.schedule_background,
++                self.runtime_for_session,
++            )
              await self.runtime_event_publisher.session_turn_persisted(
                  ctx.msg,
-@@ -2335,21 +2702,34 @@
+                 ctx.session_key,
+@@ -2335,21 +2707,34 @@ class AgentLoop:
          runtime: LLMRuntime | None = None,
          on_runtime_admitted: Callable[[LLMRuntime], Awaitable[None]] | None = None,
          attributes: Mapping[str, Any] | None = None,
@@ -742,13 +749,12 @@ index a9d75da..e38b88b 100644
          msg = InboundMessage(
              channel=channel, sender_id=sender_id, chat_id=chat_id,
 -            content=content, media=media or [], metadata=metadata,
--        )
 +            content=content,
 +            media=media or [],
 +            metadata=metadata,
 +            session_key_override=session_key,
 +            actor=request_context.actor if request_context is not None else None,
-+        )
+         )
 +        admitted = await self._admit_inbound(msg)
 +        if admitted is None:
 +            return None
@@ -762,7 +768,7 @@ index a9d75da..e38b88b 100644
                  kwargs: dict[str, Any] = {
                      "session_key": session_key,
                      "on_progress": on_progress,
-@@ -2386,3 +2766,23 @@
+@@ -2386,3 +2771,23 @@ class AgentLoop:
              lock = asyncio.Lock()
              self._session_locks[session_key] = lock
          return lock

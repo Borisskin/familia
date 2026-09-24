@@ -189,7 +189,7 @@ class CronTool(Tool):
         cron_expr: str | None,
         tz: str | None,
         at: str | None,
-        tags: list[str] | None,
+        tags: list[str] | None = None,
     ) -> str:
         if not message:
             return ToolResult.error(

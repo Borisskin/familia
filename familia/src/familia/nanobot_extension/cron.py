@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -25,6 +26,16 @@ from familia.principals import (
     set_current_actor,
     set_current_channel,
 )
+
+
+def dream_consolidator_memx_key() -> str:
+    """Return the required service key without silently sending an empty key."""
+    value = os.environ.get("DREAM_CONSOLIDATOR_MEMX_KEY", "").strip()
+    if not value:
+        raise RuntimeError("DREAM_CONSOLIDATOR_MEMX_KEY is not configured")
+    if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", value) is None:
+        raise RuntimeError("DREAM_CONSOLIDATOR_MEMX_KEY has an invalid format")
+    return value
 
 
 def _identity_matches(identity: Any, channel: str, chat_id: str) -> bool:
@@ -531,7 +542,7 @@ def make_dream_tool_installers(
             principal_getter = make_dream_server_context_resolver()
         ingestor = PrincipalMemoryIngestor(
             base_url=memx_base_url(),
-            api_key=os.environ.get("DREAM_CONSOLIDATOR_MEMX_KEY", ""),
+            api_key=dream_consolidator_memx_key(),
             server_topic_validator=server_topic_validator,
         )
         for name in ("read_file", "edit_file", "write_file"):

@@ -5,7 +5,7 @@ diff --git a/nanobot/nanobot/config/schema.py b/nanobot/nanobot/config/schema.py
 index c3e75dc..ca8eed6 100644
 --- a/nanobot/nanobot/config/schema.py
 +++ b/nanobot/nanobot/config/schema.py
-@@ -237,6 +237,12 @@
+@@ -237,6 +237,12 @@ class BedrockProviderConfig(ProviderConfig):
      profile: str | None = None  # Optional AWS shared config profile
  
  
@@ -18,7 +18,7 @@ index c3e75dc..ca8eed6 100644
  class ProvidersConfig(Base):
      """Configuration for LLM providers.
  
-@@ -254,6 +260,7 @@
+@@ -254,6 +260,7 @@ class ProvidersConfig(Base):
      openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
      orcarouter: ProviderConfig = Field(default_factory=ProviderConfig)  # OrcaRouter API gateway
      assemblyai: ProviderConfig = Field(default_factory=ProviderConfig)  # AssemblyAI voice transcription

@@ -715,6 +715,24 @@ def install_tools(context_or_loop: Any, registry: Any | None = None) -> Any:
     else:
         context = context_or_loop
         bus = getattr(context, "bus", None)
+        if getattr(context, "config", None) is not None:
+            from familia.nanobot_extension.cron import dream_consolidator_memx_key
+
+            # Fail during runtime construction, before the first inbound message.
+            dream_key = dream_consolidator_memx_key()
+            from familia.acl.graph_io import GraphIOError, get_raw
+
+            try:
+                # A missing probe value is fine; 401/403 and transport errors are
+                # not.  The private namespace is the same one used by Dream.
+                get_raw(
+                    "private:_familia_startup_probe:value:heartbeat",
+                    api_key=dream_key,
+                )
+            except GraphIOError as exc:
+                raise RuntimeError(
+                    "DREAM_CONSOLIDATOR_MEMX_KEY was rejected by memX"
+                ) from exc
         _ensure_familia_tool_security(getattr(context, "config", None))
         from familia.nanobot_extension.cron import make_cron_job_access
 

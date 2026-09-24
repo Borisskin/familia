@@ -5,7 +5,7 @@ diff --git a/nanobot/nanobot/channels/manager.py b/nanobot/nanobot/channels/mana
 index 1da6aad..7a5c6a7 100644
 --- a/nanobot/nanobot/channels/manager.py
 +++ b/nanobot/nanobot/channels/manager.py
-@@ -25,7 +25,7 @@
+@@ -25,7 +25,7 @@ from nanobot.bus.outbound_events import (
  )
  from nanobot.bus.queue import MessageBus
  from nanobot.channels._setup import channel_setup_spec
@@ -14,7 +14,7 @@ index 1da6aad..7a5c6a7 100644
  from nanobot.channels.contracts import (
      channel_default_config,
      channel_instance_specs,
-@@ -111,6 +111,9 @@
+@@ -111,6 +111,9 @@ class ChannelManager:
              Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] | None
          ) = None,
          config_path: Path | None = None,
@@ -24,7 +24,7 @@ index 1da6aad..7a5c6a7 100644
      ):
          if config_path is None:
              from nanobot.config.loader import get_config_path
-@@ -133,6 +136,13 @@
+@@ -133,6 +136,13 @@ class ChannelManager:
          self._webui_mcp_reload = webui_mcp_reload
          self._webui_skill_state_action = webui_skill_state_action
          self._webui_recovery_action = webui_recovery_action
@@ -38,7 +38,7 @@ index 1da6aad..7a5c6a7 100644
          self.channels: dict[str, BaseChannel] = {}
          self._channel_owners: dict[str, str] = {}
          self._channel_runtime_specs: dict[str, tuple[str, str]] = {}
-@@ -156,6 +166,7 @@
+@@ -156,6 +166,7 @@ class ChannelManager:
          config: Config | None = None,
          default_sections: dict[str, Any] | None = None,
          default_enabled: bool | None = None,
@@ -46,7 +46,7 @@ index 1da6aad..7a5c6a7 100644
      ) -> Any:
          config = config or self.config
          section = getattr(config.channels, name, None)
-@@ -164,9 +175,9 @@
+@@ -164,9 +175,9 @@ class ChannelManager:
          if section is not None or not default_enabled:
              return section
          if default_sections is None:
@@ -58,7 +58,7 @@ index 1da6aad..7a5c6a7 100644
              if default is not None:
                  default_sections[name] = default
          return default_sections.get(name)
-@@ -236,16 +247,50 @@
+@@ -236,16 +247,50 @@ class ChannelManager:
          from nanobot.channels.registry import discover_plugins
          from nanobot.optional_features import ensure_enabled_channel_dependencies
  
@@ -110,7 +110,7 @@ index 1da6aad..7a5c6a7 100644
              if section is None:
                  continue
              try:
-@@ -725,24 +770,48 @@
+@@ -725,24 +770,48 @@ class ChannelManager:
              task.cancel()
          await asyncio.gather(*tasks, return_exceptions=True)
  
@@ -164,7 +164,7 @@ index 1da6aad..7a5c6a7 100644
  
          task = asyncio.create_task(send(), name=f"outbound-{msg.channel}-{msg.chat_id}")
          self._outbound_tasks[task] = key
-@@ -753,6 +822,11 @@
+@@ -753,6 +822,11 @@ class ChannelManager:
              if self._outbound_tails.get(key) is done:
                  self._outbound_tails.pop(key, None)
              self._outbound_slots.release()
@@ -176,7 +176,7 @@ index 1da6aad..7a5c6a7 100644
              if not done.cancelled() and (error := done.exception()) is not None:
                  logger.error("Outbound delivery to {}:{} failed: {}", *key, error)
  
-@@ -843,6 +917,7 @@
+@@ -843,6 +917,7 @@ class ChannelManager:
                      await self._queue_outbound(channel, msg)
                  else:
                      logger.warning("Unknown channel: {}", msg.channel)
@@ -184,7 +184,7 @@ index 1da6aad..7a5c6a7 100644
  
              except asyncio.TimeoutError:
                  continue
-@@ -1001,7 +1076,7 @@
+@@ -1001,7 +1076,7 @@ class ChannelManager:
          msg: OutboundMessage,
          *,
          deadline: float | None = None,
@@ -193,7 +193,7 @@ index 1da6aad..7a5c6a7 100644
          """Send a message with retry on failure using exponential backoff.
  
          When deadline is provided, retry until that monotonic time instead of
-@@ -1011,23 +1086,29 @@
+@@ -1011,23 +1086,29 @@ class ChannelManager:
          """
          max_attempts = max(self.config.channels.send_max_retries, 1)
          attempt = 0
@@ -226,7 +226,7 @@ index 1da6aad..7a5c6a7 100644
                  loop = asyncio.get_running_loop()
                  exhausted = (
                      attempt >= max_attempts
-@@ -1039,7 +1120,7 @@
+@@ -1039,7 +1120,7 @@ class ChannelManager:
                          "Failed to send to {} after {} attempts",
                          msg.channel, attempt,
                      )

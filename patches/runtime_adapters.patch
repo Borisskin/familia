@@ -4,7 +4,7 @@
 diff --git a/nanobot/nanobot/runtime_adapters.py b/nanobot/nanobot/runtime_adapters.py
 new file mode 100644
 index 0000000..ea46ce0
---- a/nanobot/nanobot/runtime_adapters.py
+--- /dev/null
 +++ b/nanobot/nanobot/runtime_adapters.py
 @@ -0,0 +1,316 @@
 +"""Neutral runtime wiring for optional product integrations."""

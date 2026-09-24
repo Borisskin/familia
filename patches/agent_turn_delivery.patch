@@ -5,7 +5,7 @@ diff --git a/nanobot/nanobot/agent/turn_delivery.py b/nanobot/nanobot/agent/turn
 index 3a035da..4a9230b 100644
 --- a/nanobot/nanobot/agent/turn_delivery.py
 +++ b/nanobot/nanobot/agent/turn_delivery.py
-@@ -4,10 +4,10 @@
+@@ -4,10 +4,10 @@ from __future__ import annotations
  
  import dataclasses
  import time
@@ -18,7 +18,7 @@ index 3a035da..4a9230b 100644
  
  from nanobot.bus.events import InboundMessage, OutboundMessage
  from nanobot.bus.notification_delivery import notification_is_deliverable
-@@ -41,6 +41,17 @@
+@@ -41,6 +41,17 @@ class TurnRoute:
  TurnRoutePolicy = Callable[[InboundMessage, str, TurnRoute], TurnRoute]
  
  
@@ -36,7 +36,7 @@ index 3a035da..4a9230b 100644
  def _bind_events(
      bus: MessageBus, route: TurnRoute,
  ) -> EventSink:
-@@ -77,10 +88,12 @@
+@@ -77,10 +88,12 @@ class TurnDeliveryFactory:
          self,
          bus: MessageBus,
          route_policy: TurnRoutePolicy | None = None,
@@ -49,7 +49,7 @@ index 3a035da..4a9230b 100644
  
      def create(
          self,
-@@ -101,6 +114,7 @@
+@@ -101,6 +114,7 @@ class TurnDeliveryFactory:
              session_key=session_key,
              route=route,
              enable_stream=enable_stream,
@@ -57,7 +57,7 @@ index 3a035da..4a9230b 100644
          )
  
      def unrouted(self, msg: InboundMessage, session_key: str) -> TurnDelivery:
-@@ -115,6 +129,7 @@
+@@ -115,6 +129,7 @@ class TurnDeliveryFactory:
                  chat_id=msg.chat_id,
                  metadata=dict(msg.metadata or {}),
              ),
@@ -65,7 +65,7 @@ index 3a035da..4a9230b 100644
          )
  
      def session_events(
-@@ -184,6 +199,7 @@
+@@ -184,6 +199,7 @@ class TurnDelivery:
      session_key: str
      route: TurnRoute
      enable_stream: bool = False
@@ -73,7 +73,7 @@ index 3a035da..4a9230b 100644
      delivery_message: InboundMessage = field(init=False)
      lifecycle_message: InboundMessage = field(init=False)
      _stream_base_id: str | None = field(init=False, default=None)
-@@ -306,15 +322,16 @@
+@@ -306,15 +322,16 @@ class TurnDelivery:
              completed_channel = response.channel
              completed_chat_id = response.chat_id
              if response.channel != "websocket" or stop_reason != "error":
@@ -93,7 +93,7 @@ index 3a035da..4a9230b 100644
              )
          if publish_completion:
              outcome, failure_kind = _turn_outcome(stop_reason)
-@@ -334,13 +351,14 @@
+@@ -334,13 +351,14 @@ class TurnDelivery:
              )
  
      async def fail(self, *, publish_completion: bool) -> None:
@@ -110,7 +110,7 @@ index 3a035da..4a9230b 100644
          )
          if publish_completion:
              await self.runtime_event_publisher.turn_completed(
-@@ -380,6 +398,16 @@
+@@ -380,6 +398,16 @@ class TurnDelivery:
              if not event.merge_next:
                  self._stream_segment += 1
  

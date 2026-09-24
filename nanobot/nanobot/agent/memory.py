@@ -29,7 +29,13 @@ from nanobot.llm_usage.context import llm_usage_source
 from nanobot.providers.base import LLMResponse, ProviderConversationState
 from nanobot.providers.conversation_state import ProviderConversationStateController
 from nanobot.runtime_context import public_history_messages
-from nanobot.session.manager import Session, SessionManager
+from nanobot.session.manager import (
+    SESSION_FILE_CAP_CHECKED_KEY,
+    SESSION_FILE_CAP_MAX_MESSAGES,
+    SESSION_FILE_CAP_PENDING_KEY,
+    Session,
+    SessionManager,
+)
 from nanobot.session.summary import is_summary_checkpoint, session_summary_from_metadata
 from nanobot.utils.gitstore import GitStore
 from nanobot.utils.helpers import (
@@ -1358,3 +1364,122 @@ class Consolidator:
             )
 
             return summary
+
+    async def enforce_file_cap(
+        self,
+        session_key: str,
+        *,
+        runtime: LLMRuntime,
+    ) -> bool:
+        """Archive and drop only complete, confirmed prefixes above the file cap."""
+        async with self._session_lock(session_key):
+            self.sessions.invalidate(session_key)
+            session = self.sessions.get_or_create(session_key)
+            if not session.policy.persist:
+                return False
+
+            if len(session.messages) <= SESSION_FILE_CAP_MAX_MESSAGES:
+                session.metadata[SESSION_FILE_CAP_CHECKED_KEY] = True
+                session.metadata.pop(SESSION_FILE_CAP_PENDING_KEY, None)
+                self.sessions.save(session)
+                return True
+
+            if (
+                session.metadata.get(SESSION_FILE_CAP_CHECKED_KEY) is not True
+                or session.metadata.get(SESSION_FILE_CAP_PENDING_KEY) is not True
+            ):
+                session.metadata[SESSION_FILE_CAP_CHECKED_KEY] = True
+                session.metadata[SESSION_FILE_CAP_PENDING_KEY] = True
+                self.sessions.save(session)
+
+            # A live recovery checkpoint may still refer to the full transcript.
+            if session.metadata.get("pending_user_turn") or session.metadata.get("runtime_checkpoint"):
+                return False
+
+            threshold = len(session.messages) - SESSION_FILE_CAP_MAX_MESSAGES + 1
+            user_starts = [
+                index
+                for index, message in enumerate(session.messages)
+                if index > 0
+                and index <= threshold
+                and message.get("role") == "user"
+                and not message.get("_command")
+                and not is_summary_checkpoint(message)
+            ]
+            later_user_starts = [
+                index
+                for index, message in enumerate(session.messages)
+                if index > threshold
+                and message.get("role") == "user"
+                and not message.get("_command")
+                and not is_summary_checkpoint(message)
+            ]
+            cut = min(later_user_starts) if later_user_starts else max(user_starts, default=0)
+            if cut > 0 and session.messages[cut - 1].get("_channel_delivery"):
+                cut -= 1
+
+            watermark = session.last_archived
+            has_summary = session_summary_from_metadata(
+                session.metadata,
+                fallback_last_active=session.updated_at,
+            ) is not None
+            archive_end: int | None = cut if cut > watermark else None
+            if archive_end is None and not (watermark > 0 and has_summary):
+                return False
+
+            archived_summary: str | None = None
+            last_active = session.updated_at
+            if archive_end is not None:
+                archived_summary = await self.archive_session(
+                    session,
+                    archive_end=archive_end,
+                    runtime=runtime,
+                )
+                if not archived_summary:
+                    return False
+
+            if session.metadata.get("pending_user_turn") or session.metadata.get("runtime_checkpoint"):
+                return False
+
+            # Snapshot after the await so concurrent appends are part of the
+            # rollback state and cannot disappear if the atomic save fails.
+            original_messages = list(session.messages)
+            original_metadata = deepcopy(session.metadata)
+            original_last_archived = session.last_archived
+            original_provider_state = session.provider_state
+            original_updated_at = session.updated_at
+            try:
+                if archived_summary is not None and archive_end is not None:
+                    session.commit_summary_checkpoint(
+                        archived_summary,
+                        insert_at=archive_end,
+                        last_active=last_active,
+                    )
+                    prune_end = archive_end
+                else:
+                    prune_end = watermark
+                session.messages = session.messages[prune_end:]
+                session.last_archived = 0
+                session.provider_state = None
+                session.metadata[SESSION_FILE_CAP_CHECKED_KEY] = True
+                session.metadata.pop(SESSION_FILE_CAP_PENDING_KEY, None)
+                self.sessions.save(session)
+            except (Exception, asyncio.CancelledError):
+                session.messages = original_messages
+                session.metadata = original_metadata
+                session.last_archived = original_last_archived
+                session.provider_state = original_provider_state
+                session.updated_at = original_updated_at
+                remember = getattr(self.sessions, "_remember", None)
+                if callable(remember):
+                    remember(session)
+                raise
+
+            logger.info(
+                "Session file-cap retention for {}: cut={}, retained={}, archived={}",
+                session_key,
+                archive_end or watermark,
+                len(session.messages),
+                archived_summary is not None,
+            )
+            return True

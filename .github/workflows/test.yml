@@ -22,7 +22,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: HKUDS/nanobot
-          ref: 3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec
+          ref: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
           path: upstream-nanobot
 
       - name: Expose upstream checkout at the patch-tool path
@@ -64,7 +64,6 @@ jobs:
             nanobot/tests/agent/test_loop_cron_timezone.py \
             nanobot/tests/agent/test_loop_save_turn.py \
             nanobot/tests/agent/test_memory_store.py \
-            nanobot/tests/agent/test_new_command_archival.py \
             nanobot/tests/session/test_consolidated_offset_clamp.py \
             nanobot/tests/cli/test_commands.py \
             nanobot/tests/cron/test_cron_tool_list.py \

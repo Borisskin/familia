@@ -2,7 +2,7 @@
 # upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
 diff --git a/nanobot/nanobot/agent/tools/cron.py b/nanobot/nanobot/agent/tools/cron.py
-index 6a4fd65..797cf47 100644
+index 6a4fd65..d2de58b 100644
 --- a/nanobot/nanobot/agent/tools/cron.py
 +++ b/nanobot/nanobot/agent/tools/cron.py
 @@ -4,19 +4,21 @@
@@ -29,11 +29,10 @@ index 6a4fd65..797cf47 100644
  from nanobot.session.keys import UNIFIED_SESSION_KEY
  
  _CRON_PARAMETERS = tool_parameters_schema(
-@@ -39,6 +41,14 @@
-     at=StringSchema(
+@@ -40,6 +42,14 @@ _CRON_PARAMETERS = tool_parameters_schema(
          "ISO datetime for one-time execution (e.g. '2026-02-12T10:30:00'). "
          "Naive values use the tool's default timezone."
-+    ),
+     ),
 +    tags=ArraySchema(
 +        StringSchema(""),
 +        description=(
@@ -41,10 +40,11 @@ index 6a4fd65..797cf47 100644
 +            "by the calling actor."
 +        ),
 +        nullable=True,
-     ),
++    ),
      job_id=StringSchema("REQUIRED when action='remove'. Job ID to remove (obtain via action='list')."),
      required=["action"],
-@@ -56,9 +66,16 @@
+     description=(
+@@ -56,9 +66,16 @@ _CRON_PARAMETERS = tool_parameters_schema(
  class CronTool(Tool):
      """Tool to schedule reminders and recurring tasks."""
  
@@ -62,7 +62,7 @@ index 6a4fd65..797cf47 100644
          self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
  
      @classmethod
-@@ -70,7 +87,16 @@
+@@ -70,7 +87,16 @@ class CronTool(Tool):
          cron_service = ctx.cron_service
          if cron_service is None:
              raise RuntimeError("CronTool requires an initialized cron service")
@@ -80,7 +80,7 @@ index 6a4fd65..797cf47 100644
  
      @staticmethod
      def _request_route() -> tuple[str, str, str, dict[str, Any]]:
-@@ -142,12 +168,13 @@
+@@ -142,12 +168,13 @@ class CronTool(Tool):
          cron_expr: str | None = None,
          tz: str | None = None,
          at: str | None = None,
@@ -95,15 +95,15 @@ index 6a4fd65..797cf47 100644
          elif action == "list":
              return self._list_jobs()
          elif action == "remove":
-@@ -162,6 +189,7 @@
+@@ -162,6 +189,7 @@ class CronTool(Tool):
          cron_expr: str | None,
          tz: str | None,
          at: str | None,
-+        tags: list[str] | None,
++        tags: list[str] | None = None,
      ) -> str:
          if not message:
              return ToolResult.error(
-@@ -179,6 +207,18 @@
+@@ -179,6 +207,18 @@ class CronTool(Tool):
          if tz:
              if err := self._validate_timezone(tz):
                  return err
@@ -122,7 +122,7 @@ index 6a4fd65..797cf47 100644
  
          # Build schedule
          delete_after = False
-@@ -215,6 +255,7 @@
+@@ -215,6 +255,7 @@ class CronTool(Tool):
              origin_channel=origin_channel,
              origin_chat_id=origin_chat_id,
              origin_metadata=origin_metadata,
@@ -130,7 +130,7 @@ index 6a4fd65..797cf47 100644
          )
          return f"Created job '{job.name}' (id: {job.id})"
  
-@@ -259,7 +300,7 @@
+@@ -259,7 +300,7 @@ class CronTool(Tool):
          return "System-managed internal job."
  
      def _list_jobs(self) -> str:
@@ -139,7 +139,7 @@ index 6a4fd65..797cf47 100644
          if not jobs:
              return "No scheduled jobs."
          lines: list[str] = []
-@@ -273,9 +314,21 @@
+@@ -273,9 +314,21 @@ class CronTool(Tool):
              lines.append("\n".join(parts))
          return "Scheduled jobs:\n" + "\n".join(lines)
  

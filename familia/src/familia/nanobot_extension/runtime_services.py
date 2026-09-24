@@ -18,6 +18,7 @@ from typing import Any
 from loguru import logger
 
 from familia.nanobot_extension.cron import (
+    dream_consolidator_memx_key,
     make_cron_delivery_observer,
     make_heartbeat_source_reader,
     make_scheduled_handler,
@@ -530,7 +531,7 @@ async def _delete_archive_facts(owner: str, fact_ids: list[str]) -> bool:
                 return False
         ingestor = PrincipalMemoryIngestor(
             base_url=memx_base_url(),
-            api_key=os.environ.get("DREAM_CONSOLIDATOR_MEMX_KEY", ""),
+            api_key=dream_consolidator_memx_key(),
         )
         for fact_id in fact_ids:
             result = await ingestor.ingest(

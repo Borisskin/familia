@@ -5,15 +5,15 @@ diff --git a/nanobot/nanobot/audio/transcription_registry.py b/nanobot/nanobot/a
 index a044abd..8d638aa 100644
 --- a/nanobot/nanobot/audio/transcription_registry.py
 +++ b/nanobot/nanobot/audio/transcription_registry.py
-@@ -54,6 +54,11 @@
+@@ -53,6 +53,11 @@ TRANSCRIPTION_PROVIDERS: tuple[TranscriptionProviderSpec, ...] = (
+         default_model="whisper-1",
          adapter="nanobot.providers.transcription:OpenAITranscriptionProvider",
      ),
-     TranscriptionProviderSpec(
++    TranscriptionProviderSpec(
 +        name="yandex",
 +        default_model="",
 +        adapter="nanobot.providers.transcription:YandexTranscriptionProvider",
 +    ),
-+    TranscriptionProviderSpec(
+     TranscriptionProviderSpec(
          name="openrouter",
          default_model="openai/whisper-1",
-         adapter="nanobot.providers.transcription:OpenRouterTranscriptionProvider",

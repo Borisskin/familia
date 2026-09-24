@@ -5,7 +5,7 @@ diff --git a/nanobot/nanobot/cron/service.py b/nanobot/nanobot/cron/service.py
 index 37e1e7e..339bdfd 100644
 --- a/nanobot/nanobot/cron/service.py
 +++ b/nanobot/nanobot/cron/service.py
-@@ -397,6 +397,11 @@
+@@ -397,6 +397,11 @@ class CronService:
                          "deliver": j.payload.deliver,
                          "channel": j.payload.channel,
                          "to": j.payload.to,
@@ -17,7 +17,7 @@ index 37e1e7e..339bdfd 100644
                          "channelMeta": j.payload.channel_meta,
                          "sessionKey": j.payload.session_key,
                          "originChannel": j.payload.origin_channel,
-@@ -700,6 +705,7 @@
+@@ -700,6 +705,7 @@ class CronService:
          origin_channel: str | None = None,
          origin_chat_id: str | None = None,
          origin_metadata: dict[str, Any] | None = None,
@@ -25,7 +25,7 @@ index 37e1e7e..339bdfd 100644
      ) -> CronJob:
          """Add a new job."""
          _validate_schedule_for_add(schedule)
-@@ -716,6 +722,7 @@
+@@ -716,6 +722,7 @@ class CronService:
                  deliver=deliver,
                  channel=channel,
                  to=to,

@@ -19,7 +19,7 @@ index 27021b9..03dec68 100644
  from dataclasses import dataclass, replace
  from typing import TYPE_CHECKING, Any, Literal, cast
  
-@@ -310,13 +312,16 @@
+@@ -310,13 +312,16 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
      )
  
  
@@ -38,7 +38,7 @@ index 27021b9..03dec68 100644
      archive_snapshot = None
      runtime = None
      if session.last_archived < len(snapshot):
-@@ -327,22 +332,65 @@
+@@ -327,17 +332,47 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
              metadata=dict(session.metadata),
              provider_state=None,
          )
@@ -54,7 +54,6 @@ index 27021b9..03dec68 100644
                  archive_end=len(snapshot),
                  runtime=runtime,
              )
--        )
 +        except Exception:
 +            logger.exception("Could not archive session {} before /new", ctx.key)
 +            return OutboundMessage(
@@ -86,16 +85,16 @@ index 27021b9..03dec68 100644
 +            chat_id=ctx.msg.chat_id,
 +            content="Could not start a new session; existing history was kept.",
 +            metadata=dict(ctx.msg.metadata or {}),
-+        )
+         )
 +    loop.sessions.invalidate(session.key)
 +    loop.discard_session_file_state(ctx.key)
      return OutboundMessage(
          channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
          content="New session started.",
-         metadata=dict(ctx.msg.metadata or {})
+@@ -345,6 +380,19 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
      )
-+
-+
+ 
+ 
 +async def cmd_new(ctx: CommandContext) -> OutboundMessage:
 +    """Stop active work and reset only after the shared archive lock is held."""
 +    lock_factory = getattr(ctx.loop, "_session_lock", None)
@@ -107,10 +106,12 @@ index 27021b9..03dec68 100644
 +        async with lock_factory(ctx.key):
 +            return await _cmd_new_unlocked(ctx)
 +    return await _cmd_new_unlocked(ctx)
- 
- 
++
++
  async def cmd_compact(ctx: CommandContext) -> None:
-@@ -448,12 +496,84 @@
+     """Compact the current session without resetting the conversation."""
+     loop = ctx.loop
+@@ -448,6 +496,50 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
      )
  
  
@@ -161,10 +162,10 @@ index 27021b9..03dec68 100644
  async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
      """Manually trigger a Dream consolidation run."""
      import time
- 
+@@ -455,6 +547,34 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
      loop = ctx.loop
      msg = ctx.msg
-+
+ 
 +    service_runner = getattr(getattr(loop, "runtime_adapters", None), "run_dream", None)
 +    if callable(service_runner) and getattr(msg, "actor", None):
 +        async def _run_service_dream() -> None:
@@ -192,10 +193,11 @@ index 27021b9..03dec68 100644
 +            chat_id=msg.chat_id,
 +            content="Dreaming...",
 +        )
- 
++
      async def _run_dream():
          from nanobot.agent.memory import MemoryStore
-@@ -473,11 +593,11 @@
+ 
+@@ -473,11 +593,11 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
          try:
              result = store.build_dream_prompt()
              if result is None:
@@ -209,7 +211,7 @@ index 27021b9..03dec68 100644
                  return
              prompt, last_cursor = result
              key = dream_session_key()
-@@ -518,9 +638,9 @@
+@@ -518,9 +638,9 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
                      content += f" (commit {sha})"
              store.compact_history()
              prune_dream_sessions(loop.sessions)

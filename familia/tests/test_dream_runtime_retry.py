@@ -254,6 +254,7 @@ def test_familia_phase2_prompt_omits_protected_file_directives() -> None:
 def test_familia_dream_installer_removes_protected_file_editors(monkeypatch) -> None:
     from familia.nanobot_extension.cron import make_dream_tool_installers
 
+    monkeypatch.setenv("DREAM_CONSOLIDATOR_MEMX_KEY", "test-dream-key")
     monkeypatch.setattr("familia.memx_client.memx_base_url", lambda: "http://memx")
     monkeypatch.setattr(
         "familia.principal_memory_ingestor.PrincipalMemoryIngestor",

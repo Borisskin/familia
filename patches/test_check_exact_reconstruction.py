@@ -7,11 +7,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from patches.check_exact_reconstruction import TreeEntry, _indexed_tree, _write_baseline_index
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECKER = ROOT / "patches" / "check_exact_reconstruction.py"
-UPSTREAM_REPO = ROOT.parent / "nanobot"
-UPSTREAM_COMMIT = "3f602fbc8c104b5af27aa4d3520e7dcef2fa70ec"
+UPSTREAM_REPO = Path(
+    os.environ.get("FAMILIA_UPSTREAM_REPO", str(ROOT.parent / "nanobot"))
+)
+UPSTREAM_COMMIT = "1bb712d3488915ca4ed9ccc1a93067ff722f5ab9"
 
 
 class ExactReconstructionAcceptanceTest(unittest.TestCase):
@@ -82,6 +86,21 @@ class ExactReconstructionAcceptanceTest(unittest.TestCase):
         self.assertIn("apply_valid=true", completed.stdout)
         self.assertIn("exact_equal=true", completed.stdout)
         self.assertIn("RESULT=PASS", completed.stdout)
+
+    def test_write_baseline_index_tracks_755_to_644(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = "scripts/install.sh"
+            _write_baseline_index(
+                root,
+                {path: TreeEntry(mode="100755", data=b"#!/bin/sh\necho ok\n")},
+            )
+            self.assertEqual(_indexed_tree(root)[path].mode, "100755")
+            _write_baseline_index(
+                root,
+                {path: TreeEntry(mode="100644", data=b"#!/bin/sh\necho ok\n")},
+            )
+            self.assertEqual(_indexed_tree(root)[path].mode, "100644")
 
 
 if __name__ == "__main__":

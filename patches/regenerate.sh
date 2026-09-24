@@ -45,21 +45,82 @@ fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-mkdir -p "$tmp/up/raw" "$tmp/up/nanobot/nanobot" "$tmp/current/nanobot"
-git -c "safe.directory=$UPSTREAM_REPO" -C "$UPSTREAM_REPO" archive "$UPSTREAM" nanobot pyproject.toml README.md \
+mkdir -p "$tmp/up/raw" "$tmp/up/nanobot" "$tmp/current/nanobot"
+git -c "safe.directory=$UPSTREAM_REPO" -C "$UPSTREAM_REPO" archive "$UPSTREAM" \
     | /usr/bin/tar -x -C "$tmp/up/raw"
-cp -a "$tmp/up/raw/nanobot/." "$tmp/up/nanobot/nanobot/"
-cp "$tmp/up/raw/pyproject.toml" "$tmp/up/nanobot/pyproject.toml"
-cp "$tmp/up/raw/README.md" "$tmp/up/nanobot/README.md"
+cp -a "$tmp/up/raw/." "$tmp/up/nanobot/"
+while IFS= read -r -d '' rel; do
+    target="$tmp/current/$rel"
+    mkdir -p "$(dirname "$target")"
+    cp -a "$REPO/$rel" "$target"
+done < <(
+    git -C "$REPO" ls-files --cached --others --exclude-standard -z -- nanobot
+)
 
-cp -a nanobot/nanobot "$tmp/current/nanobot/"
-cp nanobot/pyproject.toml "$tmp/current/nanobot/pyproject.toml"
-cp nanobot/README.md "$tmp/current/nanobot/README.md"
+mapfile -t excluded_upstream_paths < <(
+    python - "$REPO/patches/ownership.yaml" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    for row in json.load(handle)["excluded_upstream_paths"]:
+        print(row["path"])
+PY
+)
+ # Docker tar extraction applies the container umask instead of preserving
+ # Git's mode bits. Normalize both trees, then restore the committed modes
+ # recorded by their respective Git indexes.
+find "$tmp/up/nanobot" -type f -exec chmod 0644 {} +
+python - "$UPSTREAM_REPO" "$UPSTREAM" "$tmp/up/nanobot" <<'PY'
+import os
+import subprocess
+import sys
+
+repo, commit, upstream_root = sys.argv[1:]
+records = subprocess.check_output(
+    ["git", "-C", repo, "ls-tree", "-r", "-z", commit]
+)
+for record in records.split(b"\0"):
+    if not record:
+        continue
+    metadata, raw_path = record.split(b"\t", 1)
+    mode = metadata.split(b" ", 1)[0].decode("ascii")
+    target = os.path.join(upstream_root, *raw_path.decode("utf-8").split("/"))
+    if mode == "100755":
+        os.chmod(target, 0o755)
+    elif mode == "100644":
+        os.chmod(target, 0o644)
+PY
 
 # Windows bind mounts make every copied file look executable to Linux tools.
-# Preserve tracked modes through git apply; generated patches carry content
-# deltas only so untracked additions get the stable regular-file mode.
-find "$tmp/up/nanobot" "$tmp/current/nanobot" -type f -exec chmod 0644 {} +
+# Normalize untracked files to regular mode, then restore the tracked modes
+# recorded by the Familia index, including the deliberate install.sh delta.
+find "$tmp/current/nanobot" -type f -exec chmod 0644 {} +
+python - "$REPO" "$tmp/current/nanobot" <<'PY'
+import os
+import subprocess
+import sys
+
+repo, current_root = sys.argv[1:]
+records = subprocess.check_output(
+    ["git", "-C", repo, "ls-files", "--stage", "-z", "--", "nanobot"]
+)
+for record in records.split(b"\0"):
+    if not record:
+        continue
+    metadata, raw_path = record.split(b"\t", 1)
+    mode = metadata.split(b" ", 1)[0].decode("ascii")
+    relative = raw_path.decode("utf-8").removeprefix("nanobot/")
+    target = os.path.join(current_root, *relative.split("/"))
+    if mode == "100755":
+        os.chmod(target, 0o755)
+    elif mode == "100644":
+        os.chmod(target, 0o644)
+PY
+
+for rel in "${excluded_upstream_paths[@]}"; do
+    rm -f "$tmp/up/nanobot/$rel"
+done
 
 /usr/bin/find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' -delete
 
@@ -100,7 +161,7 @@ emit_patch() {
         echo "# nanobot baseline: $UPSTREAM_VERSION"
         echo "# upstream commit: $UPSTREAM"
         echo
-    git diff --no-index "${diff_args[@]}" 2>/dev/null || true
+        git diff --no-index "${diff_args[@]}" 2>/dev/null || true
     ) | normalize_diff_headers > "$PATCH_DIR/$name"
     echo "  $PATCH_DIR/$name"
 }
@@ -120,7 +181,9 @@ echo "-> upstream repo: $UPSTREAM_REPO"
 for rel in "${rels[@]}"; do
     left="$tmp/up/nanobot/$rel"
     right="$tmp/current/nanobot/$rel"
-    if [[ -f "$left" && -f "$right" ]] && cmp -s "$left" "$right"; then
+    if [[ -f "$left" && -f "$right" ]] \
+        && cmp -s "$left" "$right" \
+        && [[ "$(stat -c '%a' "$left")" == "$(stat -c '%a' "$right")" ]]; then
         continue
     fi
     emit_patch "$rel"

@@ -5,7 +5,7 @@ diff --git a/nanobot/nanobot/bus/queue.py b/nanobot/nanobot/bus/queue.py
 index 16b4b12..fd93ff7 100644
 --- a/nanobot/nanobot/bus/queue.py
 +++ b/nanobot/nanobot/bus/queue.py
-@@ -8,7 +8,7 @@
+@@ -8,7 +8,7 @@ from typing import Any, TypeVar, overload
  
  from loguru import logger
  
@@ -14,7 +14,7 @@ index 16b4b12..fd93ff7 100644
  from nanobot.bus.outbound_events import outbound_message_for_event
  from nanobot.events import AgentEvent
  
-@@ -28,9 +28,11 @@
+@@ -28,9 +28,11 @@ class MessageBus:
      ``publish_event``. Local state transitions never wait for network sends.
      """
  
@@ -27,11 +27,10 @@ index 16b4b12..fd93ff7 100644
          self._handlers: list[EventHandler] = []
          self._pending: set[asyncio.Task[None]] = set()
  
-@@ -41,6 +43,36 @@
-     async def consume_inbound(self) -> InboundMessage:
+@@ -42,6 +44,36 @@ class MessageBus:
          """Consume the next inbound message (blocks until available)."""
          return await self.inbound.get()
-+
+ 
 +    async def publish_callback(self, event: CallbackEvent) -> None:
 +        """Queue a typed channel callback without trusting its actor field."""
 +        if not isinstance(event, CallbackEvent):
@@ -61,18 +60,19 @@ index 16b4b12..fd93ff7 100644
 +            return None
 +        result = callback(event)
 +        return await result if inspect.isawaitable(result) else result
- 
++
      async def publish_outbound(self, msg: OutboundMessage) -> None:
          """Queue a routed message or event for its channel."""
-@@ -77,6 +109,11 @@
-     def outbound_size(self) -> int:
+         await self.outbound.put(msg)
+@@ -78,6 +110,11 @@ class MessageBus:
          """Number of pending outbound messages."""
          return self.outbound.qsize()
-+
+ 
 +    @property
 +    def callback_size(self) -> int:
 +        """Number of callbacks waiting for the runtime adapter."""
 +        return self.callbacks.qsize()
- 
++
      @overload
      def subscribe(
+         self, handler: Callable[[_EventT], Awaitable[None] | None],

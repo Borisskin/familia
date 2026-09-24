@@ -5,7 +5,7 @@ diff --git a/nanobot/nanobot/cli/commands.py b/nanobot/nanobot/cli/commands.py
 index cb65541..720bcf7 100644
 --- a/nanobot/nanobot/cli/commands.py
 +++ b/nanobot/nanobot/cli/commands.py
-@@ -74,6 +74,11 @@
+@@ -74,6 +74,11 @@ from nanobot.cli.webui_support import (  # noqa: E402
  )
  from nanobot.config.paths import get_workspace_path  # noqa: E402
  from nanobot.config.schema import Config  # noqa: E402
@@ -17,7 +17,7 @@ index cb65541..720bcf7 100644
  from nanobot.security.network import is_loopback_host  # noqa: E402
  from nanobot.utils.helpers import sanitize_surrogates as _sanitize_surrogates  # noqa: E402,F401
  from nanobot.utils.helpers import (  # noqa: E402
-@@ -357,6 +362,10 @@
+@@ -357,6 +362,10 @@ def serve(
      config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
  ):
      """Start the OpenAI-compatible API server (/v1/chat/completions)."""
@@ -28,7 +28,7 @@ index cb65541..720bcf7 100644
      try:
          from aiohttp import web  # noqa: F401
      except ImportError:
-@@ -368,9 +377,6 @@
+@@ -368,9 +377,6 @@ def serve(
      from nanobot.providers.image_generation import image_gen_provider_configs
      from nanobot.session.manager import SessionManager
  
@@ -38,7 +38,7 @@ index cb65541..720bcf7 100644
      api_cfg = runtime_config.api
      host = host if host is not None else api_cfg.host
      port = port if port is not None else api_cfg.port
-@@ -384,12 +390,19 @@
+@@ -384,12 +390,19 @@ def serve(
          raise typer.Exit(1)
      sync_workspace_templates(runtime_config.workspace_path)
      bus = MessageBus()
@@ -59,7 +59,7 @@ index cb65541..720bcf7 100644
              session_manager=session_manager,
              image_generation_provider_configs=image_gen_provider_configs(runtime_config),
              hook_factories=[create_file_edit_activity_hook],
-@@ -490,10 +503,15 @@
+@@ -490,10 +503,15 @@ def sessions_restore_workspace(
      from nanobot.session.manager import SessionManager
  
      runtime_config = _load_runtime_config(config, workspace)

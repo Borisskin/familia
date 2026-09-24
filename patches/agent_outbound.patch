@@ -4,7 +4,7 @@
 diff --git a/nanobot/nanobot/agent/outbound.py b/nanobot/nanobot/agent/outbound.py
 new file mode 100644
 index 0000000..c493c67
---- a/nanobot/nanobot/agent/outbound.py
+--- /dev/null
 +++ b/nanobot/nanobot/agent/outbound.py
 @@ -0,0 +1,62 @@
 +"""Neutral outbound policy request and decision types."""
