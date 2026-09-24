@@ -90,6 +90,7 @@ DeliveryObserver: TypeAlias = Callable[[Any, str], Awaitable[None]]
 DeliveryObserverFactory: TypeAlias = Callable[
     [Callable[..., Awaitable[Any]], Any, Callable[[], list[str]]], DeliveryObserver | None
 ]
+SystemJobRegistrar: TypeAlias = Callable[[Any], Any]
 RuntimeAdapterFactory: TypeAlias = Callable[[Any, "MessageBus | None"], "RuntimeAdapters"]
 
 
@@ -113,6 +114,7 @@ class RuntimeAdapters:
     run_dream: Callable[[str, Any], Any | Awaitable[Any]] | None = None
     run_heartbeat: Callable[[str, Any], Any | Awaitable[Any]] | None = None
     run_scheduled: Callable[[Any, Any], Any | Awaitable[Any]] | None = None
+    register_system_jobs: SystemJobRegistrar | None = None
     resolve_heartbeat_target: Callable[[str, set[str]], tuple[str, str] | None] | None = None
     make_heartbeat_source_reader: Callable[[str | None], Any] | None = None
     channel_plugins: Callable[[set[str] | None], Mapping[str, Any]] | None = None
@@ -303,6 +305,7 @@ __all__ = [
     "RUNTIME_REQUEST_CONTEXT_KEY",
     "RuntimeAdapterError",
     "RuntimeAdapters",
+    "SystemJobRegistrar",
     "RuntimeContextProvider",
     "RuntimeContextResult",
     "SessionAccessGuard",

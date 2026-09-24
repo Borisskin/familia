@@ -325,9 +325,9 @@
       "patch": "cli_gateway_runtime.patch",
       "owner": "familia-core",
       "category": "familia-invariant",
-      "behavior": "Gateway runtime подключает обязательный runtime adapter.",
-      "native_gap": "Нативный gateway не имеет product runtime adapter seam.",
-      "verification": "Docker exact reconstruction; tests/test_nanobot_context_extension.py",
+      "behavior": "Gateway runtime подключает обязательный runtime adapter и через него идемпотентно регистрирует три Familia-owned maintenance job.",
+      "native_gap": "Нативный gateway не имеет product runtime adapter seam и не знает Familia maintenance jobs.",
+      "verification": "Docker exact reconstruction; familia/tests/test_maintenance_recovery.py",
       "hunks": [
         {
           "range": "all",
@@ -415,9 +415,9 @@
       "patch": "runtime_adapters.patch",
       "owner": "familia-core",
       "category": "familia-invariant",
-      "behavior": "Добавлен нейтральный runtime seam для безопасного подключения Familia.",
+      "behavior": "Добавлен нейтральный runtime seam для безопасного подключения Familia, включая регистрацию system jobs.",
       "native_gap": "В upstream отсутствует файл; это product integration seam, не upstream API.",
-      "verification": "Docker exact reconstruction; tests/test_nanobot_context_extension.py",
+      "verification": "Docker exact reconstruction; familia/tests/test_maintenance_recovery.py",
       "hunks": [
         {
           "range": "all",

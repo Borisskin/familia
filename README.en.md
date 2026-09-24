@@ -10,8 +10,9 @@ or kids.
   <img src=".github/assets/familia-readme.jpg" alt="Familia assistant preview" width="960">
 </p>
 
-Repo: <https://github.com/Verconto/familia>. Latest release — `v0.5.60`,
-backend `0.2.3`.
+Repo: <https://github.com/Verconto/familia>. Latest published
+[release — `v0.5.73`](https://github.com/Verconto/familia/releases/tag/v0.5.73),
+backend `0.4.2`.
 
 ## Try it live
 
@@ -159,11 +160,11 @@ either the password or your SSH key — you'll need them in the next step.
 ### 2. Download the admin app
 
 Grab the latest `FamiliaAdmin-vX.Y.Z.exe` from
-[Releases](../../releases/latest). Put `WebView2Loader.dll` from the same
+[release](https://github.com/Verconto/familia/releases/latest). Put `WebView2Loader.dll` from the same
 release next to it — without it the app won't start.
 
-Windows only for now. macOS and Linux are coming later. There is no installer;
-the `.exe` is portable. SmartScreen will warn you the first time — click "More
+Windows only for now. macOS and Linux are coming later. You can choose the
+portable `.exe` or the installer. SmartScreen will warn you the first time — click "More
 info" → "Run anyway" (the app isn't code-signed; that's not in the hobby-project
 budget).
 

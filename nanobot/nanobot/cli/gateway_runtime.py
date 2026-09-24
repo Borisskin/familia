@@ -874,6 +874,10 @@ def _run_gateway(
         _advance_dream_cursor_if_behind(agent.context.memory)
         cron.remove_system_job("dream")
 
+    register_system_jobs = getattr(runtime_adapters, "register_system_jobs", None)
+    if callable(register_system_jobs):
+        register_system_jobs(cron)
+
     # Register Heartbeat system job (idempotent on restart)
     if hb_cfg.enabled:
         cron.register_system_job(CronJob(

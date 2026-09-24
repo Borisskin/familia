@@ -16,6 +16,7 @@ from typing import Any
 
 from loguru import logger
 
+from familia.nanobot_extension import maintenance
 from familia.nanobot_extension.cron import (
     dream_consolidator_memx_key,
     make_cron_delivery_observer,
@@ -912,6 +913,18 @@ async def run_scheduled(job: Any, loop: Any) -> Any:
         owner = _configured_job_owner(job, loop, name)
         return await run_heartbeat(owner, loop) if owner is not None else None
 
+    for job_id, runner in (
+        ("media_cleanup", maintenance.cleanup_media),
+        ("sessions_cleanup", maintenance.cleanup_sessions),
+        ("workspace_git_gc", maintenance.workspace_git_gc),
+    ):
+        if _is_trusted_system_job(job, job_id):
+            try:
+                runner()
+            except Exception:  # noqa: BLE001
+                logger.exception("Familia maintenance job {} failed", job_id)
+            return None
+
     cron = getattr(loop, "cron_service", None)
     if cron is None:
         logger.warning("Cron job {} skipped: loop has no cron service", getattr(job, "id", "?"))
@@ -943,6 +956,7 @@ def make_runtime_service_hooks(config: Any = None, bus: Any = None) -> dict[str,
         "run_dream": run_dream,
         "run_heartbeat": run_heartbeat,
         "run_scheduled": run_scheduled,
+        "register_system_jobs": maintenance.register_system_jobs,
         "outbound_guard": make_outbound_guard(),
     }
     if bus is not None:

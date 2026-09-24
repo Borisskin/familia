@@ -2,7 +2,7 @@
 # upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
 diff --git a/nanobot/nanobot/cli/gateway_runtime.py b/nanobot/nanobot/cli/gateway_runtime.py
-index dff86e2..7159919 100644
+index dff86e2..0dfc602 100644
 --- a/nanobot/nanobot/cli/gateway_runtime.py
 +++ b/nanobot/nanobot/cli/gateway_runtime.py
 @@ -1,6 +1,7 @@
@@ -136,4 +136,14 @@ index dff86e2..7159919 100644
 +        on_delivery_result=delivery_observer,
          config_path=Path(config_path),
      )
+ 
+@@ -831,4 +874,8 @@ def _run_gateway(
+         _advance_dream_cursor_if_behind(agent.context.memory)
+         cron.remove_system_job("dream")
+ 
++    register_system_jobs = getattr(runtime_adapters, "register_system_jobs", None)
++    if callable(register_system_jobs):
++        register_system_jobs(cron)
++
+     # Register Heartbeat system job (idempotent on restart)
  
