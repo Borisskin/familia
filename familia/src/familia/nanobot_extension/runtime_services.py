@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import inspect
 import json
-import os
 import threading
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import nullcontext
