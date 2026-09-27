@@ -34,6 +34,7 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable
 from contextlib import ExitStack
 from datetime import UTC
 from pathlib import Path
@@ -71,23 +72,22 @@ TOPICS_KEY = "shared:topics.graph"
 # and sandbox mode dies whenever the admin logs out of mp.weixin.qq.com —
 # both fail the "works for non-technical owner without ops" bar. Re-add
 # when we have a public-domain story.
+# China-only channels (DingTalk, Feishu, QQ, WeCom, MoChat) were dropped
+# from the admin 2026-09-25: they need Chinese accounts. The nanobot
+# adapters stay available through config.json.
 POLL_CHANNEL_KINDS = frozenset({
-    "telegram", "vk", "discord", "slack", "matrix",
-    "email", "dingtalk", "feishu", "qq", "wecom", "mochat",
+    "telegram", "vk", "discord", "slack", "matrix", "mattermost",
+    "email", "whatsapp",
 })
 
 # Mapping channel kind → import-name + pip-spec for runtime extras
 # install. Channels not listed here ship with no extras (use stdlib /
-# nanobot core deps).
+# nanobot core deps). Both fields may list several space-separated names.
 CHANNEL_DEPS: dict[str, tuple[str, str]] = {
     "discord":  ("discord",          "discord.py"),
     "slack":    ("slack_sdk",        "slack-sdk"),
     "matrix":   ("nio",              "matrix-nio"),
-    "dingtalk": ("dingtalk_stream",  "dingtalk-stream"),
-    "feishu":   ("lark_oapi",        "lark-oapi"),
-    "qq":       ("botpy",            "qq-botpy"),
-    "wecom":    ("wecom_aibot_sdk",  "wecom-aibot-sdk"),
-    "mochat":   ("socketio",         "python-socketio"),
+    "whatsapp": ("neonize segno",    "neonize>=0.4.3.post0,<0.5.0 segno>=1.6.1,<2.0.0"),
 }
 
 # SR-18: kinship terms must be resolved contextually via KINSHIP_RU, never
@@ -1746,6 +1746,21 @@ def build_parser() -> argparse.ArgumentParser:
                            help="JSON object with creds to test")
     p_ch_test.set_defaults(func=cmd_channels_test)
 
+    # WhatsApp links as a device by QR. The session lives in this process,
+    # so start/poll/cancel only work across calls inside ``rpc-server``.
+    p_ch_wa = pch_sub.add_parser("whatsapp-connect", parents=[json_parent],
+                                 help="link WhatsApp by QR: start, poll or cancel")
+    p_ch_wa.add_argument("action", choices=["start", "poll", "cancel"])
+    p_ch_wa.add_argument("--session-id", default="", dest="session_id")
+    p_ch_wa.add_argument("--force", action="store_true",
+                         help="start: re-link even if a session database exists")
+    p_ch_wa.add_argument(
+        "--request-stdin", action="store_true",
+        help='start: read {"proxy": ...} from stdin (the form value, may be the '
+             "redacted preview); keeps proxy credentials out of argv logs",
+    )
+    p_ch_wa.set_defaults(func=cmd_channels_whatsapp_connect)
+
     # Per-channel STT override. ``inherit`` clears the field so the channel
     # falls back to the global ``channels.transcriptionProvider`` default;
     # ``off`` disables transcription entirely; otherwise stores the named
@@ -2552,16 +2567,19 @@ def _save_config_json(path: Path, raw: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def _redact_channel_section(name: str, section: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy with secrets redacted for safe display in admin UI."""
+def redact_channel_section(kind: str, section: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy for the admin UI: legacy keys under their nanobot
+    names (so old Email/Matrix sections open filled in) and secrets
+    redacted. The file itself is not touched."""
     out = dict(section)
-    for key in ("token", "access_token", "password", "api_key"):
+    _migrate_legacy_channel_keys(kind, out)
+    for key in _SECRET_FIELDS:
         if isinstance(out.get(key), str) and out[key]:
-            out[key] = f"***{out[key][-4:]}"
+            out[key] = _redacted(out[key])
     # Proxy URLs may carry inline credentials (``socks5://user:pass@host``);
     # keep host:port visible for debugging but blank the userinfo so the
     # admin UI doesn't paint passwords.
-    for proxy_key in ("proxy", "media_proxy"):
+    for proxy_key in _PROXY_FIELDS:
         url = out.get(proxy_key)
         if isinstance(url, str) and url:
             out[proxy_key] = _redact_proxy_url(url)
@@ -2596,7 +2614,7 @@ def cmd_channels_list(args: argparse.Namespace) -> int:
         rows.append({
             "name": name,
             "enabled": bool(section.get("enabled", False)),
-            "config": _redact_channel_section(name, section),
+            "config": redact_channel_section(name, section),
             "addable": name in POLL_CHANNEL_KINDS,
         })
     rows.sort(key=lambda r: r["name"])
@@ -2618,9 +2636,133 @@ def cmd_channels_list(args: argparse.Namespace) -> int:
 
 
 _SECRET_FIELDS = (
-    "token", "access_token", "app_token", "password",
-    "client_secret", "app_secret", "secret",
+    "token", "access_token", "app_token", "bot_token", "password",
+    "imap_password", "smtp_password",
+    "client_secret", "app_secret", "secret", "api_key",
 )
+
+# Keys the old admin forms wrote but nanobot never read.
+_LEGACY_CHANNEL_KEYS = {
+    "email": {"user": "imap_username", "password": "imap_password"},
+    "matrix": {"user": "user_id"},
+}
+
+
+def _redacted(value: str) -> str:
+    return f"***{value[-4:]}"
+
+
+_PROXY_FIELDS = ("proxy", "media_proxy")
+
+# Fields a saved section must carry; empty tuple = nothing beyond enabled.
+_REQUIRED_CHANNEL_FIELDS: dict[str, tuple[str, ...]] = {
+    "telegram": ("token",),
+    "vk": ("access_token", "group_id"),
+    "discord": ("token",),
+    "slack": ("bot_token", "app_token"),
+    "matrix": ("homeserver", "user_id", "access_token"),
+    "mattermost": ("server_url", "token"),
+    "email": ("imap_host", "smtp_host", "imap_username", "imap_password"),
+}
+
+# Email SMTP fields the form never shows: they follow their IMAP source
+# unless someone set them to something else by hand.
+_EMAIL_DERIVED_FIELDS = (
+    ("imap_username", "smtp_username"),
+    ("imap_username", "from_address"),
+    ("imap_password", "smtp_password"),
+)
+
+
+class ChannelConfigError(ValueError):
+    """A channel form cannot become a config section; text is for the owner."""
+
+
+def _migrate_legacy_channel_keys(kind: str, section: dict[str, Any]) -> None:
+    for old, new in _LEGACY_CHANNEL_KEYS.get(kind, {}).items():
+        if old in section:
+            value = section.pop(old)
+            section.setdefault(new, value)
+
+
+def merge_channel_section(
+    kind: str, incoming: dict[str, Any], stored: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge a form payload with the stored section, shared by save,
+    connection test and WhatsApp linking.
+
+    Legacy keys are renamed on both sides; redacted previews the form
+    echoes back (``***xxxx`` secrets, ``scheme://***@host`` proxies) turn
+    back into the stored values; blank secrets keep the stored ones and
+    other blank strings mean "cleared".
+    """
+    section = dict(incoming)
+    stored = dict(stored)
+    _migrate_legacy_channel_keys(kind, stored)
+    _migrate_legacy_channel_keys(kind, section)
+    for key in _SECRET_FIELDS:
+        # A real secret never starts with the ``***`` of a redacted preview.
+        if isinstance(section.get(key), str) and section[key].startswith("***"):
+            del section[key]
+    for key in _PROXY_FIELDS:
+        value, kept = section.get(key), stored.get(key)
+        if not isinstance(value, str) or "://***@" not in value:
+            continue
+        if isinstance(kept, str) and value == _redact_proxy_url(kept):
+            section[key] = kept
+        else:
+            raise ChannelConfigError(
+                f"{key}: enter the full proxy address including login and password"
+            )
+    for key in _SECRET_FIELDS:
+        if not section.get(key) and stored.get(key):
+            section[key] = stored[key]
+    # The UI sends "" for an optional field the operator cleared (e.g. a
+    # removed proxy); ``proxy: ""`` on disk would break the adapter.
+    return {k: v for k, v in section.items() if v != ""}
+
+
+def _apply_email_defaults(section: dict[str, Any], stored: dict[str, Any]) -> None:
+    """Fill the nanobot email keys the form does not ask for.
+
+    Derived SMTP fields follow the IMAP login and password on every save
+    while they still equal the previous IMAP value; nanobot refuses to run
+    without ``consent_granted``.
+    """
+    for source, derived in _EMAIL_DERIVED_FIELDS:
+        value = section.get(source)
+        if value and (not section.get(derived) or section[derived] == stored.get(source)):
+            section[derived] = value
+    try:
+        ssl = int(section.get("smtp_port") or 0) == 465
+    except (TypeError, ValueError):
+        raise ChannelConfigError("smtp_port must be a number") from None
+    section["smtp_use_ssl"] = ssl
+    section["smtp_use_tls"] = not ssl
+    section["consent_granted"] = True
+
+
+def prepare_channel_section(
+    kind: str,
+    incoming: dict[str, Any],
+    stored: dict[str, Any],
+    *,
+    whatsapp_linked: Callable[[], bool],
+) -> dict[str, Any]:
+    """Turn a form payload into the section to save or raise
+    ``ChannelConfigError``."""
+    section = merge_channel_section(kind, incoming, stored)
+    missing = [k for k in _REQUIRED_CHANNEL_FIELDS.get(kind, ()) if not section.get(k)]
+    if missing:
+        raise ChannelConfigError(f"{kind} requires " + " and ".join(repr(k) for k in missing))
+    if kind == "email":
+        previous = dict(stored)
+        _migrate_legacy_channel_keys(kind, previous)
+        _apply_email_defaults(section, previous)
+    if kind == "whatsapp" and section.get("enabled", True) and not whatsapp_linked():
+        raise ChannelConfigError("whatsapp is not linked yet; scan the QR code first")
+    section.setdefault("enabled", True)
+    return section
 
 
 def cmd_channels_add(args: argparse.Namespace) -> int:
@@ -2655,45 +2797,13 @@ def cmd_channels_add(args: argparse.Namespace) -> int:
     path, raw = _load_config_json()
     channels = raw.setdefault("channels", {})
     existing = channels.get(args.name) if isinstance(channels.get(args.name), dict) else {}
-
-    # Carry over any secret field that the caller didn't include in the
-    # new section. We do this BEFORE validation so e.g. a proxy-only
-    # edit doesn't fail on "telegram requires 'token'" just because the
-    # form left the field blank.
-    for key in _SECRET_FIELDS:
-        if key not in section and existing.get(key):
-            section[key] = existing[key]
-
-    # Empty-string semantics on non-secret keys: the admin UI sends
-    # ``""`` for an optional text field that the operator deliberately
-    # cleared (e.g. removing a previously-set proxy). The cfg-merge on
-    # the frontend can't distinguish "didn't touch" from "explicitly
-    # cleared", so it leans on this convention. Drop those keys here
-    # so the persisted section reflects the operator's intent — if we
-    # left ``proxy: ""`` on disk the running adapter would read it as
-    # an empty proxy URL and httpx would refuse to talk to it.
-    # Secret fields are out of scope: the UI never sends an empty
-    # secret directly (the merge above already filled the gap).
-    for key in list(section.keys()):
-        if key in _SECRET_FIELDS:
-            continue
-        v = section[key]
-        if isinstance(v, str) and v == "":
-            del section[key]
-
-    # Light schema validation per channel — fail loudly so the operator
-    # learns about missing tokens before a restart silently drops the
-    # adapter from `_init_channels`.
-    if args.name == "telegram" and not section.get("token"):
-        print("error: telegram requires 'token'", file=sys.stderr)
+    try:
+        section = prepare_channel_section(
+            args.name, section, existing, whatsapp_linked=_whatsapp_linked,
+        )
+    except ChannelConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
-    if args.name == "vk" and (
-        not section.get("access_token") or not section.get("group_id")
-    ):
-        print("error: vk requires 'access_token' and 'group_id'", file=sys.stderr)
-        return 2
-
-    section.setdefault("enabled", True)
 
     channels[args.name] = section
     _save_config_json(path, raw)
@@ -2709,9 +2819,21 @@ def cmd_channels_add(args: argparse.Namespace) -> int:
 
 
 def _is_dep_importable(import_name: str) -> bool:
-    """Return True iff ``import_name`` resolves on the current sys.path."""
+    """Return True iff every name in ``import_name`` resolves on sys.path.
+
+    The long-lived ``rpc-server`` may predate a ``pip install --user``:
+    add a freshly created user-site and drop stale finder caches so the
+    same process can import the new package (WhatsApp links right after
+    installing neonize).
+    """
+    import importlib
     import importlib.util as _u
-    return _u.find_spec(import_name) is not None
+    import site
+    user_site = site.getusersitepackages()
+    if os.path.isdir(user_site) and user_site not in sys.path:
+        site.addsitedir(user_site)
+    importlib.invalidate_caches()
+    return all(_u.find_spec(name) is not None for name in import_name.split())
 
 
 def cmd_channels_deps_status(args: argparse.Namespace) -> int:
@@ -2768,7 +2890,7 @@ def cmd_channels_deps_install(args: argparse.Namespace) -> int:
         print(f"deps for {kind!r} already importable ({import_name}) — no-op")
         return 0
     import subprocess
-    cmd = [sys.executable, "-m", "pip", "install", "--user", "--no-cache-dir", pip_spec]
+    cmd = [sys.executable, "-m", "pip", "install", "--user", "--no-cache-dir", *pip_spec.split()]
     print(f"running: {' '.join(cmd)}", file=sys.stderr)
     try:
         result = subprocess.run(
@@ -2924,10 +3046,10 @@ def _channel_test_email(cfg: dict[str, Any]) -> tuple[bool, str]:
     import imaplib
     host = (cfg.get("imap_host") or "").strip()
     port = int(cfg.get("imap_port") or 993)
-    user = (cfg.get("user") or "").strip()
-    pwd = (cfg.get("password") or "").strip()
+    user = (cfg.get("imap_username") or "").strip()
+    pwd = (cfg.get("imap_password") or "").strip()
     if not host or not user or not pwd:
-        return False, "imap_host / user / password missing"
+        return False, "imap_host / imap_username / imap_password missing"
     try:
         with imaplib.IMAP4_SSL(host, port, timeout=10) as imap:
             imap.login(user, pwd)
@@ -2936,13 +3058,33 @@ def _channel_test_email(cfg: dict[str, Any]) -> tuple[bool, str]:
         return False, f"error: {e}"
 
 
+def _channel_test_mattermost(cfg: dict[str, Any]) -> tuple[bool, str]:
+    import httpx
+    url = (cfg.get("server_url") or "").strip().rstrip("/")
+    tok = (cfg.get("token") or "").strip()
+    if not url or not tok:
+        return False, "server_url or token missing"
+    try:
+        r = httpx.get(
+            f"{url}/api/v4/users/me",
+            headers={"Authorization": f"Bearer {tok}"},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            return True, f"connected as @{r.json().get('username')}"
+        return False, f"HTTP {r.status_code}: {r.text[:200]}"
+    except Exception as e:  # noqa: BLE001 - external channel probe boundary
+        return False, f"error: {e}"
+
+
 _CHANNEL_TESTERS = {
-    "telegram": _channel_test_telegram,
-    "vk":       _channel_test_vk,
-    "discord":  _channel_test_discord,
-    "slack":    _channel_test_slack,
-    "matrix":   _channel_test_matrix,
-    "email":    _channel_test_email,
+    "telegram":   _channel_test_telegram,
+    "vk":         _channel_test_vk,
+    "discord":    _channel_test_discord,
+    "slack":      _channel_test_slack,
+    "matrix":     _channel_test_matrix,
+    "mattermost": _channel_test_mattermost,
+    "email":      _channel_test_email,
 }
 
 
@@ -2968,19 +3110,22 @@ def cmd_channels_test(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "message": "--config must be JSON object"}))
         return 0
 
-    # Secret merge: same _SECRET_FIELDS list as cmd_channels_add.
+    # Same merge as cmd_channels_add, so masks never reach the tester.
     try:
         _, raw = _load_config_json()
-        existing = (raw.get("channels") or {}).get(args.kind) or {}
-        if isinstance(existing, dict):
-            for key in _SECRET_FIELDS:
-                if not cfg.get(key) and existing.get(key):
-                    cfg[key] = existing[key]
+        existing = (raw.get("channels") or {}).get(args.kind)
     except (OSError, json.JSONDecodeError):
         # Test must keep working when there's no on-disk config yet
-        # (fresh install) — fall through with whatever the caller
-        # supplied; the tester will surface the missing-secret error.
-        pass
+        # (fresh install); the tester will surface the missing-secret error.
+        existing = None
+    try:
+        cfg = merge_channel_section(
+            args.kind, cfg, existing if isinstance(existing, dict) else {},
+        )
+    except ChannelConfigError as exc:
+        print(json.dumps({"ok": False, "message": str(exc), "implemented": True},
+                         ensure_ascii=False))
+        return 0
 
     tester = _CHANNEL_TESTERS.get(args.kind)
     if tester is None:
@@ -2994,6 +3139,114 @@ def cmd_channels_test(args: argparse.Namespace) -> int:
     ok, message = tester(cfg)
     out = {"ok": ok, "message": message, "implemented": True}
     print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
+def _use_gateway_nanobot_config() -> None:
+    """Point nanobot path helpers at the gateway's config.json, so the
+    WhatsApp session database is written and looked up where the
+    gateway's WhatsAppChannel reads it."""
+    from nanobot.config.loader import set_config_path
+    set_config_path(_config_path())
+
+
+def _whatsapp_linked() -> bool:
+    from nanobot.channels.whatsapp.state import local_state_present
+    _use_gateway_nanobot_config()
+    _, raw = _load_config_json()
+    return local_state_present((raw.get("channels") or {}).get("whatsapp") or {})
+
+
+class _NanobotWhatsAppLink:
+    """Production WhatsApp link: nanobot's connect store on its own asyncio
+    loop in a daemon thread, so a pending QR session survives between
+    ``rpc-server`` calls."""
+
+    def __init__(self) -> None:
+        import asyncio
+        import threading
+
+        from nanobot.channels.whatsapp.connect import WhatsAppConnectStore
+
+        class _Store(WhatsAppConnectStore):
+            # nanobot builds the login channel from the saved config only;
+            # the admin links before saving, so the form's proxy goes here.
+            proxy_override: str | None = None
+
+            def _build_channel(self) -> tuple[Any, Path]:
+                channel, target = super()._build_channel()
+                if self.proxy_override is not None:
+                    channel.config.proxy = self.proxy_override
+                return channel, target
+
+        _use_gateway_nanobot_config()
+        self._store = _Store()
+        self._loop = asyncio.new_event_loop()
+        threading.Thread(target=self._loop.run_forever, name="whatsapp-connect",
+                         daemon=True).start()
+
+    def handle(self, action: str, *, session_id: str, force: bool,
+               proxy: str | None) -> dict[str, Any]:
+        import asyncio
+
+        query: dict[str, list[str]] = {}
+        if session_id:
+            query["session_id"] = [session_id]
+        if force:
+            query["force"] = ["1"]
+        if action == "start":
+            self._store.proxy_override = proxy
+        return asyncio.run_coroutine_threadsafe(
+            self._store.handle(action, query), self._loop
+        ).result(timeout=60)
+
+
+# One link per rpc-server process; tests replace it.
+_WHATSAPP_LINK: Any = None
+
+
+def _whatsapp_link() -> Any:
+    global _WHATSAPP_LINK
+    if _WHATSAPP_LINK is None:
+        _WHATSAPP_LINK = _NanobotWhatsAppLink()
+    return _WHATSAPP_LINK
+
+
+def cmd_channels_whatsapp_connect(args: argparse.Namespace) -> int:
+    """Drive nanobot's WhatsApp QR linking and print its status payload.
+
+    ``qr_url`` (the raw pairing string) is replaced by ``qr_svg``, a
+    ready-to-show data URI, so the admin needs no QR library.
+    """
+    try:
+        _, raw = _load_config_json()
+        stored = (raw.get("channels") or {}).get("whatsapp")
+        stored = stored if isinstance(stored, dict) else {}
+        proxy = None
+        if args.action == "start" and args.request_stdin:
+            body = json.load(sys.stdin)
+            form_proxy = body.get("proxy") if isinstance(body, dict) else None
+            if isinstance(form_proxy, str):
+                proxy = merge_channel_section(
+                    "whatsapp", {"proxy": form_proxy}, stored,
+                ).get("proxy", "")
+        # nanobot swaps the session database right after the scan; a
+        # running gateway channel must not be using it at that moment.
+        if args.action == "start" and stored.get("enabled") and (
+            args.force or not _whatsapp_linked()
+        ):
+            raise ChannelConfigError("disable the WhatsApp channel before linking a new number")
+        payload = _whatsapp_link().handle(
+            args.action, session_id=args.session_id, force=args.force, proxy=proxy,
+        )
+        qr = payload.pop("qr_url", "")
+        if qr:
+            import segno
+            payload["qr_svg"] = segno.make(qr, error="m").svg_data_uri(scale=6, border=2)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the admin as a JSON error
+        _emit_error_json(f"WhatsApp: {exc}", code="WHATSAPP_CONNECT")
+        return 1
+    print(json.dumps({"schema_version": 1, **payload}, ensure_ascii=False))
     return 0
 
 
@@ -3345,6 +3598,9 @@ def _cmd_channels_set_enabled(args: argparse.Namespace, enabled: bool) -> int:
     section = channels.get(args.name)
     if not isinstance(section, dict):
         print(f"error: channel {args.name!r} is not configured", file=sys.stderr)
+        return 2
+    if enabled and args.name == "whatsapp" and not _whatsapp_linked():
+        print("error: whatsapp is not linked yet; scan the QR code first", file=sys.stderr)
         return 2
     if section.get("enabled") == enabled:
         # Idempotent — make the no-op visible to the caller but don't
