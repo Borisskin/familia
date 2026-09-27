@@ -89,6 +89,21 @@ def test_supported_kinds_match_the_field_contract(config, capsys):
     assert {row["kind"] for row in json.loads(out)["channels"]} == KINDS
 
 
+def test_whatsapp_deps_need_python_magic(config, capsys, monkeypatch):
+    import importlib.util
+
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec",
+                        lambda name, *a: None if name == "magic" else real(name, *a))
+
+    rc, out, _ = run(capsys, "channels", "deps", "status", "--json")
+
+    row = {r["kind"]: r for r in json.loads(out)["channels"]}["whatsapp"]
+    assert rc == 0
+    assert row["installed"] is False
+    assert "python-magic" in row["pip_spec"]
+
+
 @pytest.mark.parametrize("argv", [
     ("channels", "add", "feishu", "--config", "{}"),
     ("channels", "test", "qq", "--config", "{}"),

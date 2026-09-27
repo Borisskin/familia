@@ -87,7 +87,9 @@ CHANNEL_DEPS: dict[str, tuple[str, str]] = {
     "discord":  ("discord",          "discord.py"),
     "slack":    ("slack_sdk",        "slack-sdk"),
     "matrix":   ("nio",              "matrix-nio"),
-    "whatsapp": ("neonize segno",    "neonize>=0.4.3.post0,<0.5.0 segno>=1.6.1,<2.0.0"),
+    # nanobot's WhatsApp channel also imports ``magic`` (python-magic).
+    "whatsapp": ("neonize segno magic",
+                 "neonize>=0.4.3.post0,<0.5.0 segno>=1.6.1,<2.0.0 python-magic>=0.4.27,<0.5"),
 }
 
 # SR-18: kinship terms must be resolved contextually via KINSHIP_RU, never
