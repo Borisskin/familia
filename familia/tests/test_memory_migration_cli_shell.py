@@ -1588,3 +1588,39 @@ def test_isolated_cli_plain_apply_summary_uses_result(
     _run_stubbed_apply_cli(tmp_path, result=result, json_output=False)
 
     assert capsys.readouterr().out.strip() == expected_output
+
+
+def test_configured_history_consolidator_uses_real_nanobot_provider(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "defaults": {
+                        "model": "default-model",
+                        "modelPreset": "migration",
+                    }
+                },
+                "modelPresets": {
+                    "migration": {"model": "preset-model", "provider": "custom"}
+                },
+                "providers": {
+                    "custom": {"apiKey": "test-key", "apiBase": "https://example.com/v1"}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    consolidate = memory_migration.make_configured_history_consolidator(config_path)
+
+    chat = AsyncMock(return_value=SimpleNamespace(content="- durable fact"))
+    with patch("nanobot.providers.base.LLMProvider.chat_with_retry", chat):
+        result = asyncio.run(
+            consolidate("alice", [{"cursor": 1, "content": "legacy"}], "")
+        )
+
+    assert result == "- durable fact"
+    assert chat.await_args.kwargs["model"] == "preset-model"

@@ -508,12 +508,12 @@ def make_configured_history_consolidator(
     """Load nanobot's configured provider lazily for CLI migration apply."""
 
     from nanobot.config.loader import load_config, resolve_config_env_vars
-    from nanobot.nanobot import _make_provider
+    from nanobot.providers.factory import make_provider
 
     resolved = config_path.expanduser().resolve() if config_path is not None else None
-    config = resolve_config_env_vars(load_config(resolved))
-    provider = _make_provider(config)
-    return make_history_consolidator(provider, config.agents.defaults.model)
+    config = resolve_config_env_vars(load_config(resolved), config_path=resolved)
+    provider = make_provider(config)
+    return make_history_consolidator(provider, config.resolve_preset().model)
 
 
 async def apply_legacy_transition_plan(
