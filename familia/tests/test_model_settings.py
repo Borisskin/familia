@@ -211,3 +211,33 @@ def test_agents_get_preserves_codex_oauth_provider_fields(
         "extra_body": {"model": "openai-codex/gpt-5", "keep": "oauth"},
     }
     capsys.readouterr()
+
+
+def test_apply_slot_rotates_camel_case_provider_credentials() -> None:
+    from nanobot.config.schema import Config
+
+    from familia.model_settings import apply_slot
+
+    raw = {
+        "agents": {"defaults": {"model": "openai/old", "provider": "openai"}},
+        "providers": {
+            "openai": {"apiKey": "synthetic-old", "apiBase": "https://old.example/v1"}
+        },
+    }
+
+    apply_slot(
+        raw,
+        slot="main",
+        model="openai/new",
+        provider="openai",
+        api_key="synthetic-new",
+        api_base="https://new.example/v1",
+    )
+
+    assert raw["providers"]["openai"] == {
+        "apiKey": "synthetic-new",
+        "apiBase": "https://new.example/v1",
+    }
+    openai = Config.model_validate(raw).providers.openai
+    assert openai.api_key == "synthetic-new"
+    assert openai.api_base == "https://new.example/v1"

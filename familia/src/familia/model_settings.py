@@ -381,10 +381,11 @@ def apply_slot(
     if not isinstance(providers, dict):
         raise ModelSettingsError("providers must be an object")
     config = _raw_provider_config(providers, provider_name)
+    # Nanobot serializes camelCase; a leftover alias would win validation.
     if api_key:
-        config["api_key"] = api_key
+        _set_alias(config, ("apiKey", "api_key"), api_key)
     if api_base:
-        config["api_base"] = api_base
+        _set_alias(config, ("apiBase", "api_base"), api_base)
     if api_key or api_base:
         if "providers" not in candidate or candidate["providers"] is None:
             candidate["providers"] = providers

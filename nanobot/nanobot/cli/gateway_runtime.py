@@ -149,6 +149,58 @@ def _install_gateway_shutdown_handlers(
     return restore
 
 
+def _install_gateway_reload_handler(
+    loop: asyncio.AbstractEventLoop,
+    reload: Callable[[], Awaitable[None]],
+) -> Callable[[], None]:
+    """Run ``reload`` on SIGHUP and return a restore callback.
+
+    External tools (Familia Admin) send HUP after editing channels or
+    principals.  Reloads are serialised; HUPs arriving mid-reload collapse
+    into one follow-up pass because every pass re-reads the current files.
+    """
+    sighup = getattr(signal, "SIGHUP", None)
+    if sighup is None:
+        return lambda: None
+    lock = asyncio.Lock()
+    pending = False
+    running: set[asyncio.Task[None]] = set()
+
+    async def run_reload() -> None:
+        nonlocal pending
+        if lock.locked():
+            pending = True
+            return
+        async with lock:
+            while True:
+                pending = False
+                try:
+                    await reload()
+                except Exception:
+                    logger.exception("SIGHUP: runtime reload failed")
+                if not pending:
+                    return
+
+    def on_sighup() -> None:
+        task = loop.create_task(run_reload(), name="nanobot-sighup-reload")
+        running.add(task)
+        task.add_done_callback(running.discard)
+
+    try:
+        loop.add_signal_handler(sighup, on_sighup)
+    except (NotImplementedError, RuntimeError, ValueError):
+        logger.warning("SIGHUP reload handler is not available")
+        return lambda: None
+
+    def restore() -> None:
+        with suppress(NotImplementedError, RuntimeError, ValueError):
+            loop.remove_signal_handler(sighup)
+        for task in running:
+            task.cancel()
+
+    return restore
+
+
 def _advance_dream_cursor_if_behind(memory: Any) -> None:
     latest = memory.get_latest_cursor()
     if memory.get_last_dream_cursor() < latest:
@@ -953,6 +1005,23 @@ def _run_gateway(
             tasks,
             console.print,
         )
+
+        async def _reload_from_disk() -> None:
+            reload_runtime = runtime_adapters.reload_runtime
+            if reload_runtime is not None:
+                try:
+                    reload_runtime()
+                    logger.info("SIGHUP: runtime registry reloaded")
+                except Exception:
+                    logger.exception("SIGHUP: runtime registry reload failed")
+            # Tracked with the runtime tasks so shutdown cancels it too.
+            tasks.append(await channels.reload_from_disk())
+            logger.info("SIGHUP: channels reloaded: {}", ", ".join(channels.enabled_channels) or "none")
+
+        restore_reload_handler = _install_gateway_reload_handler(
+            asyncio.get_running_loop(),
+            _reload_from_disk,
+        )
         try:
             await cron.start()
             # Re-read once on first admission to close the watcher subscription window.
@@ -1042,6 +1111,8 @@ def _run_gateway(
                 # failed before any runtime task or listener was created.
                 raise typer.Exit(1)
         finally:
+            # No reload may restart channels while the gateway shuts down.
+            restore_reload_handler()
             try:
                 if shutdown_task and not shutdown_task.done():
                     shutdown_task.cancel()

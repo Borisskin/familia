@@ -12,6 +12,8 @@ from typing import Any
 from loguru import logger
 from nanobot.config.paths import get_data_dir, get_media_dir, get_workspace_path
 
+from familia.session_storage import active_sessions_dir
+
 MEDIA_TTL_SECONDS = 24 * 60 * 60
 SESSIONS_TTL_SECONDS = 90 * 24 * 60 * 60
 MEDIA_CLEANUP_INTERVAL_MS = 60 * 60 * 1000
@@ -49,9 +51,9 @@ def cleanup_media(ttl_seconds: int = MEDIA_TTL_SECONDS) -> tuple[int, int]:
 
 
 def cleanup_sessions(ttl_seconds: int = SESSIONS_TTL_SECONDS) -> tuple[int, int]:
-    """Delete stale JSONL sessions under the current workspace only."""
-    root = get_workspace_path() / "sessions"
-    if not root.exists():
+    """Delete stale JSONL sessions in the current workspace's namespace only."""
+    root = _sessions_dir()
+    if root is None:
         return 0, 0
     cutoff = time.time() - ttl_seconds
     deleted = 0
@@ -101,7 +103,7 @@ def disk_usage_report() -> dict[str, Any]:
     )
     categories = (
         ("media", get_media_dir()),
-        ("sessions", workspace / "sessions"),
+        ("sessions", _sessions_dir() or workspace / "sessions"),
         ("memory", workspace / "memory"),
         ("workspace_git", workspace / ".git"),
         ("audit", Path(audit_file)),
@@ -118,6 +120,10 @@ def disk_usage_report() -> dict[str, Any]:
     except OSError:
         vm = {"path": "/", "free_bytes": 0, "total_bytes": 0}
     return {"schema_version": 1, "categories": result, "vm": vm}
+
+
+def _sessions_dir() -> Path | None:
+    return active_sessions_dir(get_data_dir(), get_workspace_path())
 
 
 def _path_size(path: Path) -> tuple[int, int]:

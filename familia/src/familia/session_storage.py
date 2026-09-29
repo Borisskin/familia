@@ -75,6 +75,18 @@ def _same_workspace(recorded: str, workspace: Path) -> bool:
         return False
 
 
+def active_sessions_dir(data_dir: Path, workspace: Path) -> Path | None:
+    """Return this workspace's session namespace without creating or migrating it."""
+    try:
+        workspace_id = _read_workspace_id(_workspace_id_marker(workspace))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    namespace = data_dir / "sessions" / workspace_id
+    if namespace.is_symlink() or not namespace.is_dir():
+        return None
+    return namespace
+
+
 def _root_claim_marker(sessions_root: Path) -> Path:
     return sessions_root.parent / _ROOT_CLAIM_FILE
 

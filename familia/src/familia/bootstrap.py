@@ -1200,6 +1200,7 @@ def make_runtime_adapters(config: Any, bus: Any = None) -> Any:
         ),
         "callback_handler": hooks.pop("callback_handler", _callback_handler(bus)),
         "outbound_guard": outbound_guard,
+        "reload_runtime": reload_runtime_registry,
     }
     values.update(hooks)
     return RuntimeAdapters(**values)

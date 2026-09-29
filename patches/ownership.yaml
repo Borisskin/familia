@@ -282,7 +282,7 @@
       "category": "familia-invariant",
       "behavior": "Менеджер каналов подключает product runtime adapters Familia.",
       "native_gap": "Нативный manager не содержит seam для product-owned adapters.",
-      "verification": "Docker exact reconstruction; nanobot/tests/channels/test_manager.py",
+      "verification": "Docker exact reconstruction; nanobot/tests/channels/test_manager.py; familia/tests/test_gateway_sighup_reload.py",
       "hunks": [
         {
           "range": "all",
@@ -327,7 +327,7 @@
       "category": "familia-invariant",
       "behavior": "Gateway runtime подключает обязательный runtime adapter и через него идемпотентно регистрирует три Familia-owned maintenance job.",
       "native_gap": "Нативный gateway не имеет product runtime adapter seam и не знает Familia maintenance jobs.",
-      "verification": "Docker exact reconstruction; familia/tests/test_maintenance_recovery.py",
+      "verification": "Docker exact reconstruction; familia/tests/test_maintenance_recovery.py; familia/tests/test_gateway_sighup_reload.py",
       "hunks": [
         {
           "range": "all",

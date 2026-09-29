@@ -725,6 +725,27 @@ class ChannelManager:
         for name in list(self.channels):
             await self._stop_channel(name)
 
+    async def reload_from_disk(self) -> asyncio.Task[None]:
+        """Rebuild every channel from the config file (gateway SIGHUP).
+
+        The new config is read before anything stops, so an unreadable file
+        leaves the running channels intact.  Returns the background task that
+        runs the re-initialised channels.
+        """
+        from nanobot.config.loader import load_config, resolve_config_env_vars
+
+        new_config = resolve_config_env_vars(load_config(self._config_path))
+        # Keep the workspace the gateway booted with (CLI --workspace override).
+        new_config.agents.defaults.workspace = self.config.agents.defaults.workspace
+        await self.stop_all()
+        self.channels.clear()
+        self._channel_owners.clear()
+        self._channel_runtime_specs.clear()
+        self._channel_errors.clear()
+        self.config = new_config
+        self._init_channels()
+        return asyncio.create_task(self.start_all(), name="nanobot-channels-reload")
+
     @staticmethod
     def _fingerprint_content(content: str) -> str:
         normalized = " ".join(content.split())

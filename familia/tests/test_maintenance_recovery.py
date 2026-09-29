@@ -14,15 +14,16 @@ def test_disk_usage_report_keeps_admin_schema_and_current_paths(tmp_path, monkey
     data = tmp_path / "data"
     workspace = tmp_path / "workspace"
     media = data / "media"
-    sessions = workspace / "sessions"
+    sessions = _session_namespace(data, workspace)
     memory = workspace / "memory"
     git = workspace / ".git"
     cron = workspace / "cron"
     logs = data / "logs"
     audit = data / "audit.jsonl"
-    for path in (media, sessions, memory, git, cron, logs):
+    for path in (media, memory, git, cron, logs):
         path.mkdir(parents=True)
     (media / "one.bin").write_bytes(b"123")
+    (sessions / "chat.jsonl").write_bytes(b"12345")
     audit.write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr(maintenance, "get_data_dir", lambda: data)
     monkeypatch.setattr(maintenance, "get_media_dir", lambda: media)
@@ -43,15 +44,28 @@ def test_disk_usage_report_keeps_admin_schema_and_current_paths(tmp_path, monkey
         "logs",
     }
     assert all({"name", "path", "bytes", "files"} <= set(item) for item in report["categories"])
+    by_name = {item["name"]: item for item in report["categories"]}
+    assert by_name["sessions"]["path"] == str(sessions)
+    assert by_name["sessions"]["bytes"] >= 5
     assert {"path", "free_bytes", "total_bytes"} <= set(report["vm"])
 
 
+def _session_namespace(data: Path, workspace: Path) -> Path:
+    from familia.session_storage import prepare_familia_session_storage
+
+    workspace.mkdir(parents=True, exist_ok=True)
+    config = SimpleNamespace(runtime_data_dir=data, workspace_path=workspace)
+    prepared = prepare_familia_session_storage(config)
+    return prepared.sessions_root / prepared.workspace_id
+
+
 def test_cleanup_media_and_sessions_respect_retention_and_scope(tmp_path, monkeypatch):
+    data = tmp_path / "data"
     media = tmp_path / "media"
     workspace = tmp_path / "workspace"
-    sessions = workspace / "sessions"
+    sessions = _session_namespace(data, workspace)
+    other_workspace_sessions = _session_namespace(data, tmp_path / "other")
     media.mkdir(parents=True)
-    sessions.mkdir(parents=True)
     old_media = media / "old.bin"
     new_media = media / "new.bin"
     old_media.write_bytes(b"old")
@@ -62,9 +76,13 @@ def test_cleanup_media_and_sessions_respect_retention_and_scope(tmp_path, monkey
     old_session.write_bytes(b"old")
     new_session.write_bytes(b"new")
     ignored.write_bytes(b"keep")
+    other_old = other_workspace_sessions / "old.jsonl"
+    other_old.write_bytes(b"other")
     old_time = time.time() - 10
     os.utime(old_media, (old_time, old_time))
     os.utime(old_session, (old_time, old_time))
+    os.utime(other_old, (old_time, old_time))
+    monkeypatch.setattr(maintenance, "get_data_dir", lambda: data)
     monkeypatch.setattr(maintenance, "get_media_dir", lambda: media)
     monkeypatch.setattr(maintenance, "get_workspace_path", lambda: workspace)
 
@@ -75,6 +93,7 @@ def test_cleanup_media_and_sessions_respect_retention_and_scope(tmp_path, monkey
     assert not old_session.exists()
     assert new_session.exists()
     assert ignored.exists()
+    assert other_old.exists()
 
 
 def test_workspace_git_gc_is_confined_to_workspace(tmp_path, monkeypatch):

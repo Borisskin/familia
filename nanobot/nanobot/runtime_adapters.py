@@ -121,6 +121,8 @@ class RuntimeAdapters:
     register_channel_descriptor: Callable[[Any], None] | None = None
     callback_handler: Callable[[Any], Any | Awaitable[Any]] | None = None
     outbound_guard: OutboundGuard | None = None
+    # Re-read product state kept in memory (gateway SIGHUP).
+    reload_runtime: Callable[[], Any] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.context_providers, tuple):
