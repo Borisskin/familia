@@ -12,7 +12,7 @@ from familia.nanobot_extension import maintenance, runtime_services
 
 def test_disk_usage_report_keeps_admin_schema_and_current_paths(tmp_path, monkeypatch):
     data = tmp_path / "data"
-    workspace = tmp_path / "workspace"
+    workspace = tmp_path / "configured-workspace"
     media = data / "media"
     sessions = _session_namespace(data, workspace)
     memory = workspace / "memory"
@@ -25,9 +25,8 @@ def test_disk_usage_report_keeps_admin_schema_and_current_paths(tmp_path, monkey
     (media / "one.bin").write_bytes(b"123")
     (sessions / "chat.jsonl").write_bytes(b"12345")
     audit.write_text("{}\n", encoding="utf-8")
-    monkeypatch.setattr(maintenance, "get_data_dir", lambda: data)
+    _use_config(monkeypatch, tmp_path, data, workspace)
     monkeypatch.setattr(maintenance, "get_media_dir", lambda: media)
-    monkeypatch.setattr(maintenance, "get_workspace_path", lambda: workspace)
     monkeypatch.setenv("FAMILIA_AUDIT_FILE", str(audit))
     monkeypatch.delenv("NANOBOT_AUDIT_FILE", raising=False)
 
@@ -50,6 +49,18 @@ def test_disk_usage_report_keeps_admin_schema_and_current_paths(tmp_path, monkey
     assert {"path", "free_bytes", "total_bytes"} <= set(report["vm"])
 
 
+def _use_config(monkeypatch, tmp_path: Path, data: Path, workspace: Path) -> None:
+    """Activate a real config whose workspace is not nanobot's default."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    data.mkdir(parents=True, exist_ok=True)
+    config_path = data / "config.json"
+    config_path.write_text(
+        json.dumps({"agents": {"defaults": {"workspace": str(workspace)}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+
+
 def _session_namespace(data: Path, workspace: Path) -> Path:
     from familia.session_storage import prepare_familia_session_storage
 
@@ -62,7 +73,7 @@ def _session_namespace(data: Path, workspace: Path) -> Path:
 def test_cleanup_media_and_sessions_respect_retention_and_scope(tmp_path, monkeypatch):
     data = tmp_path / "data"
     media = tmp_path / "media"
-    workspace = tmp_path / "workspace"
+    workspace = tmp_path / "configured-workspace"
     sessions = _session_namespace(data, workspace)
     other_workspace_sessions = _session_namespace(data, tmp_path / "other")
     media.mkdir(parents=True)
@@ -82,9 +93,8 @@ def test_cleanup_media_and_sessions_respect_retention_and_scope(tmp_path, monkey
     os.utime(old_media, (old_time, old_time))
     os.utime(old_session, (old_time, old_time))
     os.utime(other_old, (old_time, old_time))
-    monkeypatch.setattr(maintenance, "get_data_dir", lambda: data)
+    _use_config(monkeypatch, tmp_path, data, workspace)
     monkeypatch.setattr(maintenance, "get_media_dir", lambda: media)
-    monkeypatch.setattr(maintenance, "get_workspace_path", lambda: workspace)
 
     assert maintenance.cleanup_media(ttl_seconds=5) == (1, 3)
     assert maintenance.cleanup_sessions(ttl_seconds=5) == (1, 3)
@@ -97,9 +107,9 @@ def test_cleanup_media_and_sessions_respect_retention_and_scope(tmp_path, monkey
 
 
 def test_workspace_git_gc_is_confined_to_workspace(tmp_path, monkeypatch):
-    workspace = tmp_path / "workspace"
+    workspace = tmp_path / "configured-workspace"
     (workspace / ".git").mkdir(parents=True)
-    monkeypatch.setattr(maintenance, "get_workspace_path", lambda: workspace)
+    _use_config(monkeypatch, tmp_path, tmp_path / "data", workspace)
     calls = []
 
     def fake_run(command, **kwargs):

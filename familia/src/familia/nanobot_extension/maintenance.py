@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
-from nanobot.config.paths import get_data_dir, get_media_dir, get_workspace_path
+from nanobot.config.loader import load_config
+from nanobot.config.paths import get_data_dir, get_media_dir
 
 from familia.session_storage import active_sessions_dir
 
@@ -74,7 +75,7 @@ def cleanup_sessions(ttl_seconds: int = SESSIONS_TTL_SECONDS) -> tuple[int, int]
 
 def workspace_git_gc() -> bool:
     """Run only automatic garbage collection in the configured workspace."""
-    workspace = get_workspace_path()
+    workspace = _workspace()
     if not (workspace / ".git").is_dir():
         return False
     try:
@@ -95,7 +96,7 @@ def workspace_git_gc() -> bool:
 def disk_usage_report() -> dict[str, Any]:
     """Return the stable report consumed by the admin Maintenance page."""
     data_dir = get_data_dir()
-    workspace = get_workspace_path()
+    workspace = _workspace()
     audit_file = (
         os.environ.get("NANOBOT_AUDIT_FILE")
         or os.environ.get("FAMILIA_AUDIT_FILE")
@@ -122,8 +123,13 @@ def disk_usage_report() -> dict[str, Any]:
     return {"schema_version": 1, "categories": result, "vm": vm}
 
 
+def _workspace() -> Path:
+    """Workspace of the active config (``agents.defaults.workspace``)."""
+    return load_config().workspace_path
+
+
 def _sessions_dir() -> Path | None:
-    return active_sessions_dir(get_data_dir(), get_workspace_path())
+    return active_sessions_dir(get_data_dir(), _workspace())
 
 
 def _path_size(path: Path) -> tuple[int, int]:
