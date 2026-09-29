@@ -1,0 +1,187 @@
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
+
+diff --git a/nanobot/tests/test_runtime_adapters.py b/nanobot/tests/test_runtime_adapters.py
+new file mode 100644
+index 0000000..fcf799b
+--- /dev/null
++++ b/nanobot/tests/test_runtime_adapters.py
+@@ -0,0 +1,178 @@
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++import typer
++
++from nanobot.agent.loop import AgentLoop
++from nanobot.agent.tools.context import RequestContext
++from nanobot.agent.tools.registry import ToolRegistry
++from nanobot.bus.events import InboundMessage
++from nanobot.bus.queue import MessageBus
++from nanobot.config.schema import Config
++from nanobot.runtime_adapters import (
++    RUNTIME_MODE_ENV,
++    Admission,
++    ArchiveResult,
++    RuntimeAdapterError,
++    RuntimeAdapters,
++    default_context_factory,
++    load_runtime_adapters,
++    prepare_session_storage_root,
++    validate_prepared_session_manager,
++)
++
++
++def _provider() -> MagicMock:
++    provider = MagicMock()
++    provider.get_default_model.return_value = "test-model"
++    provider.generation = SimpleNamespace(
++        max_tokens=4096,
++        temperature=0.1,
++        reasoning_effort=None,
++    )
++    return provider
++
++
++def _config(tmp_path) -> Config:
++    return Config.model_validate(
++        {"agents": {"defaults": {"workspace": str(tmp_path)}}}
++    )
++
++
++def test_admission_context_keeps_server_identity_and_session_key() -> None:
++    message = InboundMessage(
++        channel="test",
++        sender_id="untrusted-client-value",
++        chat_id="chat",
++        content="hello",
++    )
++    admission = Admission(actor="principal-1", session_key="familia:principal-1:test:chat", message=message)
++
++    context = default_context_factory(admission, message)
++
++    assert isinstance(context, RequestContext)
++    assert context.actor == "principal-1"
++    assert context.session_key == "familia:principal-1:test:chat"
++    assert ArchiveResult(committed=False, retryable=True).retryable
++
++
++@pytest.mark.asyncio
++async def test_admit_inbound_uses_admitted_actor_not_client_actor(tmp_path) -> None:
++    message = InboundMessage(
++        channel="test",
++        sender_id="untrusted-client-value",
++        chat_id="chat",
++        content="hello",
++        actor="client-owner",
++    )
++    admission = Admission(
++        actor="server-owner",
++        session_key="familia:server-owner:test:chat",
++        message=message,
++    )
++    loop = AgentLoop(
++        bus=MessageBus(),
++        provider=_provider(),
++        workspace=tmp_path,
++        runtime_adapters=RuntimeAdapters(admit=lambda _: admission),
++    )
++
++    admitted = await loop._admit_inbound(message)
++
++    assert admitted is not None
++    assert admitted.actor == "server-owner"
++    assert admitted.session_key_override == "familia:server-owner:test:chat"
++
++
++def test_standard_mode_keeps_native_agent_loop_available(monkeypatch, tmp_path) -> None:
++    monkeypatch.delenv(RUNTIME_MODE_ENV, raising=False)
++    adapters = RuntimeAdapters()
++
++    loop = AgentLoop(
++        bus=MessageBus(),
++        provider=_provider(),
++        workspace=tmp_path,
++        runtime_adapters=load_runtime_adapters(adapters=adapters),
++    )
++
++    assert loop.runtime_adapters is adapters
++
++
++def test_explicit_adapters_override_selected_familia_mode_for_direct_loop(
++    monkeypatch, tmp_path
++) -> None:
++    monkeypatch.setenv(RUNTIME_MODE_ENV, "familia")
++    adapters = RuntimeAdapters()
++
++    loop = AgentLoop(
++        bus=MessageBus(),
++        provider=_provider(),
++        workspace=tmp_path,
++        runtime_adapters=adapters,
++    )
++
++    assert loop.runtime_adapters is adapters
++
++
++def test_explicit_adapters_override_selected_familia_mode_from_config(
++    monkeypatch, tmp_path
++) -> None:
++    monkeypatch.setenv(RUNTIME_MODE_ENV, "familia")
++
++    adapters = RuntimeAdapters()
++    loop = AgentLoop.from_config(
++        _config(tmp_path),
++        tool_registry=ToolRegistry(),
++        runtime_adapters=adapters,
++        provider=_provider(),
++    )
++
++    assert loop.runtime_adapters is adapters
++
++
++def test_selected_familia_mode_rejects_cli_and_gateway_before_startup(
++    monkeypatch, tmp_path
++) -> None:
++    from nanobot.cli import commands
++    from nanobot.cli.gateway_runtime import _run_gateway
++
++    config = _config(tmp_path)
++    monkeypatch.setenv(RUNTIME_MODE_ENV, "familia")
++    monkeypatch.setattr(commands, "_load_runtime_config", lambda *args: config)
++
++    with pytest.raises(typer.Exit):
++        commands.serve()
++    with pytest.raises(typer.Exit):
++        _run_gateway(config, health_server_enabled=False)
++
++
++def test_prepared_storage_receipt_is_scoped_to_workspace_namespace(tmp_path) -> None:
++    root = tmp_path / "runtime" / "sessions"
++    workspace_a = tmp_path / "workspace-a"
++    workspace_b = tmp_path / "workspace-b"
++
++    def prepare(config):
++        workspace_id = "a" if config.workspace_path == workspace_a else "b"
++        return SimpleNamespace(sessions_root=root, workspace_id=workspace_id)
++
++    adapters = RuntimeAdapters(prepare_session_storage=prepare)
++    prepare_session_storage_root(
++        SimpleNamespace(workspace_path=workspace_a, runtime_data_dir=tmp_path / "runtime"),
++        adapters,
++    )
++    validate_prepared_session_manager(
++        SimpleNamespace(workspace=workspace_a, sessions_dir=root / "a"),
++        workspace_a,
++    )
++
++    with pytest.raises(RuntimeAdapterError, match="workspace namespace"):
++        validate_prepared_session_manager(
++            SimpleNamespace(workspace=workspace_b, sessions_dir=root / "a"),
++            workspace_b,
++        )
++    with pytest.raises(RuntimeAdapterError, match="workspace namespace"):
++        validate_prepared_session_manager(
++            SimpleNamespace(workspace=workspace_a, sessions_dir=root / "b"),
++            workspace_a,
++        )

@@ -3,8 +3,8 @@
 
 set -euo pipefail
 
-EXPECTED_COMMIT="950dddec499fbbe0353e997158c99808f0bb41e1"
-EXPECTED_VERSION="0.1.5.post2"
+EXPECTED_COMMIT="1bb712d3488915ca4ed9ccc1a93067ff722f5ab9"
+EXPECTED_VERSION="0.3.5"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 UPSTREAM_REPO="${UPSTREAM_REPO:-$(cd "$REPO/.." && pwd)/nanobot}"
@@ -15,7 +15,7 @@ grep -q "$EXPECTED_VERSION" patches/README.md
 grep -q "$EXPECTED_COMMIT" patches/regenerate.sh
 grep -q "$EXPECTED_VERSION" patches/regenerate.sh
 
-! grep -R "328a386\\|0806ac02c" patches/README.md patches/regenerate.sh >/dev/null
+! grep -R "950dddec499fbbe0353e997158c99808f0bb41e1\\|0.1.5.post2" patches/README.md patches/regenerate.sh >/dev/null
 
 ! grep -R "AppData/Local/Temp\\|/tmp/tmp\\|Temp/tmp" patches/*.patch >/dev/null
 

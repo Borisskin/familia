@@ -6,6 +6,7 @@ openspec/
 !docker-compose.memx.local.yml
 .tmp-*
 _tmp_*
+/NUL
 audit_*.txt
 audit_*.jsonl
 
@@ -51,3 +52,5 @@ __pycache__/
 # Editor / IDE
 .idea/
 .vscode/
+# Local Pi runtime state
+.atl/

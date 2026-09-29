@@ -1,200 +1,265 @@
-# nanobot baseline: 0.1.5.post2
-# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
 diff --git a/nanobot/nanobot/channels/manager.py b/nanobot/nanobot/channels/manager.py
-index f8f2c1d..b295b9f 100644
+index 1da6aad..0a77c00 100644
 --- a/nanobot/nanobot/channels/manager.py
 +++ b/nanobot/nanobot/channels/manager.py
-@@ -11,6 +11,7 @@ from loguru import logger
- from nanobot.bus.events import OutboundMessage
+@@ -25,7 +25,7 @@ from nanobot.bus.outbound_events import (
+ )
  from nanobot.bus.queue import MessageBus
- from nanobot.channels.base import BaseChannel
-+from nanobot.channels.inbound import InboundEnricher
- from nanobot.config.schema import Config
- from nanobot.utils.restart import consume_restart_notice_from_env, format_restart_completed_message
- 
-@@ -47,10 +48,14 @@ class ChannelManager:
-         bus: MessageBus,
-         *,
-         session_manager: "SessionManager | None" = None,
-+        inbound_enrichers: list[InboundEnricher] | None = None,
-+        channel_classes: dict[str, type[BaseChannel]] | None = None,
+ from nanobot.channels._setup import channel_setup_spec
+-from nanobot.channels.base import BaseChannel
++from nanobot.channels.base import BaseChannel, DeliveryResult, DeliveryUnavailableError
+ from nanobot.channels.contracts import (
+     channel_default_config,
+     channel_instance_specs,
+@@ -111,6 +111,9 @@ class ChannelManager:
+             Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] | None
+         ) = None,
+         config_path: Path | None = None,
++        channel_enabled: Callable[[str, bool], bool] | None = None,
++        runtime_adapters: Any | None = None,
++        on_delivery_result: Callable[[OutboundMessage, DeliveryResult], Awaitable[None]] | None = None,
      ):
-         self.config = config
-         self.bus = bus
-         self._session_manager = session_manager
-+        self._inbound_enrichers = list(inbound_enrichers or [])
-+        self._channel_classes = dict(channel_classes or {})
+         if config_path is None:
+             from nanobot.config.loader import get_config_path
+@@ -133,6 +136,13 @@ class ChannelManager:
+         self._webui_mcp_reload = webui_mcp_reload
+         self._webui_skill_state_action = webui_skill_state_action
+         self._webui_recovery_action = webui_recovery_action
++        self._channel_enabled = channel_enabled
++        self._runtime_adapters = runtime_adapters
++        self._on_delivery_result = on_delivery_result
++        self._runtime_callback_handler = getattr(runtime_adapters, "callback_handler", None)
++        set_callback_handler = getattr(self.bus, "set_callback_handler", None)
++        if callable(set_callback_handler) and self._runtime_callback_handler is not None:
++            set_callback_handler(self._runtime_callback_handler)
          self.channels: dict[str, BaseChannel] = {}
-         self._dispatch_task: asyncio.Task | None = None
+         self._channel_owners: dict[str, str] = {}
+         self._channel_runtime_specs: dict[str, tuple[str, str]] = {}
+@@ -156,6 +166,7 @@ class ChannelManager:
+         config: Config | None = None,
+         default_sections: dict[str, Any] | None = None,
+         default_enabled: bool | None = None,
++        default_config: dict[str, Any] | None = None,
+     ) -> Any:
+         config = config or self.config
+         section = getattr(config.channels, name, None)
+@@ -164,9 +175,9 @@ class ChannelManager:
+         if section is not None or not default_enabled:
+             return section
+         if default_sections is None:
+-            return _default_channel_config(name)
++            return default_config if default_config is not None else _default_channel_config(name)
+         if name not in default_sections:
+-            default = _default_channel_config(name)
++            default = default_config if default_config is not None else _default_channel_config(name)
+             if default is not None:
+                 default_sections[name] = default
+         return default_sections.get(name)
+@@ -236,16 +247,50 @@ class ChannelManager:
+         from nanobot.channels.registry import discover_plugins
+         from nanobot.optional_features import ensure_enabled_channel_dependencies
  
-@@ -60,11 +65,14 @@ class ChannelManager:
-         """Initialize channels discovered via pkgutil scan + entry_points plugins."""
-         from nanobot.channels.registry import discover_all
- 
--        transcription_provider = self.config.channels.transcription_provider
--        transcription_key = self._resolve_transcription_key(transcription_provider)
--        transcription_base = self._resolve_transcription_base(transcription_provider)
-+        global_provider = self.config.channels.transcription_provider
- 
--        for name, cls in discover_all().items():
-+        discovered = discover_all()
-+        # Runtime adapters can provide domain-owned channels without putting
-+        # their modules back under nanobot.channels.
-+        discovered.update(getattr(self, "_channel_classes", {}))
-+
-+        for name, cls in discovered.items():
-             section = getattr(self.config.channels, name, None)
+-        plugins = discover_plugins()
++        plugins = dict(discover_plugins())
++        plugin_loader = getattr(self._runtime_adapters, "channel_plugins", None)
++        register_descriptor = getattr(
++            self._runtime_adapters, "register_channel_descriptor", None
++        )
++        external_plugins: Mapping[str, Any] = {}
++        if callable(plugin_loader):
++            loaded = plugin_loader(None)
++            if loaded is not None:
++                if not isinstance(loaded, Mapping):
++                    raise TypeError("runtime channel plugin loader must return a mapping")
++                external_plugins = loaded
++            # The registrar is a handshake as well as a registry hook; invoke
++            # it even when this adapter has no descriptors to register.
++            if callable(register_descriptor) and not external_plugins:
++                try:
++                    register_descriptor(None)
++                except Exception as exc:
++                    logger.debug("Runtime channel descriptor hook rejected empty registration: {}", exc)
++        for name, plugin in external_plugins.items():
++            if callable(register_descriptor):
++                try:
++                    register_descriptor(plugin)
++                except Exception as exc:
++                    logger.debug("Runtime channel descriptor registration for {}: {}", name, exc)
++            if name in plugins:
++                logger.warning("Runtime channel descriptor collides with built-in '{}'; keeping built-in", name)
++                continue
++            plugins[name] = plugin
+         default_sections: dict[str, Any] = {}
+         activations: dict[str, tuple[Any, list[tuple[str, Any]]]] = {}
+         enabled_names: set[str] = set()
+         for name, plugin in plugins.items():
++            configured = getattr(self.config.channels, name, None) is not None
++            if self._channel_enabled is not None and not self._channel_enabled(name, configured):
++                continue
+             section = self._channel_section(
+                 name,
+                 default_sections=default_sections,
+                 default_enabled=plugin.default_enabled,
++                default_config=(channel_default_config(plugin) if name in external_plugins else None),
+             )
++            if section is None and plugin.default_enabled:
++                section = channel_default_config(plugin)
              if section is None:
                  continue
-@@ -85,21 +93,71 @@ class ChannelManager:
-                     if static_path is not None:
-                         kwargs["static_dist_path"] = static_path
-                 channel = cls(section, self.bus, **kwargs)
--                channel.transcription_provider = transcription_provider
--                channel.transcription_api_key = transcription_key
--                channel.transcription_api_base = transcription_base
-+                channel.set_inbound_enrichers(getattr(self, "_inbound_enrichers", []))
-+                # Per-channel transcription override:
-+                #   - section.transcription_provider == "off" → skip STT entirely
-+                #     (api_key="" makes BaseChannel.transcribe_audio short-circuit).
-+                #   - section.transcription_provider in {groq, openai, yandex} →
-+                #     use that provider's creds from config.providers.<name>.
-+                #   - missing / empty / "inherit" → fall back to the global default.
-+                section_provider = self._section_transcription_provider(section)
-+                effective = section_provider or global_provider
-+                if effective == "off":
-+                    channel.transcription_provider = "off"
-+                    channel.transcription_api_key = ""
-+                    channel.transcription_api_base = ""
-+                    channel.transcription_folder_id = ""
-+                else:
-+                    channel.transcription_provider = effective
-+                    channel.transcription_api_key = self._resolve_transcription_key(effective)
-+                    channel.transcription_api_base = self._resolve_transcription_base(effective)
-+                    channel.transcription_folder_id = self._resolve_transcription_folder_id(effective)
-+                # Shared per-turn STT seconds budget. Channels that
-+                # don't expose forward/reply re-processing simply
-+                # ignore this attribute.
-+                channel.audio_budget_s = int(
-+                    getattr(self.config.channels, "transcription_audio_budget_s", 300)
-+                    or 300
-+                )
-+                # Optional global STT language hint (empty = provider
-+                # default).
-+                channel.transcription_lang = (
-+                    getattr(self.config.channels, "transcription_lang", "") or ""
-+                )
-                 self.channels[name] = channel
--                logger.info("{} channel enabled", cls.display_name)
-+                logger.info(
-+                    "{} channel enabled (stt={})",
-+                    cls.display_name, channel.transcription_provider,
-+                )
-             except Exception as e:
-                 logger.warning("{} channel not available: {}", name, e)
+             try:
+@@ -680,6 +725,27 @@ class ChannelManager:
+         for name in list(self.channels):
+             await self._stop_channel(name)
  
-         self._validate_allow_from()
- 
-+    @staticmethod
-+    def _section_transcription_provider(section: Any) -> str:
-+        """Read ``transcription_provider`` from a channel section without
-+        crashing on either dict-shape or pydantic-shape configs.
++    async def reload_from_disk(self) -> asyncio.Task[None]:
++        """Rebuild every channel from the config file (gateway SIGHUP).
 +
-+        Returns "" when the field is unset / "inherit" — caller treats that
-+        as "use the global default".
++        The new config is read before anything stops, so an unreadable file
++        leaves the running channels intact.  Returns the background task that
++        runs the re-initialised channels.
 +        """
-+        if isinstance(section, dict):
-+            raw = section.get("transcription_provider", "")
-+        else:
-+            raw = getattr(section, "transcription_provider", "") or ""
-+        raw = (raw or "").strip().lower()
-+        if raw in ("", "inherit", "default"):
-+            return ""
-+        return raw
++        from nanobot.config.loader import load_config, resolve_config_env_vars
 +
-     def _resolve_transcription_key(self, provider: str) -> str:
-         """Pick the API key for the configured transcription provider."""
-         try:
-             if provider == "openai":
-                 return self.config.providers.openai.api_key
-+            if provider == "yandex":
-+                return self.config.providers.yandex.api_key or ""
-             return self.config.providers.groq.api_key
-         except AttributeError:
-             return ""
-@@ -109,10 +167,21 @@ class ChannelManager:
-         try:
-             if provider == "openai":
-                 return self.config.providers.openai.api_base or ""
-+            if provider == "yandex":
-+                return self.config.providers.yandex.api_base or ""
-             return self.config.providers.groq.api_base or ""
-         except AttributeError:
-             return ""
- 
-+    def _resolve_transcription_folder_id(self, provider: str) -> str:
-+        """Pick the folder id (yandex-only) for the configured transcription provider."""
-+        if provider != "yandex":
-+            return ""
-+        try:
-+            return self.config.providers.yandex.folder_id or ""
-+        except AttributeError:
-+            return ""
-+
-     def _validate_allow_from(self) -> None:
-         for name, ch in self.channels.items():
-             cfg = ch.config
-@@ -184,6 +253,7 @@ class ChannelManager:
-                 await self._dispatch_task
-             except asyncio.CancelledError:
-                 pass
-+            self._dispatch_task = None
- 
-         # Stop all channels
-         for name, channel in self.channels.items():
-@@ -192,6 +262,44 @@ class ChannelManager:
-                 logger.info("Stopped {} channel", name)
-             except Exception as e:
-                 logger.error("Error stopping {}: {}", name, e)
-+        self.channels.clear()
-+
-+    async def reload_from_disk(self, new_config: Config) -> None:
-+        """Hot-reload channels in-process to pick up a fresh ``config.json``.
-+
-+        Called by the SIGHUP handler on the gateway. Avoids a full
-+        ``docker restart`` (~30 s of Python startup + agent init) by
-+        keeping the long-running pieces of the gateway intact and only
-+        recycling the channel adapters that actually changed.
-+
-+        Strategy: stop everything, swap in the new config, re-init all
-+        channels, start_all again. We don't do a per-channel diff
-+        because (a) the operations admin can do (add/remove/enable/
-+        disable/edit-config) all touch the channel's state in
-+        non-trivial ways — restarting the adapter is the safe baseline,
-+        (b) ``stop_all`` + ``start_all`` together are still
-+        sub-second per channel and the operator only triggers a
-+        reload after a deliberate config edit.
-+        """
-+        logger.info("Channel reload: stopping running adapters")
++        new_config = resolve_config_env_vars(load_config(self._config_path))
++        # Keep the workspace the gateway booted with (CLI --workspace override).
++        new_config.agents.defaults.workspace = self.config.agents.defaults.workspace
 +        await self.stop_all()
-+        # Replace config and re-init. ``_init_channels`` honours
-+        # ``enabled: false`` and skips stale entries, so a removed
-+        # channel simply isn't re-created.
++        self.channels.clear()
++        self._channel_owners.clear()
++        self._channel_runtime_specs.clear()
++        self._channel_errors.clear()
 +        self.config = new_config
 +        self._init_channels()
-+        if not self.channels:
-+            logger.info("Channel reload: no enabled channels in new config")
-+            return
-+        # Start in the background — ``start_all`` blocks on
-+        # ``asyncio.gather(*tasks)`` (channels run forever), and we
-+        # don't want the SIGHUP handler to wait for that.
-+        asyncio.create_task(self.start_all())
-+        logger.info(
-+            "Channel reload: re-initialised {} channel(s): {}",
-+            len(self.channels),
-+            ", ".join(sorted(self.channels.keys())),
-+        )
++        return asyncio.create_task(self.start_all(), name="nanobot-channels-reload")
++
+     @staticmethod
+     def _fingerprint_content(content: str) -> str:
+         normalized = " ".join(content.split())
+@@ -725,24 +791,48 @@ class ChannelManager:
+             task.cancel()
+         await asyncio.gather(*tasks, return_exceptions=True)
  
-     async def _dispatch_outbound(self) -> None:
-         """Dispatch outbound messages to the appropriate channel."""
++    async def _notify_delivery_result(
++        self,
++        msg: OutboundMessage,
++        result: DeliveryResult,
++    ) -> None:
++        if self._on_delivery_result is None:
++            return
++        try:
++            await self._on_delivery_result(msg, result)
++        except Exception:
++            logger.exception("Delivery-result observer failed for {}:{}", msg.channel, msg.chat_id)
++
+     async def _queue_outbound(self, channel: BaseChannel, msg: OutboundMessage) -> None:
+         """Bound scheduled sends; preserve FIFO per destination, not across chats.
+ 
+         Retry waits occupy only their destination and one send slot. Saturation
+         pauses dispatch rather than creating unbounded tasks or dropping messages.
+         """
+-        await self._outbound_slots.acquire()
++        try:
++            await self._outbound_slots.acquire()
++        except asyncio.CancelledError:
++            await self._notify_delivery_result(msg, "unknown")
++            raise
+         if msg.channel in self._stopping_channels or self.channels.get(msg.channel) is not channel:
+             self._outbound_slots.release()
++            await self._notify_delivery_result(msg, "unknown")
+             return
+         key = (msg.channel, msg.chat_id)
+         previous = self._outbound_tails.get(key)
++        reported = False
+ 
+         async def send() -> None:
+-            if previous is not None:
+-                await asyncio.shield(asyncio.gather(previous, return_exceptions=True))
+-            async with self._outbound_sends:
+-                await self._send_with_retry(channel, msg)
++            nonlocal reported
++            result: DeliveryResult = "unknown"
++            try:
++                if previous is not None:
++                    await asyncio.shield(asyncio.gather(previous, return_exceptions=True))
++                async with self._outbound_sends:
++                    result = await self._send_with_retry(channel, msg)
++            finally:
++                reported = True
++                await self._notify_delivery_result(msg, result)
+ 
+         task = asyncio.create_task(send(), name=f"outbound-{msg.channel}-{msg.chat_id}")
+         self._outbound_tasks[task] = key
+@@ -753,6 +843,11 @@ class ChannelManager:
+             if self._outbound_tails.get(key) is done:
+                 self._outbound_tails.pop(key, None)
+             self._outbound_slots.release()
++            if not reported:
++                asyncio.create_task(
++                    self._notify_delivery_result(msg, "unknown"),
++                    name=f"outbound-result-{msg.channel}-{msg.chat_id}",
++                )
+             if not done.cancelled() and (error := done.exception()) is not None:
+                 logger.error("Outbound delivery to {}:{} failed: {}", *key, error)
+ 
+@@ -843,6 +938,7 @@ class ChannelManager:
+                     await self._queue_outbound(channel, msg)
+                 else:
+                     logger.warning("Unknown channel: {}", msg.channel)
++                    await self._notify_delivery_result(msg, "unavailable")
+ 
+             except asyncio.TimeoutError:
+                 continue
+@@ -1001,7 +1097,7 @@ class ChannelManager:
+         msg: OutboundMessage,
+         *,
+         deadline: float | None = None,
+-    ) -> None:
++    ) -> DeliveryResult:
+         """Send a message with retry on failure using exponential backoff.
+ 
+         When deadline is provided, retry until that monotonic time instead of
+@@ -1011,23 +1107,29 @@ class ChannelManager:
+         """
+         max_attempts = max(self.config.channels.send_max_retries, 1)
+         attempt = 0
++        had_ambiguous_attempt = False
+ 
+         while True:
+             attempt += 1
+             try:
+                 await self._send_once(channel, msg)
+-                return  # Send succeeded
++                return "delivered"
+             except asyncio.CancelledError:
+                 raise  # Propagate cancellation for graceful shutdown
+             except Exception as e:
+-                if not channel.should_retry_send_error(e):
++                if isinstance(e, DeliveryUnavailableError) or not channel.should_retry_send_error(e):
+                     logger.error(
+                         "Send to {} failed with a non-retryable {}: {}",
+                         msg.channel,
+                         type(e).__name__,
+                         e,
+                     )
+-                    return
++                    return (
++                        "unavailable"
++                        if isinstance(e, DeliveryUnavailableError) and not had_ambiguous_attempt
++                        else "unknown"
++                    )
++                had_ambiguous_attempt = True
+                 loop = asyncio.get_running_loop()
+                 exhausted = (
+                     attempt >= max_attempts
+@@ -1039,7 +1141,7 @@ class ChannelManager:
+                         "Failed to send to {} after {} attempts",
+                         msg.channel, attempt,
+                     )
+-                    return
++                    return "unknown"
+                 delay = _SEND_RETRY_DELAYS[min(attempt - 1, len(_SEND_RETRY_DELAYS) - 1)]
+                 if deadline is not None:
+                     delay = min(delay, max(0.0, deadline - loop.time()))

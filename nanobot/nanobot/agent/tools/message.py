@@ -1,22 +1,66 @@
 """Message tool for sending messages to users."""
 
-from contextvars import ContextVar
-from typing import Any, Awaitable, Callable
+# pyright: reportIncompatibleMethodOverride=false
 
-from nanobot.agent.outbound import OutboundGuard, OutboundRequest, allow_outbound
-from nanobot.agent.tools.base import Tool, tool_parameters
+from collections.abc import Awaitable, Callable, Generator
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
+from pathlib import Path
+from typing import Any, cast
+
+from loguru import logger
+
+from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
+from nanobot.agent.tools.context import ToolContext, current_request_context
+from nanobot.agent.tools.path_utils import resolve_workspace_path
 from nanobot.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
 from nanobot.bus.events import OutboundMessage
+from nanobot.config.paths import get_workspace_path
+from nanobot.security.workspace_access import current_tool_workspace
+
+_CURRENT_MESSAGE_SENDS: ContextVar[set[tuple[str, str]] | None] = ContextVar(
+    "message_sends",
+    default=None,
+)
+
+
+@contextmanager
+def capture_message_deliveries() -> Generator[set[tuple[str, str]], None, None]:
+    """Record successful MessageTool targets within one agent run."""
+    sends: set[tuple[str, str]] = set()
+    token = _CURRENT_MESSAGE_SENDS.set(sends)
+    try:
+        yield sends
+    finally:
+        _CURRENT_MESSAGE_SENDS.reset(token)
 
 
 @tool_parameters(
     tool_parameters_schema(
-        content=StringSchema("The message content to send"),
-        channel=StringSchema("Optional: target channel (telegram, discord, etc.)"),
-        chat_id=StringSchema("Optional: target chat/user ID"),
+        content=StringSchema(
+            "Message content for proactive or cross-channel delivery. "
+            "Do not use this for a normal reply in the current chat."
+        ),
+        channel=StringSchema(
+            "Optional target channel for cross-channel/proactive delivery. "
+            "Do not set this to the current runtime channel for a normal reply."
+        ),
+        chat_id=StringSchema(
+            "Optional target chat/user ID for cross-channel/proactive delivery. "
+            "On WebSocket/WebUI turns: omit chat_id to use the server's conversation id "
+            "(never pass client_id values like anon-…). "
+            "Do not set this to the current runtime chat for a normal reply."
+        ),
         media=ArraySchema(
             StringSchema(""),
-            description="Optional: list of file paths to attach (images, audio, documents)",
+            description=(
+                "Optional list of existing file paths to attach. "
+                "Use artifact paths returned by generate_image here when delivering generated images."
+            ),
+        ),
+        buttons=ArraySchema(
+            ArraySchema(StringSchema("Button label")),
+            description="Optional: inline keyboard buttons as list of rows, each row is list of button labels.",
         ),
         required=["content"],
     )
@@ -30,51 +74,43 @@ class MessageTool(Tool):
         default_channel: str = "",
         default_chat_id: str = "",
         default_message_id: str | None = None,
-        outbound_guard: OutboundGuard | None = None,
+        workspace: str | Path | None = None,
+        restrict_to_workspace: bool = False,
     ):
         self._send_callback = send_callback
-        self._outbound_guard = outbound_guard or allow_outbound
-        self._default_channel: ContextVar[str] = ContextVar("message_default_channel", default=default_channel)
-        self._default_chat_id: ContextVar[str] = ContextVar("message_default_chat_id", default=default_chat_id)
-        self._default_message_id: ContextVar[str | None] = ContextVar(
-            "message_default_message_id",
-            default=default_message_id,
+        self._workspace = (
+            Path(workspace).expanduser() if workspace is not None else get_workspace_path()
         )
-        # ContextVar holds a mutable 1-element list so writes from child
-        # contexts (e.g. coroutines launched under asyncio.gather, which
-        # copy the parent Context) are visible to the parent.  A plain
-        # bool ContextVar would be isolated per-child and the parent's
-        # suppression check would never see the True written by execute().
-        self._sent_in_turn_var: ContextVar[list[bool]] = ContextVar(
-            "message_sent_in_turn", default=[False]
+        self._restrict_to_workspace = restrict_to_workspace
+        self._fallback_channel = default_channel
+        self._fallback_chat_id = default_chat_id
+        self._fallback_message_id = default_message_id
+        self._fallback_metadata: dict[str, Any] = {}
+        self._suppress_delivery_var: ContextVar[bool] = ContextVar(
+            "message_suppress_delivery",
+            default=False,
         )
 
-    def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
-        """Set the current message context."""
-        self._default_channel.set(channel)
-        self._default_chat_id.set(chat_id)
-        self._default_message_id.set(message_id)
+    @classmethod
+    def create(cls, ctx: ToolContext) -> Tool:
+        send_callback = ctx.bus.publish_outbound if ctx.bus else None
+        return cls(
+            send_callback=send_callback,
+            workspace=ctx.workspace,
+            restrict_to_workspace=ctx.config.restrict_to_workspace,
+        )
 
     def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
         """Set the callback for sending messages."""
         self._send_callback = callback
 
-    def set_outbound_guard(self, guard: OutboundGuard) -> None:
-        """Set the policy guard used before publishing messages."""
-        self._outbound_guard = guard
+    def set_suppress_delivery(self, active: bool) -> Token[bool]:
+        """Acknowledge but don't deliver tool sends (heartbeat internal check)."""
+        return self._suppress_delivery_var.set(active)
 
-    def start_turn(self) -> None:
-        """Reset per-turn send tracking.  Installs a fresh holder in the
-        current context so child tasks see the same mutable object."""
-        self._sent_in_turn_var.set([False])
-
-    @property
-    def _sent_in_turn(self) -> bool:
-        return self._sent_in_turn_var.get()[0]
-
-    @_sent_in_turn.setter
-    def _sent_in_turn(self, value: bool) -> None:
-        self._sent_in_turn_var.get()[0] = value
+    def reset_suppress_delivery(self, token: Token[bool]) -> None:
+        """Restore previous delivery-suppression state."""
+        self._suppress_delivery_var.reset(token)
 
     @property
     def name(self) -> str:
@@ -83,11 +119,34 @@ class MessageTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Send a message to the user, optionally with file attachments. "
-            "This is the ONLY way to deliver files (images, documents, audio, video) to the user. "
-            "Use the 'media' parameter with file paths to attach files. "
+            "Proactively send a message to a user/channel, optionally with file attachments. "
+            "Use this for reminders, cross-channel delivery, or explicit proactive sends. "
+            "Do not use this for the normal reply in the current chat: answer naturally instead. "
+            "If channel/chat_id would target the current runtime conversation, do not call this tool "
+            "unless the user explicitly asked you to proactively send an existing file attachment. "
+            "When generate_image creates images in the current chat, use the message tool "
+            "with the artifact paths in the media parameter to deliver the images to the user. "
+            "For proactive attachment delivery, use the 'media' parameter with file paths. "
             "Do NOT use read_file to send files — that only reads content for your own analysis."
         )
+
+    def _resolve_media(self, media: list[str]) -> list[str]:
+        """Resolve local media attachments and enforce workspace restriction when enabled."""
+        resolved: list[str] = []
+        access = current_tool_workspace(
+            self._workspace,
+            restrict_to_workspace=self._restrict_to_workspace,
+        )
+        workspace = access.project_path or self._workspace
+        for p in media:
+            if p.startswith(("http://", "https://")):
+                resolved.append(p)
+            elif not access.restrict_to_workspace:
+                path = Path(p).expanduser()
+                resolved.append(p if path.is_absolute() else str(workspace / path))
+            else:
+                resolved.append(str(resolve_workspace_path(p, workspace, access.allowed_root)))
+        return resolved
 
     async def execute(
         self,
@@ -96,79 +155,109 @@ class MessageTool(Tool):
         chat_id: str | None = None,
         message_id: str | None = None,
         media: list[str] | None = None,
-        **kwargs: Any
-    ) -> str:
+        buttons: Any = None,
+        **kwargs: Any,
+    ) -> str:  # pyright: ignore[reportIncompatibleMethodOverride]
         from nanobot.utils.helpers import strip_think
+
         content = strip_think(content)
 
-        default_channel = self._default_channel.get()
-        default_chat_id = self._default_chat_id.get()
-
+        button_rows: list[list[str]] | None = None
+        if buttons is not None:
+            raw_buttons = cast(list[Any], buttons) if isinstance(buttons, list) else None
+            if raw_buttons is None or any(
+                not isinstance(row, list)
+                or any(not isinstance(label, str) for label in cast(list[Any], row))
+                for row in raw_buttons
+            ):
+                return ToolResult.error("Error: buttons must be a list of list of strings")
+            button_rows = cast(list[list[str]], raw_buttons)
+        request_ctx = current_request_context()
+        default_channel = (
+            request_ctx.channel if request_ctx is not None else self._fallback_channel
+        )
+        default_chat_id = (
+            request_ctx.chat_id if request_ctx is not None else self._fallback_chat_id
+        )
+        default_message_id = (
+            request_ctx.message_id
+            if request_ctx is not None
+            else self._fallback_message_id
+        )
+        default_metadata = (
+            request_ctx.metadata
+            if request_ctx is not None
+            else self._fallback_metadata
+        )
         channel = channel or default_channel
+        explicit_chat_id = chat_id
+        if (
+            default_channel == "websocket"
+            and channel == "websocket"
+            and explicit_chat_id is not None
+            and str(explicit_chat_id).strip() != ""
+            and str(explicit_chat_id).strip() != str(default_chat_id).strip()
+        ):
+            return ToolResult.error(
+                "Error: chat_id does not match the active WebSocket conversation. "
+                "Omit chat_id (and usually channel) so delivery uses the current "
+                "conversation id from context — WebSocket client_id strings "
+                "(e.g. anon-…) are not chat ids."
+            )
         chat_id = chat_id or default_chat_id
         # Only inherit default message_id when targeting the same channel+chat.
         # Cross-chat sends must not carry the original message_id, because
         # some channels (e.g. Feishu) use it to determine the target
         # conversation via their Reply API, which would route the message
         # to the wrong chat entirely.
-        if channel == default_channel and chat_id == default_chat_id:
-            message_id = message_id or self._default_message_id.get()
+        same_target = channel == default_channel and chat_id == default_chat_id
+        if same_target:
+            message_id = message_id or default_message_id
         else:
             message_id = None
 
         if not channel or not chat_id:
-            return "Error: No target channel/chat specified"
+            return ToolResult.error("Error: No target channel/chat specified")
 
         if not self._send_callback:
-            return "Error: Message sending not configured"
+            return ToolResult.error("Error: Message sending not configured")
+
+        if media:
+            try:
+                media = self._resolve_media(media)
+            except (OSError, PermissionError, ValueError) as e:
+                return ToolResult.error(f"Error: media path is not allowed: {str(e)}")
+
+        metadata = dict(default_metadata) if same_target else {}
+        if message_id:
+            metadata["message_id"] = message_id
+        if media:
+            metadata["_record_channel_delivery"] = True
 
         msg = OutboundMessage(
             channel=channel,
             chat_id=chat_id,
             content=content,
             media=media or [],
-            metadata={
-                "message_id": message_id,
-            } if message_id else {},
+            buttons=button_rows or [],
+            metadata=metadata,
         )
 
-        # MessageTool stays policy-agnostic; deployments inject a guard that
-        # can deny, park, audit, or allow the outbound before it is published.
-        result = await self._outbound_guard(
-            OutboundRequest(
-                action="message.send",
-                outbound=msg,
-                inbound_channel=default_channel or None,
-                inbound_chat_id=default_chat_id or None,
-                publish_outbound=self._send_callback,
-            )
-        )
-        if result.kind == "deny":
-            return f"Policy denied message.send to {channel}:{chat_id}: {result.reason}"
-        if result.kind == "asked":
-            return (
-                f"Отправлен запрос на подтверждение ({result.approvers_label}). "
-                "Жду ответа (до 15 минут)."
-            )
-
-        if result.kind != "allow":
-            return f"Policy denied message.send to {channel}:{chat_id}: unsupported decision"
+        if self._suppress_delivery_var.get():
+            logger.debug("MessageTool: delivery suppressed during internal check")
+            return f"Message acknowledged for {channel}:{chat_id} (not delivered)"
 
         try:
             await self._send_callback(msg)
-            if channel == default_channel and chat_id == default_chat_id:
-                self._sent_in_turn = True
+            sends = _CURRENT_MESSAGE_SENDS.get()
+            if sends is not None:
+                sends.add((channel, chat_id))
             media_info = f" with {len(media)} attachments" if media else ""
-            return f"Message sent to {channel}:{chat_id}{media_info}"
+            button_info = (
+                f" with {sum(len(row) for row in button_rows)} button(s)"
+                if button_rows
+                else ""
+            )
+            return f"Message sent to {channel}:{chat_id}{media_info}{button_info}"
         except Exception as e:
-            return f"Error sending message: {str(e)}"
-
-    async def send_approved(self, outbound: OutboundMessage) -> None:
-        """Send an outbound message previously parked by the policy gate.
-
-        Bypasses the policy engine because the action has already been
-        authorized by an approver.  Raises if no send_callback is set.
-        """
-        if not self._send_callback:
-            raise RuntimeError("Message sending not configured")
-        await self._send_callback(outbound)
+            return ToolResult.error(f"Error sending message: {str(e)}")

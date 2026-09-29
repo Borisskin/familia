@@ -1,43 +1,90 @@
 """OpenAI-compatible provider for all non-Anthropic LLM APIs."""
 
+# pyright: reportPrivateImportUsage=false
+
 from __future__ import annotations
 
 import asyncio
-import json
 import hashlib
 import importlib.util
+import json
 import os
+import re
 import secrets
 import string
 import time
 import uuid
-from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any
+from collections import deque
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from ipaddress import ip_address
+from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import urlparse
 
-import json_repair
 from loguru import logger
+from pydantic.alias_generators import to_snake
 
-if os.environ.get("LANGFUSE_SECRET_KEY") and importlib.util.find_spec("langfuse"):
-    from langfuse.openai import AsyncOpenAI
-else:
-    if os.environ.get("LANGFUSE_SECRET_KEY"):
-        import logging
-        logging.getLogger(__name__).warning(
-            "LANGFUSE_SECRET_KEY is set but langfuse is not installed; "
-            "install with `pip install langfuse` to enable tracing"
-        )
-    from openai import AsyncOpenAI
-
-from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.providers.base import (
+    LLMProvider,
+    LLMResponse,
+    LLMUsage,
+    ProviderCallContext,
+    ProviderConversationState,
+    ToolCallRequest,
+    parse_tool_arguments,
+    resolve_stream_idle_timeout_s,
+    tool_arguments_json_for_replay,
+)
 from nanobot.providers.openai_responses import (
+    ResponsesStreamCapture,
+    build_responses_compaction_state,
+    build_responses_state,
     consume_sdk_stream,
-    convert_messages,
     convert_tools,
+    is_compaction_compatibility_error,
+    is_replayable_finish_reason,
     parse_response_output,
+    prepare_responses_input,
+    resolve_compact_threshold,
+    responses_state_matches,
 )
 
 if TYPE_CHECKING:
+    from openai import AsyncOpenAI as AsyncOpenAIType
+
     from nanobot.providers.registry import ProviderSpec
+
+# Module-level placeholder — set lazily by _ensure_client on first real
+# use, or replaced by tests via ``patch(...)``.  Kept as a plain name so
+# that ``unittest.mock.patch`` can find and replace it.
+AsyncOpenAI: Any = None
+
+_GEMINI_SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
+
+
+def _is_hosted_web_search_type(value: object) -> bool:
+    return isinstance(value, str) and (
+        value == "web_search" or value.startswith("web_search_")
+    )
+
+
+def _is_hosted_web_search_tool(tool: object) -> bool:
+    if not isinstance(tool, dict):
+        return False
+    tool_type = cast(dict[object, object], tool).get("type")
+    return _is_hosted_web_search_type(tool_type)
+
+
+def _is_named_function_tool(tool: object, name: str) -> bool:
+    """Return whether a Responses tool is a function with the given name."""
+    if not isinstance(tool, dict):
+        return False
+    record = cast(dict[object, object], tool)
+    if record.get("type") != "function":
+        return False
+    function = record.get("function")
+    if isinstance(function, dict):
+        return cast(dict[object, object], function).get("name") == name
+    return record.get("name") == name
 
 _ALLOWED_MSG_KEYS = frozenset({
     "role", "content", "tool_calls", "tool_call_id", "name",
@@ -52,30 +99,132 @@ _DEFAULT_OPENROUTER_HEADERS = {
     "X-OpenRouter-Title": "nanobot",
     "X-OpenRouter-Categories": "cli-agent,personal-agent",
 }
+_KIMI_K3_MODEL = "kimi-k3"
 _KIMI_THINKING_MODELS: frozenset[str] = frozenset({
     "kimi-k2.5",
     "kimi-k2.6",
+    "kimi-k2.7",
+    "kimi-k2.7-code",
+    "kimi-k2.7-code-highspeed",
     "k2.6-code-preview",
 })
+_KIMI_ALWAYS_THINKING_MODELS: frozenset[str] = frozenset({
+    "kimi-k2.7-code",
+    "kimi-k2.7-code-highspeed",
+})
+_KIMI_SERVER_MANAGED_TEMPERATURE_MODELS: frozenset[str] = frozenset({
+    "kimi-k2.5",
+    "kimi-k2.6",
+})
+_DEEPSEEK_MULTIMODAL_MODELS: frozenset[str] = frozenset({
+    "deepseek-v4-flash-vision-exp",
+})
+_TEXT_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+# Thinking-capable MiMo models per Xiaomi docs (see
+# tests/providers/test_xiaomi_mimo_thinking.py). mimo-v2-flash is omitted
+# because it does not support thinking.
+_MIMO_THINKING_MODELS: frozenset[str] = frozenset({
+    "mimo-v2.5-pro",
+    "mimo-v2.5",
+    "mimo-v2-pro",
+    "mimo-v2-omni",
+})
+_OPENAI_COMPAT_REQUEST_TIMEOUT_S = 120.0
+
+# Maps ProviderSpec.thinking_style → extra_body builder.
+# Each builder takes a bool (thinking_enabled) and returns the dict to
+# merge into extra_body, keeping the style→wire-format mapping in one place.
+_THINKING_STYLE_MAP: dict[
+    str,
+    Callable[[bool], dict[str, Any]],
+] = {
+    "thinking_type": lambda on: {"thinking": {"type": "enabled" if on else "disabled"}},
+    "enable_thinking": lambda on: {"enable_thinking": on},
+    "reasoning_split": lambda on: {"reasoning_split": on},
+}
+_GATEWAY_REASONING_STYLE_MAP: dict[
+    str,
+    Callable[[str], dict[str, Any]],
+] = {
+    "reasoning_effort": lambda effort: {"reasoning": {"effort": effort}},
+}
+_QWEN_THINKING_MODELS: frozenset[str] = frozenset({
+    "qwen3.7-max",
+    "qwen3.7-plus",
+    "qwen3.6-max-preview",
+    "qwen3.6-plus",
+    "qwen3.6-flash",
+    "qwen3.5-plus",
+    "qwen3.5-flash",
+})
+
+_MODEL_THINKING_STYLES: dict[str, str] = {
+    **dict.fromkeys(_KIMI_THINKING_MODELS, "thinking_type"),
+    **dict.fromkeys(_MIMO_THINKING_MODELS, "thinking_type"),
+    **dict.fromkeys(_QWEN_THINKING_MODELS, "enable_thinking"),
+}
 
 
-def _is_kimi_thinking_model(model_name: str) -> bool:
-    """Return True if model_name refers to a Kimi thinking-capable model.
+def _model_slug(model_name: str) -> str:
+    return model_name.lower().rsplit("/", 1)[-1]
 
-    Supports two forms:
-    - Exact match: e.g. kimi-k2.5 / kimi-k2.6 in _KIMI_THINKING_MODELS
-    - Slug match:  moonshotai/kimi-k2.5 -> the part after the last "/"
-                   is checked against _KIMI_THINKING_MODELS
 
-    This covers both the native Moonshot provider (bare slug) and
-    OpenRouter-style names (``"publisher/slug"``).
-    """
-    name = model_name.lower()
-    if name in _KIMI_THINKING_MODELS:
-        return True
-    if "/" in name and name.rsplit("/", 1)[1] in _KIMI_THINKING_MODELS:
-        return True
-    return False
+def _provider_prefix_key(name: str) -> str:
+    return to_snake(name.replace("-", "_")).lower()
+
+
+def _requires_max_completion_tokens(model_name: str) -> bool:
+    """Return True for models that require ``max_completion_tokens``."""
+    slug = _model_slug(model_name)
+    return slug == _KIMI_K3_MODEL or "gpt-5" in slug or any(
+        slug == p or slug.startswith((p + "-", p + ".")) for p in ("o1", "o3", "o4")
+    )
+
+
+def _model_thinking_style(model_name: str) -> str:
+    return _MODEL_THINKING_STYLES.get(_model_slug(model_name), "")
+
+
+def _thinking_styles_for(spec: ProviderSpec | None, model_name: str) -> list[str]:
+    styles: list[str] = []
+    if spec and spec.thinking_style:
+        styles.append(spec.thinking_style)
+    model_style = _model_thinking_style(model_name)
+    if model_style and model_style not in styles:
+        styles.append(model_style)
+    return styles
+
+
+def _thinking_extra_body(style: str, thinking_enabled: bool) -> dict[str, Any] | None:
+    builder = _THINKING_STYLE_MAP.get(style)
+    return builder(thinking_enabled) if builder else None
+
+
+def _gateway_reasoning_extra_body(style: str, effort: str | None) -> dict[str, Any] | None:
+    if not effort:
+        return None
+    builder = _GATEWAY_REASONING_STYLE_MAP.get(style)
+    return builder(effort) if builder else None
+
+
+def _openai_compat_timeout_s() -> float:
+    """Return the bounded request timeout used for OpenAI-compatible providers."""
+    return _float_env("NANOBOT_OPENAI_COMPAT_TIMEOUT_S", _OPENAI_COMPAT_REQUEST_TIMEOUT_S)
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid {}={!r}; using {}", name, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("Ignoring non-positive {}={!r}; using {}", name, raw, default)
+        return default
+    return value
 
 
 def _short_tool_id() -> str:
@@ -83,24 +232,87 @@ def _short_tool_id() -> str:
     return "".join(secrets.choice(_ALNUM) for _ in range(9))
 
 
-def _get(obj: Any, key: str) -> Any:
+def _strip_json_fence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```") or not stripped.endswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if len(lines) < 2:
+        return stripped
+    return "\n".join(lines[1:-1]).strip()
+
+
+def _extract_text_tool_calls(content: str | None) -> tuple[str | None, list[ToolCallRequest]]:
+    """Normalize common text-format tool call blocks into structured calls."""
+    if not content or "<tool_call>" not in content:
+        return content, []
+
+    tool_calls: list[ToolCallRequest] = []
+    spans: list[tuple[int, int]] = []
+    for match in _TEXT_TOOL_CALL_RE.finditer(content):
+        try:
+            raw_payload: object = json.loads(
+                _strip_json_fence(match.group(1))
+            )
+        except Exception:
+            continue
+        if not isinstance(raw_payload, dict):
+            continue
+        payload = cast(dict[str, Any], raw_payload)
+
+        nested = cast(object, payload.get("tool_call"))
+        if isinstance(nested, dict):
+            payload = cast(dict[str, Any], nested)
+        function = cast(object, payload.get("function"))
+        if not isinstance(function, dict):
+            function = payload
+        function_data = cast(dict[str, Any], function)
+        name = cast(object, function_data.get("name"))
+        if not isinstance(name, str) or not name:
+            continue
+
+        arguments = function_data.get(
+            "arguments",
+            payload.get("arguments", {}),
+        )
+        tool_calls.append(ToolCallRequest(
+            id=str(payload.get("id") or _short_tool_id()),
+            name=name,
+            arguments=parse_tool_arguments(arguments),
+        ))
+        spans.append(match.span())
+
+    if not tool_calls:
+        return content, []
+
+    visible_parts: list[str] = []
+    last = 0
+    for start, end in spans:
+        visible_parts.append(content[last:start])
+        last = end
+    visible_parts.append(content[last:])
+    visible_content = "".join(visible_parts).strip() or None
+    return visible_content, tool_calls
+
+
+def _get(obj: object, key: str) -> Any:
     """Get a value from dict or object attribute, returning None if absent."""
     if isinstance(obj, dict):
-        return obj.get(key)
+        return cast(dict[str, Any], obj).get(key)
     return getattr(obj, key, None)
 
 
-def _coerce_dict(value: Any) -> dict[str, Any] | None:
+def _coerce_dict(value: object) -> dict[str, Any] | None:
     """Try to coerce *value* to a dict; return None if not possible or empty."""
     if value is None:
         return None
     if isinstance(value, dict):
-        return value if value else None
+        return cast(dict[str, Any], value) if value else None
     model_dump = getattr(value, "model_dump", None)
     if callable(model_dump):
-        dumped = model_dump()
+        dumped: object = model_dump()
         if isinstance(dumped, dict) and dumped:
-            return dumped
+            return cast(dict[str, Any], dumped)
     return None
 
 
@@ -146,8 +358,46 @@ def _uses_openrouter_attribution(spec: "ProviderSpec | None", api_base: str | No
     return bool(api_base and "openrouter" in api_base.lower())
 
 
+def _uses_opencode_affinity(spec: ProviderSpec | None, api_base: str | None) -> bool:
+    if spec and spec.name in {"opencode", "opencode_zen", "opencode_go"}:
+        return True
+    host = (urlparse(api_base or "").hostname or "").rstrip(".")
+    return host == "opencode.ai" or host.endswith(".opencode.ai")
+
+
 _RESPONSES_FAILURE_THRESHOLD = 3
 _RESPONSES_PROBE_INTERVAL_S = 300  # 5 minutes
+
+
+def _is_local_endpoint(
+    spec: "ProviderSpec | None",
+    api_base: str | None,
+) -> bool:
+    """Return True when the endpoint is a local or LAN model server.
+
+    Matches either the provider spec's ``is_local`` flag or common private-
+    network patterns in the base URL (localhost, 127.x, 192.168.x, 10.x,
+    172.16-31.x, Docker ``host.docker.internal``).
+    """
+    if spec and spec.is_local:
+        return True
+    if not api_base:
+        return False
+    raw = api_base.strip().lower()
+    parsed = urlparse(raw if "://" in raw else f"//{raw}")
+    try:
+        host = parsed.hostname
+    except ValueError:
+        return False
+    if host in {"localhost", "host.docker.internal"}:
+        return True
+    if not host:
+        return False
+    try:
+        addr = ip_address(host)
+    except ValueError:
+        return False
+    return addr.is_loopback or addr.is_private
 
 
 def _is_direct_openai_base(api_base: str | None) -> bool:
@@ -168,12 +418,102 @@ def _responses_circuit_key(
     return f"{model_name}:{effort}"
 
 
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge *override* into *base*, returning a new dict.
+
+    Nested dicts are merged key-by-key; all other types in *override*
+    replace the corresponding key in *base*.
+    """
+    merged = dict(base)
+    for key, value in override.items():
+        if (
+            key in merged
+            and isinstance(merged[key], dict)
+            and isinstance(value, dict)
+        ):
+            merged[key] = _deep_merge(
+                cast(dict[str, Any], merged[key]),
+                cast(dict[str, Any], value),
+            )
+        else:
+            merged[key] = value
+    return merged
+
+
+def _merge_unique_list(base: object, override: object) -> object:
+    """Append list values while preserving order and removing duplicates."""
+    if not isinstance(base, list) or not isinstance(override, list):
+        return override
+    result: list[object] = []
+    seen: set[str] = set()
+    for value in [
+        *cast(list[object], base),
+        *cast(list[object], override),
+    ]:
+        try:
+            key = json.dumps(value, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            key = repr(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
+
+
+def _merge_chat_extra_body(
+    kwargs: dict[str, Any],
+    extra_body: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge configured Chat Completions fields without clobbering tools."""
+    regular_extra = {key: value for key, value in extra_body.items() if key != "tools"}
+    merged = dict(kwargs)
+    if regular_extra:
+        existing = kwargs.get("extra_body", {})
+        merged["extra_body"] = _deep_merge(existing, regular_extra)
+
+    if "tools" in extra_body:
+        current_tools = kwargs.get("tools")
+        configured_tools = extra_body["tools"]
+        if isinstance(current_tools, list) and isinstance(configured_tools, list):
+            merged["tools"] = [*current_tools, *configured_tools]
+        else:
+            merged["tools"] = configured_tools
+
+    return merged
+
+
+def _merge_responses_extra_body(
+    body: dict[str, Any],
+    extra_body: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge configured Responses API body fields without clobbering tools."""
+    reserved = {"include", "tools"}
+    regular_extra = {key: value for key, value in extra_body.items() if key not in reserved}
+    merged = _deep_merge(body, regular_extra)
+
+    if "include" in extra_body:
+        merged["include"] = _merge_unique_list(body.get("include"), extra_body["include"])
+
+    if "tools" in extra_body:
+        current_tools = body.get("tools")
+        configured_tools = extra_body["tools"]
+        if isinstance(current_tools, list) and isinstance(configured_tools, list):
+            merged["tools"] = [*current_tools, *configured_tools]
+        else:
+            merged["tools"] = configured_tools
+
+    return merged
+
+
 class OpenAICompatProvider(LLMProvider):
     """Unified provider for all OpenAI-compatible APIs.
 
     Receives a resolved ``ProviderSpec`` from the caller — no internal
     registry lookups needed.
     """
+
+    _native_compaction_available = True
 
     def __init__(
         self,
@@ -182,48 +522,119 @@ class OpenAICompatProvider(LLMProvider):
         default_model: str = "gpt-4o",
         extra_headers: dict[str, str] | None = None,
         spec: ProviderSpec | None = None,
+        extra_body: dict[str, Any] | None = None,
+        api_type: str = "auto",
+        extra_query: dict[str, str] | None = None,
+        proxy: str | None = None,
+        provider_name: str = "openai",
     ):
-        super().__init__(api_key, api_base)
+        super().__init__(api_key, api_base, provider_name=provider_name)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
         self._spec = spec
-
-        if api_key and spec and spec.env_key:
-            self._setup_env(api_key, api_base)
+        self._extra_body = dict(extra_body or {})
+        self._api_type = api_type if spec and spec.name == "openai" else "auto"
+        self._extra_query = extra_query or {}
+        self._proxy = proxy or None
+        self._native_compaction_available = True
 
         effective_base = api_base or (spec.default_api_base if spec else None) or None
         self._effective_base = effective_base
-        default_headers = {"x-session-affinity": uuid.uuid4().hex}
+        self._default_headers = {"x-session-affinity": uuid.uuid4().hex}
         if _uses_openrouter_attribution(spec, effective_base):
-            default_headers.update(_DEFAULT_OPENROUTER_HEADERS)
+            self._default_headers.update(_DEFAULT_OPENROUTER_HEADERS)
         if extra_headers:
-            default_headers.update(extra_headers)
-
-        self._client = AsyncOpenAI(
-            api_key=api_key or "no-key",
-            base_url=effective_base,
-            default_headers=default_headers,
-            max_retries=0,
+            self._default_headers.update(extra_headers)
+        self._opencode_session_affinity = _uses_opencode_affinity(spec, effective_base) and not any(
+            name.lower() == "x-opencode-session" for name in self.extra_headers
         )
+        if self._opencode_session_affinity:
+            # Calls without conversation context still need a stable routing header.
+            self._default_headers["x-opencode-session"] = uuid.uuid4().hex
+        self._api_key_for_client = api_key or "no-key"
+        self._is_local = _is_local_endpoint(spec, effective_base)
+
+        # Lazy-init: the OpenAI client and its httpx transport are expensive
+        # to create (~700 ms on Windows). Defer until first use.
+        self._client: AsyncOpenAIType | None = None
+        self._client_lock = asyncio.Lock()
 
         # Responses API circuit breaker: skip after repeated failures,
         # probe again after _RESPONSES_PROBE_INTERVAL_S seconds.
         self._responses_failures: dict[str, int] = {}
         self._responses_tripped_at: dict[str, float] = {}
 
-    def _setup_env(self, api_key: str, api_base: str | None) -> None:
-        """Set environment variables based on provider spec."""
-        spec = self._spec
-        if not spec or not spec.env_key:
-            return
-        if spec.is_gateway:
-            os.environ[spec.env_key] = api_key
-        else:
-            os.environ.setdefault(spec.env_key, api_key)
-        effective_base = api_base or spec.default_api_base
-        for env_name, env_val in spec.env_extras:
-            resolved = env_val.replace("{api_key}", api_key).replace("{api_base}", effective_base)
-            os.environ.setdefault(env_name, resolved)
+    def _build_client(self) -> None:
+        """Create the OpenAI client using the current module-level AsyncOpenAI."""
+        import httpx
+
+        timeout_s = _openai_compat_timeout_s()
+        http_client: httpx.AsyncClient | None = None
+        if self._proxy:
+            http_client = httpx.AsyncClient(
+                timeout=timeout_s,
+                proxy=self._proxy,
+                trust_env=False,
+                follow_redirects=True,
+            )
+        elif self._is_local:
+            # Local model servers (Ollama, llama.cpp, vLLM) often close idle
+            # HTTP connections before the client-side keepalive expires. When
+            # two LLM calls happen seconds apart (e.g. heartbeat _decide then
+            # process_direct), the second call may grab a now-dead pooled
+            # connection, causing a transient APIConnectionError on every first
+            # attempt. Disabling keepalive for local endpoints avoids this by
+            # opening a fresh connection for each request, which is cheap on a
+            # LAN. Cloud providers benefit from keepalive, so we leave the
+            # default pool settings for them.
+            #
+            # Also disable proxy for local endpoints: when the host has
+            # HTTP_PROXY / HTTPS_PROXY / ALL_PROXY set, httpx would try to
+            # route local traffic through the proxy, which typically cannot
+            # reach localhost or LAN addresses.
+            _local_limits = httpx.Limits(keepalive_expiry=0)
+            http_client = httpx.AsyncClient(
+                limits=_local_limits,
+                timeout=timeout_s,
+                transport=httpx.AsyncHTTPTransport(proxy=None, limits=_local_limits),
+            )
+        # else: http_client stays None → SDK creates DefaultAsyncHttpxClient
+        # which already reads proxy env vars via trust_env=True, has proper
+        # connection limits, and follows redirects.
+        self._client = AsyncOpenAI(
+            api_key=self._api_key_for_client,
+            base_url=self._effective_base,
+            default_headers=self._default_headers,
+            default_query=self._extra_query or None,
+            max_retries=0,
+            timeout=timeout_s,
+            http_client=http_client,
+        )
+
+    async def _ensure_client(self) -> AsyncOpenAIType:
+        """Return the shared OpenAI client, creating it on first call."""
+        if self._client is not None:
+            return self._client
+        async with self._client_lock:
+            if self._client is not None:
+                return self._client
+            global AsyncOpenAI
+            if AsyncOpenAI is None:
+                if os.environ.get("LANGFUSE_SECRET_KEY") and importlib.util.find_spec("langfuse"):
+                    from langfuse.openai import AsyncOpenAI as _AsyncOpenAI
+                else:
+                    if os.environ.get("LANGFUSE_SECRET_KEY"):
+                        logger.warning(
+                            "LANGFUSE_SECRET_KEY is set but langfuse is not installed; "
+                            "run `nanobot plugins enable langfuse` to enable tracing"
+                        )
+                    from openai import AsyncOpenAI as _AsyncOpenAI
+                AsyncOpenAI = _AsyncOpenAI
+
+            self._build_client()
+            if self._client is None:
+                raise RuntimeError("OpenAI client initialization did not produce a client")
+            return self._client
 
     @classmethod
     def _apply_cache_control(
@@ -242,7 +653,7 @@ class OpenAICompatProvider(LLMProvider):
                     {"type": "text", "text": content, "cache_control": cache_marker},
                 ]}
             if isinstance(content, list) and content:
-                nc = list(content)
+                nc = list(cast(list[dict[str, Any]], content))
                 nc[-1] = {**nc[-1], "cache_control": cache_marker}
                 return {**msg, "content": nc}
             return msg
@@ -268,48 +679,105 @@ class OpenAICompatProvider(LLMProvider):
             return tool_call_id
         return hashlib.sha1(tool_call_id.encode()).hexdigest()[:9]
 
-    @staticmethod
-    def _normalize_tool_call_arguments(arguments: Any) -> str:
-        """Force function.arguments into a valid JSON object string."""
-        if isinstance(arguments, str):
-            stripped = arguments.strip()
-            if not stripped:
-                return "{}"
-            try:
-                parsed = json_repair.loads(stripped)
-            except Exception:
-                return "{}"
-            if isinstance(parsed, dict):
-                return json.dumps(parsed, ensure_ascii=False)
-            return "{}"
-        if isinstance(arguments, dict):
-            return json.dumps(arguments, ensure_ascii=False)
-        return "{}"
+    def _should_normalize_tool_call_ids(self) -> bool:
+        """Return True for providers that reject normal OpenAI tool call IDs."""
+        return bool(self._spec and self._spec.name == "mistral")
 
-    def _sanitize_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    @staticmethod
+    def _coerce_content_to_string(content: Any) -> str | None:
+        """Coerce block/list content into plain text for strict string-only APIs."""
+        if content is None or isinstance(content, str):
+            return content
+        text = OpenAICompatProvider._extract_text_content(content)
+        if isinstance(text, str) and text:
+            return text
+        try:
+            dumped = json.dumps(content, ensure_ascii=False)
+        except Exception:
+            dumped = str(content)
+        return dumped or "(empty)"
+
+    def _sanitize_messages(
+        self,
+        messages: list[dict[str, Any]],
+        model: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Strip non-standard keys, normalize tool_call IDs."""
         sanitized = LLMProvider._sanitize_request_messages(messages, _ALLOWED_MSG_KEYS)
         id_map: dict[str, str] = {}
+        pending_tool_ids: dict[str, deque[str]] = {}
+        is_deepseek = bool(self._spec and self._spec.name == "deepseek")
+        model_name = model or self.default_model
+        force_string_content = (
+            is_deepseek and _model_slug(model_name) not in _DEEPSEEK_MULTIMODAL_MODELS
+        )
+        normalize_tool_ids = self._should_normalize_tool_call_ids()
+        strip_reasoning = bool(
+            self._spec
+            and getattr(self._spec, "strip_history_reasoning_content", False)
+        )
+        if strip_reasoning:
+            for msg in sanitized:
+                msg.pop("reasoning_content", None)
+        if self._spec and self._spec.name == "gemini":
+            sanitized = self._ensure_gemini_thought_signatures(sanitized)
 
         def map_id(value: Any) -> Any:
             if not isinstance(value, str):
                 return value
+            if not normalize_tool_ids:
+                return value
             return id_map.setdefault(value, self._normalize_tool_call_id(value))
 
+        def unique_tool_id(value: Any, used_ids: set[str], idx: int) -> str:
+            if isinstance(value, str) and value:
+                base = map_id(value)
+            else:
+                base = _short_tool_id()
+            if not isinstance(base, str) or not base:
+                base = _short_tool_id()
+            if base not in used_ids:
+                return base
+            seed = value if isinstance(value, str) and value else base
+            salt = 1
+            while True:
+                candidate = self._normalize_tool_call_id(f"{seed}:{idx}:{salt}")
+                if isinstance(candidate, str) and candidate not in used_ids:
+                    return candidate
+                salt += 1
+
+        def map_tool_result_id(value: Any) -> Any:
+            if not isinstance(value, str):
+                return value
+            queue = pending_tool_ids.get(value)
+            if queue:
+                mapped = queue.popleft()
+                if not queue:
+                    pending_tool_ids.pop(value, None)
+                return mapped
+            return map_id(value)
+
         for clean in sanitized:
-            if isinstance(clean.get("tool_calls"), list):
-                normalized = []
-                for tc in clean["tool_calls"]:
+            tool_calls_value = cast(object, clean.get("tool_calls"))
+            if isinstance(tool_calls_value, list):
+                normalized: list[Any] = []
+                used_ids: set[str] = set()
+                for idx, tc in enumerate(cast(list[object], tool_calls_value)):
                     if not isinstance(tc, dict):
                         normalized.append(tc)
                         continue
-                    tc_clean = dict(tc)
-                    tc_clean["id"] = map_id(tc_clean.get("id"))
-                    function = tc_clean.get("function")
+                    tc_clean = dict(cast(dict[str, Any], tc))
+                    raw_id = tc_clean.get("id")
+                    mapped_id = unique_tool_id(raw_id, used_ids, idx)
+                    tc_clean["id"] = mapped_id
+                    used_ids.add(mapped_id)
+                    if isinstance(raw_id, str) and raw_id:
+                        pending_tool_ids.setdefault(raw_id, deque()).append(mapped_id)
+                    function = cast(object, tc_clean.get("function"))
                     if isinstance(function, dict):
-                        function_clean = dict(function)
+                        function_clean = dict(cast(dict[str, Any], function))
                         if "arguments" in function_clean:
-                            function_clean["arguments"] = self._normalize_tool_call_arguments(
+                            function_clean["arguments"] = tool_arguments_json_for_replay(
                                 function_clean.get("arguments")
                             )
                         else:
@@ -317,17 +785,113 @@ class OpenAICompatProvider(LLMProvider):
                         tc_clean["function"] = function_clean
                     normalized.append(tc_clean)
                 clean["tool_calls"] = normalized
-                if clean.get("role") == "assistant":
-                    # Some OpenAI-compatible gateways reject assistant messages
-                    # that mix non-empty content with tool_calls.
-                    clean["content"] = None
             if "tool_call_id" in clean and clean["tool_call_id"]:
-                clean["tool_call_id"] = map_id(clean["tool_call_id"])
+                clean["tool_call_id"] = map_tool_result_id(clean["tool_call_id"])
+            if (
+                force_string_content
+                and not (clean.get("role") == "assistant" and clean.get("tool_calls"))
+            ):
+                clean["content"] = self._coerce_content_to_string(clean.get("content"))
         return self._enforce_role_alternation(sanitized)
+
+    @staticmethod
+    def _gemini_thought_signature(tool_call: dict[str, Any]) -> str | None:
+        """Return Gemini's thought signature attached to a tool call, if any.
+
+        Gemini's OpenAI-compatible endpoint returns tool calls with an
+        ``extra_content`` field: ``{"google": {"thought_signature": "..."}}``.
+        nanobot preserves it through the parse -> serialize round-trip so
+        replayed calls stay valid. Calls produced by other providers (e.g.
+        after a mid-conversation model switch) carry no signature.
+        """
+        extra = tool_call.get("extra_content")
+        if not isinstance(extra, dict):
+            return None
+        google = cast(dict[str, Any], extra).get("google")
+        if not isinstance(google, dict):
+            return None
+        signature = cast(dict[str, Any], google).get("thought_signature")
+        if isinstance(signature, str) and signature:
+            return signature
+        return None
+
+    def _ensure_gemini_thought_signatures(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Keep migrated tool history wire-valid without losing tool context.
+
+        Gemini requires the first call in each function-call step to carry a
+        thought signature. Native parallel calls intentionally leave later
+        calls unsigned, so they must remain in their original order. For a
+        fully unsigned step imported from another provider, Google documents
+        ``skip_thought_signature_validator`` as a last-resort migration value.
+        """
+        kept: list[dict[str, Any]] = []
+        for msg in messages:
+            role = msg.get("role")
+            calls = msg.get("tool_calls")
+            if role != "assistant" or not isinstance(calls, list) or not calls:
+                kept.append(msg)
+                continue
+
+            call_values = cast(list[object], calls)
+            typed_calls = [
+                cast(dict[str, Any], tool_call)
+                for tool_call in call_values
+                if isinstance(tool_call, dict)
+            ]
+            if not typed_calls:
+                if msg.get("content"):
+                    clean = dict(msg)
+                    clean.pop("tool_calls", None)
+                    kept.append(clean)
+                continue
+
+            clean_calls = typed_calls
+            if self._gemini_thought_signature(typed_calls[0]) is None:
+                first = dict(typed_calls[0])
+                extra_value = first.get("extra_content")
+                extra = dict(cast(dict[str, Any], extra_value)) if isinstance(
+                    extra_value, dict
+                ) else {}
+                google_value = extra.get("google")
+                google = dict(cast(dict[str, Any], google_value)) if isinstance(
+                    google_value, dict
+                ) else {}
+                google["thought_signature"] = _GEMINI_SKIP_THOUGHT_SIGNATURE
+                extra["google"] = google
+                first["extra_content"] = extra
+                clean_calls = [first, *typed_calls[1:]]
+
+            if clean_calls != call_values:
+                msg = dict(msg)
+                msg["tool_calls"] = clean_calls
+            kept.append(msg)
+        return kept
 
     # ------------------------------------------------------------------
     # Build kwargs
     # ------------------------------------------------------------------
+
+    def _request_model_name(self, model_name: str) -> str:
+        spec = self._spec
+        if not spec or "/" not in model_name:
+            return model_name
+        if spec.strip_model_prefix:
+            return model_name.split("/")[-1]
+
+        route_prefixes = getattr(spec, "strip_model_prefixes", ())
+        if not isinstance(route_prefixes, tuple) or not route_prefixes:
+            return model_name
+        typed_route_prefixes = cast(tuple[str, ...], route_prefixes)
+        model_prefix, routed_model = model_name.split("/", 1)
+        model_prefix_key = _provider_prefix_key(model_prefix)
+        if any(
+            _provider_prefix_key(prefix) == model_prefix_key
+            for prefix in typed_route_prefixes
+        ):
+            return routed_model
+        return model_name
 
     @staticmethod
     def _supports_temperature(
@@ -336,13 +900,30 @@ class OpenAICompatProvider(LLMProvider):
     ) -> bool:
         """Return True when the model accepts a temperature parameter.
 
-        GPT-5 family and reasoning models (o1/o3/o4) reject temperature
-        when reasoning_effort is set to anything other than ``"none"``.
+        Kimi K3 uses a fixed temperature that should be omitted. GPT-5 family
+        and reasoning models (o1/o3/o4) reject temperature when
+        reasoning_effort is set to anything other than ``"none"``.
         """
+        if _model_slug(model_name) == _KIMI_K3_MODEL:
+            return False
         if reasoning_effort and reasoning_effort.lower() != "none":
             return False
         name = model_name.lower()
         return not any(token in name for token in ("gpt-5", "o1", "o3", "o4"))
+
+    def _opencode_affinity_headers(
+        self,
+        provider_context: "ProviderCallContext | None",
+    ) -> dict[str, str] | None:
+        """Override the instance fallback with an opaque, ASCII-safe conversation key."""
+        if (
+            not self._opencode_session_affinity
+            or provider_context is None
+            or not provider_context.session_id
+        ):
+            return None
+        session_key = hashlib.sha256(provider_context.session_id.encode("utf-8")).hexdigest()
+        return {"x-opencode-session": session_key}
 
     def _build_kwargs(
         self,
@@ -353,6 +934,7 @@ class OpenAICompatProvider(LLMProvider):
         temperature: float,
         reasoning_effort: str | None,
         tool_choice: str | dict[str, Any] | None,
+        extra_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         model_name = model or self.default_model
         spec = self._spec
@@ -362,12 +944,14 @@ class OpenAICompatProvider(LLMProvider):
             if any(model_name.lower().startswith(k) for k in ("anthropic/", "claude")):
                 messages, tools = self._apply_cache_control(messages, tools)
 
-        if spec and spec.strip_model_prefix:
-            model_name = model_name.split("/")[-1]
+        model_name = self._request_model_name(model_name)
 
         kwargs: dict[str, Any] = {
             "model": model_name,
-            "messages": self._sanitize_messages(self._sanitize_empty_content(messages)),
+            "messages": self._sanitize_messages(
+                self._sanitize_empty_content(messages),
+                model_name,
+            ),
         }
 
         # GPT-5 and reasoning models (o1/o3/o4) reject temperature when
@@ -375,7 +959,9 @@ class OpenAICompatProvider(LLMProvider):
         if self._supports_temperature(model_name, reasoning_effort):
             kwargs["temperature"] = temperature
 
-        if spec and getattr(spec, "supports_max_completion_tokens", False):
+        if (
+            spec and getattr(spec, "supports_max_completion_tokens", False)
+        ) or _requires_max_completion_tokens(model_name):
             kwargs["max_completion_tokens"] = max(1, max_tokens)
         else:
             kwargs["max_tokens"] = max(1, max_tokens)
@@ -387,40 +973,133 @@ class OpenAICompatProvider(LLMProvider):
                     kwargs.update(overrides)
                     break
 
-        if reasoning_effort:
-            kwargs["reasoning_effort"] = reasoning_effort
+        # Moonshot selects the only valid temperature from the K2.5/K2.6 thinking mode:
+        # 1.0 when enabled and 0.6 when disabled. Omitting the parameter lets the API
+        # apply the matching value for both its default and explicit thinking controls.
+        if (
+            spec
+            and spec.name == "moonshot"
+            and _model_slug(model_name) in _KIMI_SERVER_MANAGED_TEMPERATURE_MODELS
+        ):
+            kwargs.pop("temperature", None)
 
-        # Provider-specific thinking parameters.
-        # Only sent when reasoning_effort is explicitly configured so that
-        # the provider default is preserved otherwise.
-        if spec and reasoning_effort is not None:
-            thinking_enabled = reasoning_effort.lower() != "minimal"
-            extra: dict[str, Any] | None = None
-            if spec.name == "dashscope":
-                extra = {"enable_thinking": thinking_enabled}
-            elif spec.name in (
-                "volcengine", "volcengine_coding_plan",
-                "byteplus", "byteplus_coding_plan",
-            ):
-                extra = {
-                    "thinking": {"type": "enabled" if thinking_enabled else "disabled"}
-                }
-            if extra:
-                kwargs.setdefault("extra_body", {}).update(extra)
+        # Normalize reasoning_effort into a semantic form (OpenAI vocab)
+        # used for internal decisions, and a wire form actually sent out.
+        # "minimum" is accepted as a DashScope-native alias for "minimal".
+        semantic_effort: str | None = None
+        if isinstance(reasoning_effort, str):
+            semantic_effort = reasoning_effort.lower()
+            if semantic_effort == "minimum":
+                semantic_effort = "minimal"
 
-        # Model-level thinking injection for Kimi thinking-capable models.
-        # Strip any provider prefix (e.g. "moonshotai/") before the set lookup
-        # so that OpenRouter-style names like "moonshotai/kimi-k2.5" are handled
-        # identically to bare names like "kimi-k2.5".
-        if reasoning_effort is not None and _is_kimi_thinking_model(model_name):
-            thinking_enabled = reasoning_effort.lower() != "minimal"
-            kwargs.setdefault("extra_body", {}).update(
-                {"thinking": {"type": "enabled" if thinking_enabled else "disabled"}}
+        wire_effort = reasoning_effort
+        slug = _model_slug(model_name)
+        if slug == _KIMI_K3_MODEL and semantic_effort is not None:
+            # K3 always reasons and currently accepts only the top-level
+            # reasoning_effort="max". Preserve disabled/default semantics by
+            # omitting the field; normalize older enabled presets to "max" so
+            # switching from a K2.x model does not send an unsupported value.
+            if semantic_effort in ("none", "minimal"):
+                wire_effort = None
+            else:
+                semantic_effort = "max"
+                wire_effort = "max"
+        if spec and spec.name == "dashscope" and semantic_effort == "minimal":
+            # DashScope accepts none/minimum/low/medium/high/xhigh; "minimal" 400s.
+            wire_effort = "minimum"
+
+        # Magistral and other providers where reasoning is implicit reject the
+        # reasoning_effort kwarg entirely. Strip it before the remap so we don't
+        # accidentally send "none"/"high" to a model that always reasons.
+        strip_effort = False
+        if spec and getattr(spec, "implicit_reasoning_models", ()):
+            model_lower = model_name.lower()
+            strip_effort = any(
+                pat in model_lower for pat in spec.implicit_reasoning_models
             )
+
+        # Some providers accept a constrained reasoning_effort vocabulary
+        # (Mistral: only "high"/"none"). Remap from OpenAI vocab to the
+        # provider's accepted set; an empty mapped value means "omit".
+        if (
+            not strip_effort
+            and spec
+            and getattr(spec, "reasoning_effort_remap", ())
+            and isinstance(semantic_effort, str)
+        ):
+            remap = dict(spec.reasoning_effort_remap)
+            mapped = remap.get(semantic_effort)
+            if mapped is not None:
+                wire_effort = mapped or None
+                semantic_effort = mapped or "none"
+
+        if strip_effort:
+            wire_effort = None
+        elif wire_effort and semantic_effort != "none":
+            kwargs["reasoning_effort"] = wire_effort
+
+        # Only send thinking controls when reasoning_effort is explicit so
+        # omitting the config preserves each provider's default.
+        if reasoning_effort is not None:
+            thinking_enabled = semantic_effort not in ("none", "minimal")
+            for thinking_style in _thinking_styles_for(spec, model_name):
+                if not thinking_enabled and slug in _KIMI_ALWAYS_THINKING_MODELS:
+                    continue
+                extra = _thinking_extra_body(thinking_style, thinking_enabled)
+                if extra:
+                    kwargs.setdefault("extra_body", {}).update(extra)
+            gateway_style = getattr(spec, "gateway_reasoning_style", "") if spec else ""
+            if (
+                gateway_style
+                and _model_thinking_style(model_name)
+                and (thinking_enabled or slug not in _KIMI_ALWAYS_THINKING_MODELS)
+            ):
+                extra = _gateway_reasoning_extra_body(gateway_style, semantic_effort)
+                if extra:
+                    kwargs.setdefault("extra_body", {}).update(extra)
+
+            # Moonshot rejects requests that carry both 'reasoning_effort'
+            # and the native 'thinking' param.  We already expressed the
+            # user's intent via the provider-native shape, so drop the
+            # redundant wire-level kwarg.  Only kimi models need this —
+            # Xiaomi's API accepts both params.
+            if slug in _KIMI_THINKING_MODELS:
+                kwargs.pop("reasoning_effort", None)
 
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
+
+        # Backfill reasoning_content="" on assistants missing it: DeepSeek
+        # thinking mode rejects history otherwise (#3554, #3584); "" reads
+        # as "no thinking that turn". DeepSeek-V4/reasoner reason natively,
+        # so backfill even without explicit reasoning_effort.
+        explicit_thinking = (
+            reasoning_effort is not None
+            and semantic_effort not in ("none", "minimal")
+            and (
+                (spec and spec.thinking_style)
+                or _model_thinking_style(model_name)
+            )
+        )
+        implicit_deepseek_thinking = (
+            spec is not None
+            and spec.name == "deepseek"
+            and semantic_effort not in ("none", "minimal", "minimum")
+            and any(t in model_name.lower() for t in ("deepseek-v4", "deepseek-reasoner"))
+        )
+        if explicit_thinking or implicit_deepseek_thinking:
+            for msg in kwargs["messages"]:
+                if msg.get("role") == "assistant" and "reasoning_content" not in msg:
+                    msg["reasoning_content"] = ""
+
+        # Merge user-configured extra_body last so ordinary fields can override
+        # provider defaults. Keep configured tools at the top level: the SDK
+        # otherwise lets extra_body.tools replace nanobot's generated functions.
+        if self._extra_body:
+            kwargs = _merge_chat_extra_body(kwargs, self._extra_body)
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
 
         return kwargs
 
@@ -429,22 +1108,98 @@ class OpenAICompatProvider(LLMProvider):
         model: str | None,
         reasoning_effort: str | None,
     ) -> bool:
-        """Use Responses API only for direct OpenAI requests that benefit from it."""
-        if self._spec and self._spec.name != "openai":
+        """Choose Responses for providers/models that explicitly support it."""
+        if self._api_type == "chat_completions":
             return False
-        if not _is_direct_openai_base(self._effective_base):
+        spec_name = self._spec.name if self._spec is not None else None
+        model_name = self._request_model_name(model or self.default_model).lower()
+        supported_models = {
+            supported.lower()
+            for supported in getattr(self._spec, "responses_models", ())
+        }
+        model_responses = any(
+            model_name == supported or model_name.endswith(f"/{supported}")
+            for supported in supported_models
+        )
+        provider_responses = spec_name in ("openai", "github_copilot")
+        if not provider_responses and not model_responses:
             return False
+        if self._responses_is_required():
+            # Explicit Responses-only request fields are mandatory; do not
+            # consult the circuit breaker or fall back to Chat Completions.
+            return True
+        if provider_responses and (self._spec is None or self._spec.name != "github_copilot"):
+            if not _is_direct_openai_base(self._effective_base):
+                return False
 
-        model_name = (model or self.default_model).lower()
         wants = False
-        if reasoning_effort and reasoning_effort.lower() != "none":
+        if model_responses:
+            wants = True
+        elif reasoning_effort and reasoning_effort.lower() != "none":
             wants = True
         elif any(token in model_name for token in ("gpt-5", "o1", "o3", "o4")):
             wants = True
         if not wants:
             return False
 
-        # Circuit breaker: skip after repeated failures, probe periodically.
+        return self._responses_circuit_allows_probe(model, reasoning_effort)
+
+    def _responses_is_required(self) -> bool:
+        return self._api_type == "responses" or self._hosted_web_search_enabled()
+
+    def _hosted_web_search_enabled(self) -> bool:
+        extra_body = getattr(self, "_extra_body", {})
+        configured_tools = extra_body.get("tools")
+        if "tools" in extra_body:
+            return isinstance(configured_tools, list) and any(
+                _is_hosted_web_search_tool(tool)
+                for tool in cast(list[object], configured_tools)
+            )
+        return bool(
+            self._spec
+            and any(
+                _is_hosted_web_search_type(tool_type)
+                for tool_type in getattr(self._spec, "responses_default_tools", ())
+            )
+        )
+
+    def _responses_state_provider(self) -> str:
+        spec_name = self._spec.name if self._spec is not None else "custom"
+        effective_base = self._effective_base or "https://api.openai.com/v1"
+        return f"openai_compat:{spec_name}:{effective_base.rstrip('/')}"
+
+    def _responses_state_model(self, model: str | None) -> str:
+        return self._request_model_name(model or self.default_model)
+
+    def can_resume_conversation_state(
+        self,
+        state: ProviderConversationState,
+        model: str | None = None,
+    ) -> bool:
+        return responses_state_matches(
+            state,
+            provider=self._responses_state_provider(),
+            model=self._responses_state_model(model),
+        )
+
+    def supports_native_compaction(self, model: str | None = None) -> bool:
+        """Enable server compaction only on direct OpenAI Responses endpoints."""
+        _ = model
+        if (
+            not self._native_compaction_available
+            or self._api_type == "chat_completions"
+        ):
+            return False
+        if self._spec is not None and self._spec.name != "openai":
+            return False
+        return _is_direct_openai_base(self._effective_base)
+
+    def _responses_circuit_allows_probe(
+        self,
+        model: str | None,
+        reasoning_effort: str | None,
+    ) -> bool:
+        """Return False when the Responses API circuit breaker is open."""
         key = _responses_circuit_key(model, self.default_model, reasoning_effort)
         failures = self._responses_failures.get(key, 0)
         if failures >= _RESPONSES_FAILURE_THRESHOLD:
@@ -508,11 +1263,36 @@ class OpenAICompatProvider(LLMProvider):
         temperature: float,
         reasoning_effort: str | None,
         tool_choice: str | dict[str, Any] | None,
+        provider_context: ProviderCallContext | None = None,
     ) -> dict[str, Any]:
         """Build a Responses API body for direct OpenAI requests."""
         model_name = model or self.default_model
-        sanitized_messages = self._sanitize_messages(self._sanitize_empty_content(messages))
-        instructions, input_items = convert_messages(sanitized_messages)
+        model_name = self._request_model_name(model_name)
+        sanitized_messages = self._sanitize_messages(
+            self._sanitize_empty_content(messages),
+            model_name,
+        )
+        sanitized_state = (
+            provider_context.conversation_state
+            if provider_context is not None
+            else None
+        )
+        if sanitized_state is not None:
+            sanitized_state = sanitized_state.with_pending_messages(
+                self._sanitize_messages(
+                    self._sanitize_empty_content(sanitized_state.pending_messages),
+                    model_name,
+                )
+            )
+        is_deepseek = bool(self._spec and self._spec.name == "deepseek")
+        preserve_reasoning = is_deepseek
+        instructions, input_items, replayed = prepare_responses_input(
+            sanitized_messages,
+            state=sanitized_state,
+            provider=self._responses_state_provider(),
+            model=model_name,
+            preserve_reasoning=preserve_reasoning,
+        )
 
         body: dict[str, Any] = {
             "model": model_name,
@@ -522,46 +1302,126 @@ class OpenAICompatProvider(LLMProvider):
             "store": False,
             "stream": False,
         }
+        compact_threshold = resolve_compact_threshold(
+            (
+                provider_context.context_window_tokens
+                if provider_context is not None
+                else None
+            ),
+            max_tokens,
+        )
+        if self.supports_native_compaction(model_name) and compact_threshold is not None:
+            body["context_management"] = [{
+                "type": "compaction",
+                "compact_threshold": compact_threshold,
+            }]
 
         if self._supports_temperature(model_name, reasoning_effort):
             body["temperature"] = temperature
 
-        if reasoning_effort and reasoning_effort.lower() != "none":
-            body["reasoning"] = {"effort": reasoning_effort}
+        if not self._supports_temperature(model_name, reasoning_effort) and not preserve_reasoning:
             body["include"] = ["reasoning.encrypted_content"]
+        if reasoning_effort and (reasoning_effort.lower() != "none" or is_deepseek):
+            body["reasoning"] = {"effort": reasoning_effort}
+        if replayed and "gpt-5.6" in model_name.lower():
+            body.setdefault("reasoning", {})["context"] = "all_turns"
 
         if tools:
             body["tools"] = convert_tools(tools)
             body["tool_choice"] = tool_choice or "auto"
 
+        extra_body = getattr(self, "_extra_body", {})
+        default_tools = getattr(self._spec, "responses_default_tools", ())
+        if "tools" not in extra_body and default_tools:
+            body["tools"] = [
+                *cast(list[object], body.get("tools", [])),
+                *({"type": tool_type} for tool_type in default_tools),
+            ]
+        if extra_body:
+            body = _merge_responses_extra_body(body, extra_body)
+
+        if self._hosted_web_search_enabled():
+            configured_tools = body.get("tools")
+            if isinstance(configured_tools, list):
+                managed_tools: list[object] = []
+                hosted_search_seen = False
+                for tool in cast(list[object], configured_tools):
+                    if _is_named_function_tool(tool, "web_search"):
+                        continue
+                    if _is_hosted_web_search_tool(tool):
+                        if hosted_search_seen:
+                            continue
+                        hosted_search_seen = True
+                    managed_tools.append(tool)
+                body["tools"] = managed_tools
+            if self._spec and self._spec.name == "openai":
+                source_include = "web_search_call.action.sources"
+                configured_include = body.get("include")
+                if isinstance(configured_include, list):
+                    if source_include not in configured_include:
+                        body["include"] = [*configured_include, source_include]
+                else:
+                    body["include"] = [source_include]
+
         return body
+
+    async def _create_response_with_compaction_fallback(
+        self,
+        client: Any,
+        body: dict[str, Any],
+        extra_headers: dict[str, str] | None = None,
+    ) -> Any:
+        """Retry Responses once without server compaction on compatibility errors."""
+        request_options = (
+            {"timeout": resolve_stream_idle_timeout_s()} if body.get("stream") else {}
+        )
+        try:
+            return await client.responses.create(**body, extra_headers=extra_headers, **request_options)
+        except Exception as exc:
+            if (
+                "context_management" not in body
+                or not is_compaction_compatibility_error(exc)
+            ):
+                raise
+            self._native_compaction_available = False
+            body.pop("context_management", None)
+            logger.warning(
+                "Responses server compaction unsupported; disabled for this provider instance "
+                "(status={})",
+                getattr(exc, "status_code", None),
+            )
+            return await client.responses.create(**body, extra_headers=extra_headers, **request_options)
 
     # ------------------------------------------------------------------
     # Response parsing
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _maybe_mapping(value: Any) -> dict[str, Any] | None:
+    def _maybe_mapping(value: object) -> dict[str, Any] | None:
         if isinstance(value, dict):
-            return value
+            return cast(dict[str, Any], value)
         model_dump = getattr(value, "model_dump", None)
         if callable(model_dump):
-            dumped = model_dump()
+            dumped: object = model_dump()
             if isinstance(dumped, dict):
-                return dumped
+                return cast(dict[str, Any], dumped)
         return None
 
     @classmethod
-    def _extract_text_content(cls, value: Any) -> str | None:
+    def _extract_text_content(cls, value: object) -> str | None:
         if value is None:
             return None
         if isinstance(value, str):
             return value
         if isinstance(value, list):
             parts: list[str] = []
-            for item in value:
+            for item in cast(list[object], value):
                 item_map = cls._maybe_mapping(item)
                 if item_map:
+                    # Skip Mistral-style {"type":"thinking","thinking":[...]}
+                    # blocks: their text belongs in reasoning_content.
+                    if item_map.get("type") == "thinking":
+                        continue
                     text = item_map.get("text")
                     if isinstance(text, str):
                         parts.append(text)
@@ -576,12 +1436,37 @@ class OpenAICompatProvider(LLMProvider):
         return str(value)
 
     @classmethod
-    def _extract_usage(cls, response: Any) -> dict[str, int]:
+    def _extract_thinking_content(cls, value: object) -> str | None:
+        """Extract reasoning text from Mistral-style thinking blocks.
+
+        Mistral returns content as a list mixing
+        ``{"type":"thinking","thinking":[{"type":"text","text":...}]}`` and
+        ``{"type":"text","text":...}``. The thinking text belongs in
+        ``reasoning_content`` so the agent can surface it as a reasoning
+        trace rather than as the assistant's reply.
+        """
+        if not isinstance(value, list):
+            return None
+        parts: list[str] = []
+        for item in cast(list[object], value):
+            item_map = cls._maybe_mapping(item)
+            if not item_map:
+                continue
+            if item_map.get("type") != "thinking":
+                continue
+            inner = item_map.get("thinking")
+            text = cls._extract_text_content(inner)
+            if text:
+                parts.append(text)
+        return "".join(parts) or None
+
+    @classmethod
+    def _extract_usage(cls, response: Any) -> LLMUsage | None:
         """Extract token usage from an OpenAI-compatible response.
 
         Handles both dict-based (raw JSON) and object-based (SDK Pydantic)
-        responses.  Provider-specific ``cached_tokens`` fields are normalised
-        under a single key; see the priority chain inside for details.
+        responses. Provider-specific cache fields are normalized once at
+        this Chat Completions wire boundary.
         """
         # --- resolve usage object ---
         usage_obj = None
@@ -593,21 +1478,18 @@ class OpenAICompatProvider(LLMProvider):
 
         usage_map = cls._maybe_mapping(usage_obj)
         if usage_map is not None:
-            result = {
-                "prompt_tokens": int(usage_map.get("prompt_tokens") or 0),
-                "completion_tokens": int(usage_map.get("completion_tokens") or 0),
-                "total_tokens": int(usage_map.get("total_tokens") or 0),
-            }
+            input_tokens = int(usage_map.get("prompt_tokens") or 0)
+            output_tokens = int(usage_map.get("completion_tokens") or 0)
         elif usage_obj:
-            result = {
-                "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0) or 0,
-                "completion_tokens": getattr(usage_obj, "completion_tokens", 0) or 0,
-                "total_tokens": getattr(usage_obj, "total_tokens", 0) or 0,
-            }
+            input_tokens = int(getattr(usage_obj, "prompt_tokens", 0) or 0)
+            output_tokens = int(getattr(usage_obj, "completion_tokens", 0) or 0)
         else:
-            return {}
+            return None
 
-        # --- cached_tokens (normalised across providers) ---
+        wire_total = cls._get_nested_int(usage_obj, ("total_tokens",))
+
+        cache_read: int | None = None
+        # --- cached_tokens (normalised across Chat-compatible providers) ---
         # Try nested paths first (dict), fall back to attribute (SDK object).
         # Priority order ensures the most specific field wins.
         for path in (
@@ -616,30 +1498,46 @@ class OpenAICompatProvider(LLMProvider):
             ("prompt_cache_hit_tokens",),                # DeepSeek/SiliconFlow
         ):
             cached = cls._get_nested_int(usage_map, path)
-            if not cached and usage_obj:
+            if cached is None and usage_obj:
                 cached = cls._get_nested_int(usage_obj, path)
-            if cached:
-                result["cached_tokens"] = cached
+            if cached is not None:
+                cache_read = cached
                 break
 
-        return result
+        cache_write = cls._get_nested_int(
+            usage_obj,
+            ("prompt_tokens_details", "cache_write_tokens"),
+        )
+
+        return LLMUsage.reported(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=wire_total,
+            cache_read_tokens=cache_read,
+            cache_write_tokens=cache_write,
+        )
 
     @staticmethod
-    def _get_nested_int(obj: Any, path: tuple[str, ...]) -> int:
-        """Drill into *obj* by *path* segments and return an ``int`` value.
+    def _get_nested_int(obj: object, path: tuple[str, ...]) -> int | None:
+        """Return a present usage count while preserving explicit zero.
 
         Supports both dict-key access and attribute access so it works
         uniformly with raw JSON dicts **and** SDK Pydantic models.
         """
-        current = obj
+        current: object = obj
         for segment in path:
             if current is None:
-                return 0
+                return None
             if isinstance(current, dict):
-                current = current.get(segment)
+                current = cast(dict[str, Any], current).get(segment)
             else:
                 current = getattr(current, segment, None)
-        return int(current or 0) if current is not None else 0
+        if current is None or isinstance(current, bool):
+            return None
+        try:
+            return int(cast(Any, current))
+        except (TypeError, ValueError):
+            return None
 
     def _parse(self, response: Any) -> LLMResponse:
         if isinstance(response, str):
@@ -647,7 +1545,10 @@ class OpenAICompatProvider(LLMProvider):
 
         response_map = self._maybe_mapping(response)
         if response_map is not None:
-            choices = response_map.get("choices") or []
+            choices = cast(
+                list[object],
+                response_map.get("choices") or [],
+            )
             if not choices:
                 content = self._extract_text_content(
                     response_map.get("content") or response_map.get("output_text")
@@ -662,49 +1563,68 @@ class OpenAICompatProvider(LLMProvider):
                         finish_reason=str(response_map.get("finish_reason") or "stop"),
                         usage=self._extract_usage(response_map),
                     )
-                return LLMResponse(content="Error: API returned empty choices.", finish_reason="error")
+                return LLMResponse(
+                    content="Error: API returned empty choices.",
+                    finish_reason="error",
+                    error_kind="empty",
+                )
 
             choice0 = self._maybe_mapping(choices[0]) or {}
             msg0 = self._maybe_mapping(choice0.get("message")) or {}
             content = self._extract_text_content(msg0.get("content"))
             finish_reason = str(choice0.get("finish_reason") or "stop")
 
-            raw_tool_calls: list[Any] = []
-            # StepFun Plan: fallback to reasoning field when content is empty
-            if not content and msg0.get("reasoning"):
+            raw_tool_calls: list[object] = []
+            # StepFun: fallback to reasoning field when content is empty
+            if not content and msg0.get("reasoning") and self._spec and self._spec.reasoning_as_content:
                 content = self._extract_text_content(msg0.get("reasoning"))
             reasoning_content = msg0.get("reasoning_content")
-            if not reasoning_content and msg0.get("reasoning"):
+            if reasoning_content is None and msg0.get("reasoning"):
                 reasoning_content = self._extract_text_content(msg0.get("reasoning"))
+            # Mistral reasoning models return thinking text inside the content
+            # array; lift it into reasoning_content so the runner records it
+            # under the reasoning trace.
+            spec = getattr(self, "_spec", None)
+            if reasoning_content is None and getattr(spec, "extract_thinking_blocks", False):
+                reasoning_content = self._extract_thinking_content(msg0.get("content"))
             for ch in choices:
                 ch_map = self._maybe_mapping(ch) or {}
                 m = self._maybe_mapping(ch_map.get("message")) or {}
-                tool_calls = m.get("tool_calls")
-                if isinstance(tool_calls, list) and tool_calls:
-                    raw_tool_calls.extend(tool_calls)
+                message_tool_calls = cast(object, m.get("tool_calls"))
+                if isinstance(message_tool_calls, list) and message_tool_calls:
+                    raw_tool_calls.extend(
+                        cast(list[object], message_tool_calls)
+                    )
                     if ch_map.get("finish_reason") in ("tool_calls", "stop"):
                         finish_reason = str(ch_map["finish_reason"])
                 if not content:
                     content = self._extract_text_content(m.get("content"))
-                if not reasoning_content:
+                if reasoning_content is None:
                     reasoning_content = m.get("reasoning_content")
 
-            parsed_tool_calls = []
+            # Deduplicate tool call IDs (same pattern as streaming path)
+            # Some providers reuse the same ID for parallel tool calls.
+            _seen_tc_ids: set[str] = set()
+            parsed_tool_calls: list[ToolCallRequest] = []
             for tc in raw_tool_calls:
                 tc_map = self._maybe_mapping(tc) or {}
                 fn = self._maybe_mapping(tc_map.get("function")) or {}
-                args = fn.get("arguments", {})
-                if isinstance(args, str):
-                    args = json_repair.loads(args)
+                args = parse_tool_arguments(fn.get("arguments", {}))
                 ec, prov, fn_prov = _extract_tc_extras(tc)
+                raw_id = str(tc_map.get("id") or _short_tool_id())
+                if not raw_id or raw_id in _seen_tc_ids:
+                    raw_id = _short_tool_id()
+                _seen_tc_ids.add(raw_id)
                 parsed_tool_calls.append(ToolCallRequest(
-                    id=_short_tool_id(),
+                    id=raw_id,
                     name=str(fn.get("name") or ""),
-                    arguments=args if isinstance(args, dict) else {},
+                    arguments=args,
                     extra_content=ec,
                     provider_specific_fields=prov,
                     function_provider_specific_fields=fn_prov,
                 ))
+            if not parsed_tool_calls:
+                content, parsed_tool_calls = _extract_text_tool_calls(content)
 
             return LLMResponse(
                 content=content,
@@ -715,42 +1635,46 @@ class OpenAICompatProvider(LLMProvider):
             )
 
         if not response.choices:
-            return LLMResponse(content="Error: API returned empty choices.", finish_reason="error")
+            return LLMResponse(
+                content="Error: API returned empty choices.",
+                finish_reason="error",
+                error_kind="empty",
+            )
 
         choice = response.choices[0]
         msg = choice.message
         content = msg.content
         finish_reason = choice.finish_reason
 
-        raw_tool_calls: list[Any] = []
+        raw_sdk_tool_calls: list[Any] = []
         for ch in response.choices:
             m = ch.message
             if hasattr(m, "tool_calls") and m.tool_calls:
-                raw_tool_calls.extend(m.tool_calls)
+                raw_sdk_tool_calls.extend(m.tool_calls)
                 if ch.finish_reason in ("tool_calls", "stop"):
                     finish_reason = ch.finish_reason
             if not content and m.content:
                 content = m.content
-            if not content and getattr(m, "reasoning", None):
+            if not content and getattr(m, "reasoning", None) and self._spec and self._spec.reasoning_as_content:
                 content = m.reasoning
 
-        tool_calls = []
-        for tc in raw_tool_calls:
-            args = tc.function.arguments
-            if isinstance(args, str):
-                args = json_repair.loads(args)
+        tool_calls: list[ToolCallRequest] = []
+        for tc in raw_sdk_tool_calls:
+            args = parse_tool_arguments(tc.function.arguments)
             ec, prov, fn_prov = _extract_tc_extras(tc)
             tool_calls.append(ToolCallRequest(
-                id=_short_tool_id(),
+                id=str(getattr(tc, "id", None) or _short_tool_id()),
                 name=tc.function.name,
                 arguments=args,
                 extra_content=ec,
                 provider_specific_fields=prov,
                 function_provider_specific_fields=fn_prov,
             ))
+        if not tool_calls:
+            content, tool_calls = _extract_text_tool_calls(content)
 
-        reasoning_content = getattr(msg, "reasoning_content", None) or None
-        if not reasoning_content and getattr(msg, "reasoning", None):
+        reasoning_content = getattr(msg, "reasoning_content", None)
+        if reasoning_content is None and getattr(msg, "reasoning", None):
             reasoning_content = msg.reasoning
 
         return LLMResponse(
@@ -767,7 +1691,7 @@ class OpenAICompatProvider(LLMProvider):
         reasoning_parts: list[str] = []
         tc_bufs: dict[int, dict[str, Any]] = {}
         finish_reason = "stop"
-        usage: dict[str, int] = {}
+        usage: LLMUsage | None = None
 
         def _accum_tc(tc: Any, idx_hint: int) -> None:
             """Accumulate one streaming tool-call delta into *tc_bufs*."""
@@ -795,6 +1719,21 @@ class OpenAICompatProvider(LLMProvider):
             if fn_prov:
                 buf["fn_prov"] = fn_prov
 
+        def _accum_legacy_function_call(function_call: Any) -> None:
+            """Accumulate legacy ``delta.function_call`` streaming chunks."""
+            if not function_call:
+                return
+            buf = tc_bufs.setdefault(0, {
+                "id": "", "name": "", "arguments": "",
+                "extra_content": None, "prov": None, "fn_prov": None,
+            })
+            fn_name = _get(function_call, "name")
+            if fn_name:
+                buf["name"] = str(fn_name)
+            fn_args = _get(function_call, "arguments")
+            if fn_args:
+                buf["arguments"] += str(fn_args)
+
         for chunk in chunks:
             if isinstance(chunk, str):
                 content_parts.append(chunk)
@@ -802,7 +1741,10 @@ class OpenAICompatProvider(LLMProvider):
 
             chunk_map = cls._maybe_mapping(chunk)
             if chunk_map is not None:
-                choices = chunk_map.get("choices") or []
+                choices = cast(
+                    list[object],
+                    chunk_map.get("choices") or [],
+                )
                 if not choices:
                     usage = cls._extract_usage(chunk_map) or usage
                     text = cls._extract_text_content(
@@ -815,16 +1757,27 @@ class OpenAICompatProvider(LLMProvider):
                 if choice.get("finish_reason"):
                     finish_reason = str(choice["finish_reason"])
                 delta = cls._maybe_mapping(choice.get("delta")) or {}
-                text = cls._extract_text_content(delta.get("content"))
+                raw_delta_content = delta.get("content")
+                text = cls._extract_text_content(raw_delta_content)
                 if text:
                     content_parts.append(text)
                 text = cls._extract_text_content(delta.get("reasoning_content"))
                 if not text:
                     text = cls._extract_text_content(delta.get("reasoning"))
+                if not text:
+                    # Mistral streams thinking inside the content array as
+                    # {"type":"thinking", thinking:[{"type":"text", ...}]}.
+                    text = cls._extract_thinking_content(raw_delta_content)
                 if text:
                     reasoning_parts.append(text)
-                for idx, tc in enumerate(delta.get("tool_calls") or []):
+                for idx, tc in enumerate(
+                    cast(
+                        Iterable[object],
+                        delta.get("tool_calls") or [],
+                    )
+                ):
                     _accum_tc(tc, idx)
+                _accum_legacy_function_call(delta.get("function_call"))
                 usage = cls._extract_usage(chunk_map) or usage
                 continue
 
@@ -836,29 +1789,57 @@ class OpenAICompatProvider(LLMProvider):
                 finish_reason = choice.finish_reason
             delta = choice.delta
             if delta and delta.content:
-                content_parts.append(delta.content)
+                text = cls._extract_text_content(delta.content)
+                if text:
+                    content_parts.append(text)
+                thinking_text = cls._extract_thinking_content(delta.content)
+                if thinking_text:
+                    reasoning_parts.append(thinking_text)
             if delta:
                 reasoning = getattr(delta, "reasoning_content", None)
                 if not reasoning:
                     reasoning = getattr(delta, "reasoning", None)
                 if reasoning:
-                    reasoning_parts.append(reasoning)
-            for tc in (delta.tool_calls or []) if delta else []:
+                    text = cls._extract_text_content(reasoning)
+                    if text:
+                        reasoning_parts.append(text)
+            delta_tool_calls = (
+                cast(Iterable[object], getattr(delta, "tool_calls", None) or [])
+                if delta
+                else ()
+            )
+            for tc in delta_tool_calls:
                 _accum_tc(tc, getattr(tc, "index", 0))
+            if delta:
+                _accum_legacy_function_call(getattr(delta, "function_call", None))
+
+        # Some providers (e.g. Zhipu/GLM) reuse the same tool_call id for
+        # parallel tool calls in streaming mode. Deduplicate before building
+        # the response so downstream tool messages don't collide.
+        _seen_tc_ids: set[str] = set()
+        for b in tc_bufs.values():
+            if not b["id"] or b["id"] in _seen_tc_ids:
+                b["id"] = _short_tool_id()
+            _seen_tc_ids.add(b["id"])
+
+        content = "".join(content_parts) or None
+        tool_calls = [
+            ToolCallRequest(
+                id=b["id"] or _short_tool_id(),
+                name=b["name"],
+                arguments=parse_tool_arguments(b["arguments"]),
+                extra_content=b.get("extra_content"),
+                provider_specific_fields=b.get("prov"),
+                function_provider_specific_fields=b.get("fn_prov"),
+            )
+            for b in tc_bufs.values()
+        ]
+        if not tool_calls:
+            content, tool_calls = _extract_text_tool_calls(content)
 
         return LLMResponse(
-            content="".join(content_parts) or None,
-            tool_calls=[
-                ToolCallRequest(
-                    id=b["id"] or _short_tool_id(),
-                    name=b["name"],
-                    arguments=json_repair.loads(b["arguments"]) if b["arguments"] else {},
-                    extra_content=b.get("extra_content"),
-                    provider_specific_fields=b.get("prov"),
-                    function_provider_specific_fields=b.get("fn_prov"),
-                )
-                for b in tc_bufs.values()
-            ],
+            content=content,
+            tool_calls=tool_calls,
             finish_reason=finish_reason,
             usage=usage,
             reasoning_content="".join(reasoning_parts) or None,
@@ -950,6 +1931,28 @@ class OpenAICompatProvider(LLMProvider):
     # Public API
     # ------------------------------------------------------------------
 
+    async def chat_with_context(
+        self,
+        *,
+        provider_context: ProviderCallContext,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        return await self.chat(
+            **kwargs,
+            provider_context=provider_context,
+        )
+
+    async def chat_stream_with_context(
+        self,
+        *,
+        provider_context: ProviderCallContext,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        return await self.chat_stream(
+            **kwargs,
+            provider_context=provider_context,
+        )
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -959,18 +1962,39 @@ class OpenAICompatProvider(LLMProvider):
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        provider_context: ProviderCallContext | None = None,
     ) -> LLMResponse:
+        client = await self._ensure_client()
+        affinity = self._opencode_affinity_headers(provider_context)
         try:
             if self._should_use_responses_api(model, reasoning_effort):
                 try:
                     body = self._build_responses_body(
                         messages, tools, model, max_tokens, temperature,
                         reasoning_effort, tool_choice,
+                        provider_context,
                     )
-                    result = parse_response_output(await self._client.responses.create(**body))
+                    responses_raw = await self._create_response_with_compaction_fallback(
+                        client,
+                        body,
+                        extra_headers=affinity,
+                    )
+                    result = parse_response_output(
+                        responses_raw,
+                        state_provider=self._responses_state_provider(),
+                        state_model=str(body["model"]),
+                        state_input_items=cast(list[dict[str, Any]], body["input"]),
+                    )
                     self._record_responses_success(model, reasoning_effort)
                     return result
                 except Exception as responses_error:
+                    if self._spec and self._spec.name == "github_copilot":
+                        # Copilot gateway exposes GPT-5/o-series only via /responses;
+                        # falling back to /chat/completions cannot succeed and would
+                        # hide the real error.
+                        raise
+                    if self._responses_is_required():
+                        raise
                     if not self._should_fallback_from_responses_error(responses_error):
                         raise
                     self._record_responses_failure(model, reasoning_effort)
@@ -978,8 +2002,13 @@ class OpenAICompatProvider(LLMProvider):
             kwargs = self._build_kwargs(
                 messages, tools, model, max_tokens, temperature,
                 reasoning_effort, tool_choice,
+                extra_headers=affinity,
             )
-            return self._parse(await self._client.chat.completions.create(**kwargs))
+            chat_raw = cast(
+                Any,
+                await client.chat.completions.create(**kwargs),
+            )
+            return self._parse(chat_raw)
         except Exception as e:
             return self._handle_error(e, spec=self._spec, api_base=self.api_base)
 
@@ -993,20 +2022,30 @@ class OpenAICompatProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        provider_context: ProviderCallContext | None = None,
     ) -> LLMResponse:
-        idle_timeout_s = int(os.environ.get("NANOBOT_STREAM_IDLE_TIMEOUT_S", "90"))
+        client = await self._ensure_client()
+        idle_timeout_s = resolve_stream_idle_timeout_s()
+        affinity = self._opencode_affinity_headers(provider_context)
         try:
             if self._should_use_responses_api(model, reasoning_effort):
                 try:
                     body = self._build_responses_body(
                         messages, tools, model, max_tokens, temperature,
                         reasoning_effort, tool_choice,
+                        provider_context,
                     )
                     body["stream"] = True
-                    stream = await self._client.responses.create(**body)
+                    responses_stream = await self._create_response_with_compaction_fallback(
+                        client,
+                        body,
+                        extra_headers=affinity,
+                    )
 
-                    async def _timed_stream():
-                        stream_iter = stream.__aiter__()
+                    async def _timed_stream() -> AsyncIterator[Any]:
+                        stream_iter: AsyncIterator[Any] = responses_stream.__aiter__()
                         while True:
                             try:
                                 yield await asyncio.wait_for(
@@ -1016,19 +2055,57 @@ class OpenAICompatProvider(LLMProvider):
                             except StopAsyncIteration:
                                 break
 
-                    content, tool_calls, finish_reason, usage, reasoning_content = await consume_sdk_stream(
+                    capture = ResponsesStreamCapture()
+                    (
+                        content,
+                        tool_calls,
+                        finish_reason,
+                        usage,
+                        reasoning_content,
+                    ) = await consume_sdk_stream(
                         _timed_stream(),
                         on_content_delta,
+                        on_tool_call_delta=on_tool_call_delta,
+                        on_reasoning_delta=on_thinking_delta,
+                        capture=capture,
                     )
                     self._record_responses_success(model, reasoning_effort)
-                    return LLMResponse(
+                    result = LLMResponse(
                         content=content or None,
                         tool_calls=tool_calls,
                         finish_reason=finish_reason,
                         usage=usage,
                         reasoning_content=reasoning_content,
                     )
+                    if capture.completed and is_replayable_finish_reason(finish_reason):
+                        result.provider_state = build_responses_state(
+                            provider=self._responses_state_provider(),
+                            model=str(body["model"]),
+                            input_items=cast(list[dict[str, Any]], body["input"]),
+                            output_items=capture.output_items,
+                            usage=usage,
+                        )
+                        result.provider_compaction_state = (
+                            build_responses_compaction_state(
+                                provider=self._responses_state_provider(),
+                                model=str(body["model"]),
+                                output_items=capture.output_items,
+                            )
+                        )
+                        result.provider_compaction_applied = (
+                            result.provider_compaction_state is not None
+                        )
+                        if result.provider_compaction_applied:
+                            result.provider_compaction_scope = "current_request"
+                    return result
                 except Exception as responses_error:
+                    if self._spec and self._spec.name == "github_copilot":
+                        # Copilot gateway exposes GPT-5/o-series only via /responses;
+                        # falling back to /chat/completions cannot succeed and would
+                        # hide the real error.
+                        raise
+                    if self._responses_is_required():
+                        raise
                     if not self._should_fallback_from_responses_error(responses_error):
                         raise
                     self._record_responses_failure(model, reasoning_effort)
@@ -1036,31 +2113,86 @@ class OpenAICompatProvider(LLMProvider):
             kwargs = self._build_kwargs(
                 messages, tools, model, max_tokens, temperature,
                 reasoning_effort, tool_choice,
+                extra_headers=affinity,
             )
+            if self._spec and self._spec.name == "zhipu" and tools and on_tool_call_delta:
+                # Z.AI/GLM keeps streaming tool-call arguments behind an
+                # explicit provider flag.  Pass it through the OpenAI SDK's
+                # extra_body escape hatch so the usual delta.tool_calls path
+                # can surface live file-edit progress.
+                kwargs.setdefault("extra_body", {})["tool_stream"] = True
             kwargs["stream"] = True
+            kwargs["timeout"] = idle_timeout_s
             kwargs["stream_options"] = {"include_usage": True}
-            stream = await self._client.chat.completions.create(**kwargs)
+            chat_stream = cast(
+                Any,
+                await client.chat.completions.create(**kwargs),
+            )
             chunks: list[Any] = []
-            stream_iter = stream.__aiter__()
+            completed = False
+            stream_iter: AsyncIterator[Any] = chat_stream.__aiter__()
             while True:
                 try:
-                    chunk = await asyncio.wait_for(
+                    chunk: Any = await asyncio.wait_for(
                         stream_iter.__anext__(),
                         timeout=idle_timeout_s,
                     )
                 except StopAsyncIteration:
                     break
                 chunks.append(chunk)
-                if on_content_delta and chunk.choices:
-                    text = getattr(chunk.choices[0].delta, "content", None)
-                    if text:
-                        await on_content_delta(text)
+                if chunk.choices:
+                    completed |= bool(chunk.choices[0].finish_reason)
+                    delta_obj = chunk.choices[0].delta
+                    raw_delta_content = getattr(delta_obj, "content", None)
+                    if on_content_delta:
+                        # Mistral streams content as a list of {"type":"thinking",
+                        # ...} + {"type":"text",...} blocks. Extract just the
+                        # text portion before invoking the callback so callers
+                        # never see non-string content.
+                        text = self._extract_text_content(raw_delta_content)
+                        if text:
+                            await on_content_delta(text)
+                    if on_thinking_delta:
+                        reasoning = getattr(delta_obj, "reasoning_content", None) or getattr(
+                            delta_obj, "reasoning", None,
+                        )
+                        r_text = self._extract_text_content(reasoning)
+                        if not r_text:
+                            # Mistral keeps the thinking trace inside the
+                            # content array rather than a separate field.
+                            r_text = self._extract_thinking_content(raw_delta_content)
+                        if r_text:
+                            await on_thinking_delta(r_text)
+                    if on_tool_call_delta:
+                        for idx, tool_delta in enumerate(
+                            getattr(delta_obj, "tool_calls", None) or []
+                        ):
+                            fn = _get(tool_delta, "function")
+                            tool_index = _get(tool_delta, "index")
+                            await on_tool_call_delta({
+                                "index": tool_index if tool_index is not None else idx,
+                                "call_id": str(_get(tool_delta, "id") or ""),
+                                "name": str(_get(fn, "name") or "") if fn is not None else "",
+                                "arguments_delta": (
+                                    str(_get(fn, "arguments") or "") if fn is not None else ""
+                                ),
+                            })
+                        function_call = getattr(delta_obj, "function_call", None)
+                        if function_call:
+                            await on_tool_call_delta({
+                                "index": 0,
+                                "call_id": "",
+                                "name": str(_get(function_call, "name") or ""),
+                                "arguments_delta": str(_get(function_call, "arguments") or ""),
+                            })
+            if not completed:
+                raise ConnectionError("Model stream ended before a finish reason was received")
             return self._parse_chunks(chunks)
         except asyncio.TimeoutError:
             return LLMResponse(
                 content=(
                     f"Error calling LLM: stream stalled for more than "
-                    f"{idle_timeout_s} seconds"
+                    f"{idle_timeout_s:g} seconds"
                 ),
                 finish_reason="error",
                 error_kind="timeout",

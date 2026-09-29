@@ -1,0 +1,113 @@
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
+
+diff --git a/nanobot/nanobot/sdk/clients.py b/nanobot/nanobot/sdk/clients.py
+index 8bb81e1..8ced797 100644
+--- a/nanobot/nanobot/sdk/clients.py
++++ b/nanobot/nanobot/sdk/clients.py
+@@ -29,6 +29,11 @@ class SessionClient:
+     def __init__(self, loop: AgentLoop) -> None:
+         self._loop = loop
+ 
++    def _ensure_access(self, operation: str) -> None:
++        guard = getattr(self._loop.runtime_adapters, "session_access", None)
++        if guard is not None and not guard(operation):
++            raise RuntimeError(f"session operation '{operation}' is not available")
++
+     async def ingest(
+         self,
+         session_key: str,
+@@ -39,6 +44,7 @@ class SessionClient:
+         save: bool = True,
+     ) -> SessionSnapshot:
+         """Import an existing transcript without running the model."""
++        self._ensure_access("ingest")
+         session = self._loop.sessions.get_or_create(session_key)
+         if metadata:
+             session.metadata.update(deepcopy(dict(metadata)))
+@@ -66,6 +72,7 @@ class SessionClient:
+ 
+     def get(self, session_key: str) -> SessionSnapshot | None:
+         """Return a display-safe snapshot without creating a new session on disk."""
++        self._ensure_access("get")
+         cached = self._loop.sessions.get_cached(session_key)
+         if cached is not None:
+             return snapshot_from_session(cached)
+@@ -76,6 +83,7 @@ class SessionClient:
+ 
+     def list(self) -> list[SessionInfo]:
+         """List persisted sessions."""
++        self._ensure_access("list")
+         return [
+             SessionInfo(
+                 key=str(row.get("key") or ""),
+@@ -88,8 +96,20 @@ class SessionClient:
+             for row in self._loop.sessions.list_sessions()
+         ]
+ 
++    def read(self) -> str:
++        """Reject the legacy memory-shaped session read operation."""
++        self._ensure_access("read")
++        raise RuntimeError("session read is not available")
++
++    def read_history(self, *, session_key: str | None = None) -> list[dict[str, Any]]:
++        """Reject the legacy memory-shaped session history operation."""
++        del session_key
++        self._ensure_access("read_history")
++        raise RuntimeError("session history is not available")
++
+     def export(self, session_key: str) -> SessionSnapshot | None:
+         """Return a trusted full snapshot, including model-only runtime context."""
++        self._ensure_access("export")
+         cached = self._loop.sessions.get_cached(session_key)
+         if cached is not None:
+             return snapshot_from_session(cached, include_runtime_context=True)
+@@ -106,6 +126,7 @@ class SessionClient:
+         save: bool = True,
+     ) -> SessionSnapshot:
+         """Restore a trusted snapshot into an empty session."""
++        self._ensure_access("restore")
+         key = session_key or snapshot.key
+         if not key:
+             raise ValueError("restored snapshots must include a session key")
+@@ -137,6 +158,7 @@ class SessionClient:
+ 
+     def clear(self, session_key: str) -> SessionSnapshot:
+         """Clear one session and persist the empty session."""
++        self._ensure_access("clear")
+         self._loop.discard_session_file_state(session_key)
+         session = self._loop.sessions.get_or_create(session_key)
+         session.clear()
+@@ -145,10 +167,12 @@ class SessionClient:
+ 
+     def delete(self, session_key: str) -> bool:
+         """Delete one session from disk and cache."""
++        self._ensure_access("delete")
+         return self._loop.sessions.delete_session(session_key)
+ 
+     def flush(self) -> int:
+         """Flush cached sessions to durable storage."""
++        self._ensure_access("flush")
+         return self._loop.sessions.flush_all()
+ 
+ 
+@@ -210,6 +234,9 @@ class RuntimeClient:
+ 
+     async def compact_session(self, session_key: str) -> SessionSnapshot:
+         """Summarize one session and exclude its archived messages from replay."""
++        guard = getattr(self._loop.runtime_adapters, "session_access", None)
++        if guard is not None and not guard("compact"):
++            raise RuntimeError("session operation 'compact' is not available")
+         session = self._loop.sessions.get_or_create(session_key)
+         runtime = self._loop.runtime_for_session(session)
+         await self._loop.consolidator.compact_idle_session(
+@@ -220,6 +247,9 @@ class RuntimeClient:
+ 
+     async def compact_idle_session(self, session_key: str, *, max_suffix: int = 0) -> str | None:
+         """Return a replacement summary; legacy ``max_suffix`` no longer retains history."""
++        guard = getattr(self._loop.runtime_adapters, "session_access", None)
++        if guard is not None and not guard("compact_idle"):
++            raise RuntimeError("session operation 'compact_idle' is not available")
+         session = self._loop.sessions.get_or_create(session_key)
+         runtime = self._loop.runtime_for_session(session)
+         return await self._loop.consolidator.compact_idle_session(

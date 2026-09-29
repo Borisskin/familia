@@ -19,10 +19,17 @@ from pathlib import Path
 
 import pytest
 
-from familia.policy import Decision, PolicyContext
+from familia import principals as principals_mod
+from familia.policy import Decision, PolicyContext, gate_outbound_send
 from familia.policy.engine import PolicyEngine, load_engine
+from familia.policy import pending as pending_mod
 from familia.policy.pending import PendingStore
-from familia.principals import PrincipalRegistry, load_registry
+from familia.principals import (
+    PrincipalRegistry,
+    load_registry,
+    set_current_actor,
+    set_current_channel,
+)
 from nanobot.bus.events import OutboundMessage
 
 
@@ -104,7 +111,12 @@ def test_scenario_22_dog_health_to_both(engine: PolicyEngine) -> None:
 
 # --- Scenario #39 + #42 ----------------------------------------------------
 
-def test_scenario_39_42_ask_flow_roundtrip(engine: PolicyEngine) -> None:
+@pytest.mark.asyncio
+async def test_scenario_39_42_ask_flow_roundtrip(
+    engine: PolicyEngine,
+    principals: PrincipalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """member_a → посторонний чат → ASK(approver=owner) → park/take."""
     # 1. Policy отдаёт ASK с правильным approver'ом.
     res = engine.evaluate(PolicyContext(
@@ -115,20 +127,38 @@ def test_scenario_39_42_ask_flow_roundtrip(engine: PolicyEngine) -> None:
     assert res.rule is not None
     assert "owner" in (res.rule.approver or [])
 
-    # 2. Park outbound в PendingStore.
-    store = PendingStore()
+    # 2. Run the actual gate: it owns the pending origin route and sends the
+    # approval prompt to the approver's registered identity.
+    import familia.policy.engine as policy_engine_mod
+
+    monkeypatch.setattr(principals_mod, "_registry", principals)
+    monkeypatch.setattr(policy_engine_mod, "_engine", engine)
+    monkeypatch.setattr(pending_mod, "_store", PendingStore())
+    set_current_actor("member_a")
+    set_current_channel("vk")
+    prompts: list[OutboundMessage] = []
+
+    async def publish_outbound(message: OutboundMessage) -> None:
+        prompts.append(message)
+
     outbound = OutboundMessage(
         channel="vk", chat_id=STRANGER_CHAT,
         content="member_a → stranger через approve",
     )
-    parked = store.park(
+    gate_result = await gate_outbound_send(
         action="message.send",
         outbound=outbound,
-        requester_actor="member_a",
-        approvers=list(res.rule.approver),
-        reason=res.rule.reason or "",
-        rule_name=res.rule.name,
+        inbound_channel="vk",
+        inbound_chat_id=MEMBER_A_CHAT,
+        publish_outbound=publish_outbound,
     )
+
+    assert gate_result.kind == "asked"
+    assert prompts
+    token = prompts[0].metadata["approval_token"]
+    store = pending_mod.get_pending_store()
+    parked = store.peek(token)
+    assert parked is not None
     assert parked.token
     assert parked.allows_approver("owner")
     assert not parked.allows_approver("member_a")

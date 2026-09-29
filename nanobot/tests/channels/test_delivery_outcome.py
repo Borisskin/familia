@@ -1,0 +1,190 @@
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from familia.channels.vk import VKChannel, VKConfig
+from nanobot.bus.events import OutboundMessage
+from nanobot.bus.queue import MessageBus
+from nanobot.channels.base import BaseChannel, DeliveryUnavailableError
+from nanobot.channels.manager import ChannelManager
+from nanobot.config.schema import Config
+
+
+def _manager(outcomes: list[str], retries: int = 1) -> tuple[ChannelManager, MagicMock]:
+    async def observe(_message: OutboundMessage, result: str) -> None:
+        outcomes.append(result)
+
+    config = Config.model_validate(
+        {"channels": {"send_max_retries": retries, "websocket": {"enabled": False}}}
+    )
+    manager = ChannelManager(config, MessageBus(), on_delivery_result=observe)
+    channel = MagicMock(spec=BaseChannel)
+    channel.send = AsyncMock()
+    manager.channels["test"] = channel
+    return manager, channel
+
+
+async def _wait_for_sends(manager: ChannelManager) -> None:
+    async with asyncio.timeout(2):
+        while manager._outbound_tasks:
+            await asyncio.sleep(0)
+
+
+async def test_delivery_observer_reports_delivered_unavailable_and_unknown() -> None:
+    outcomes: list[str] = []
+    manager, channel = _manager(outcomes)
+
+    await manager._queue_outbound(channel, OutboundMessage("test", "1", "sent"))
+    await _wait_for_sends(manager)
+
+    channel.send.side_effect = DeliveryUnavailableError("rejected")
+    await manager._queue_outbound(channel, OutboundMessage("test", "1", "rejected"))
+    await _wait_for_sends(manager)
+
+    channel.send.side_effect = OSError("network outcome unknown")
+    await manager._queue_outbound(channel, OutboundMessage("test", "1", "unknown"))
+    await _wait_for_sends(manager)
+
+    assert outcomes == ["delivered", "unavailable", "unknown"]
+
+
+async def test_nonretryable_unmarked_error_is_unknown() -> None:
+    outcomes: list[str] = []
+    manager, channel = _manager(outcomes)
+    channel.should_retry_send_error.return_value = False
+    channel.send.side_effect = ValueError("outcome unknown")
+
+    await manager._queue_outbound(channel, OutboundMessage("test", "1", "unknown"))
+    await _wait_for_sends(manager)
+
+    assert outcomes == ["unknown"]
+    assert channel.send.await_count == 1
+
+
+async def test_retried_ambiguous_error_then_unavailable_is_unknown_without_fallback() -> None:
+    outcomes: list[str] = []
+    fallback = AsyncMock()
+    manager, channel = _manager(outcomes, retries=2)
+
+    async def observe(_message: OutboundMessage, result: str) -> None:
+        outcomes.append(result)
+        if result == "unavailable":
+            await fallback()
+
+    manager._on_delivery_result = observe
+    channel.should_retry_send_error.return_value = True
+    channel.send.side_effect = [OSError("network outcome unknown"), DeliveryUnavailableError("rejected")]
+
+    await manager._queue_outbound(channel, OutboundMessage("test", "1", "unknown"))
+    await _wait_for_sends(manager)
+
+    assert outcomes == ["unknown"]
+    assert channel.send.await_count == 2
+    fallback.assert_not_called()
+
+
+async def test_missing_channel_is_unavailable() -> None:
+    outcomes: list[str] = []
+    manager, _channel = _manager(outcomes)
+    dispatcher = asyncio.create_task(manager._dispatch_outbound())
+    try:
+        await manager.bus.publish_outbound(OutboundMessage("missing", "1", "hello"))
+        async with asyncio.timeout(2):
+            while not outcomes:
+                await asyncio.sleep(0)
+    finally:
+        dispatcher.cancel()
+        await dispatcher
+
+    assert outcomes == ["unavailable"]
+
+
+async def test_cancelled_send_is_unknown() -> None:
+    outcomes: list[str] = []
+    manager, channel = _manager(outcomes)
+    started = asyncio.Event()
+
+    async def send(_message: OutboundMessage) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    channel.send.side_effect = send
+    await manager._queue_outbound(channel, OutboundMessage("test", "1", "hello"))
+    await asyncio.wait_for(started.wait(), 2)
+    await manager._cancel_outbound()
+
+    assert outcomes == ["unknown"]
+
+
+async def test_vk_without_client_is_explicitly_unavailable() -> None:
+    channel = VKChannel(VKConfig(), MessageBus())
+
+    with pytest.raises(DeliveryUnavailableError, match="client not running"):
+        await channel.send(OutboundMessage("vk", "1", "hello"))
+
+
+async def test_first_vk_api_rejection_is_unavailable() -> None:
+    outcomes: list[str] = []
+    manager, _channel = _manager(outcomes)
+    channel = VKChannel(VKConfig(), MessageBus())
+    channel._client = SimpleNamespace(
+        post=AsyncMock(return_value=SimpleNamespace(json=lambda: {"error": {"code": 1}}))
+    )
+    manager.channels["vk"] = channel
+
+    await manager._queue_outbound(channel, OutboundMessage("vk", "1", "hello"))
+    await _wait_for_sends(manager)
+
+    assert outcomes == ["unavailable"]
+    assert channel._client.post.await_count == 1
+
+
+async def test_vk_rejection_after_first_fragment_is_unknown() -> None:
+    outcomes: list[str] = []
+    manager, _channel = _manager(outcomes)
+    channel = VKChannel(VKConfig(), MessageBus())
+    channel._client = SimpleNamespace(
+        post=AsyncMock(
+            side_effect=[
+                SimpleNamespace(json=lambda: {"response": 1}),
+                SimpleNamespace(json=lambda: {"error": {"code": 1}}),
+            ]
+        )
+    )
+    manager.channels["vk"] = channel
+
+    await manager._queue_outbound(
+        channel,
+        OutboundMessage("vk", "1", "x" * 4001),
+    )
+    await _wait_for_sends(manager)
+
+    assert outcomes == ["unknown"]
+    assert channel._client.post.await_count == 2
+
+
+async def test_vk_partial_rejection_does_not_resend_accepted_fragment() -> None:
+    outcomes: list[str] = []
+    manager, _channel = _manager(outcomes, retries=2)
+    channel = VKChannel(VKConfig(), MessageBus())
+    channel._client = SimpleNamespace(
+        post=AsyncMock(
+            side_effect=[
+                SimpleNamespace(json=lambda: {"response": 1}),
+                SimpleNamespace(json=lambda: {"error": {"code": 1}}),
+                AssertionError("accepted fragment was resent"),
+            ]
+        )
+    )
+    manager.channels["vk"] = channel
+
+    await manager._queue_outbound(channel, OutboundMessage("vk", "1", "x" * 4001))
+    await _wait_for_sends(manager)
+
+    assert outcomes == ["unknown"]
+    assert [call.kwargs["data"]["message"] for call in channel._client.post.await_args_list] == [
+        "x" * 4000,
+        "x",
+    ]

@@ -5,13 +5,188 @@ import i18n from "@/i18n";
 import {
   ApiError,
   deleteSession as apiDeleteSession,
-  fetchSessionMessages,
+  fetchSessionAutomations,
+  fetchWebuiThread,
   listSessions,
 } from "@/lib/api";
+import { hasPendingAgentActivity } from "@/lib/activity-timeline";
 import { deriveTitle } from "@/lib/format";
-import type { ChatSummary, UIMessage } from "@/lib/types";
+import { webuiThreadCache } from "@/lib/webui-thread-cache";
+import type {
+  ChatSummary,
+  SessionAutomationJob,
+  SessionDeleteResult,
+  UIMessage,
+  WebuiThreadPersistedPayload,
+  WorkspaceScopePayload,
+} from "@/lib/types";
 
 const EMPTY_MESSAGES: UIMessage[] = [];
+const INITIAL_HISTORY_PAGE_LIMIT = 40;
+const OLDER_HISTORY_PAGE_LIMIT = 120;
+const CHAT_CREATE_TIMEOUT_MS = 60_000;
+
+function isAbortError(error: unknown): boolean {
+  return (
+    typeof error === "object"
+    && error !== null
+    && "name" in error
+    && error.name === "AbortError"
+  );
+}
+
+export type SessionHistoryContinuity = "initial" | "overlap" | "reset";
+
+function persistedMessagesToUi(messages: UIMessage[]): UIMessage[] {
+  return messages.map((m, idx) => ({
+    ...m,
+    id: m.id ?? `hist-${idx}`,
+    createdAt: typeof m.createdAt === "number" ? m.createdAt : Date.now(),
+  }));
+}
+
+function sameSemanticMessage(a: UIMessage, b: UIMessage): boolean {
+  return (
+    a.role === b.role
+    && (a.kind ?? "") === (b.kind ?? "")
+    && a.content === b.content
+    && (!a.turnId || !b.turnId || a.turnId === b.turnId)
+  );
+}
+
+function longestSemanticOverlap(previous: UIMessage[], latest: UIMessage[]): number {
+  const maxOverlap = Math.min(previous.length, latest.length);
+  for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+    const previousStart = previous.length - overlap;
+    let matches = true;
+    for (let index = 0; index < overlap; index += 1) {
+      if (!sameSemanticMessage(previous[previousStart + index], latest[index])) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) return overlap;
+  }
+  return 0;
+}
+
+function mergeLatestHistory(
+  previous: UIMessage[],
+  latest: UIMessage[],
+  initial: boolean,
+): {
+  continuity: SessionHistoryContinuity;
+  messages: UIMessage[];
+  retainedPrefixLength: number;
+} {
+  if (initial) {
+    return {
+      continuity: "initial",
+      messages: latest,
+      retainedPrefixLength: 0,
+    };
+  }
+  const overlapLength = longestSemanticOverlap(previous, latest);
+  if (overlapLength === 0) {
+    return {
+      continuity: "reset",
+      messages: latest,
+      retainedPrefixLength: 0,
+    };
+  }
+  const retainedPrefixLength = previous.length - overlapLength;
+  return {
+    continuity: "overlap",
+    messages: [...previous.slice(0, retainedPrefixLength), ...latest],
+    retainedPrefixLength,
+  };
+}
+
+function hasPendingToolCallsFromThread(
+  body: Awaited<ReturnType<typeof fetchWebuiThread>>,
+  messages: UIMessage[],
+): boolean {
+  if (typeof body?.has_pending_tool_calls === "boolean") {
+    return body.has_pending_tool_calls;
+  }
+  return hasPendingAgentActivity(messages);
+}
+
+function completedTurnIdsFromThread(
+  body: Awaited<ReturnType<typeof fetchWebuiThread>>,
+): string[] {
+  if (!Array.isArray(body?.completed_turn_ids)) return [];
+  return Array.from(new Set(
+    body.completed_turn_ids.filter(
+      (turnId): turnId is string => typeof turnId === "string" && turnId.length > 0,
+    ),
+  ));
+}
+
+interface SessionHistoryState {
+  key: string | null;
+  messages: UIMessage[];
+  loading: boolean;
+  loadingOlder: boolean;
+  error: string | null;
+  hasPendingToolCalls: boolean;
+  completedTurnIds: string[];
+  forkBoundaryMessageCount: number | null;
+  beforeCursor: string | null;
+  hasMoreBefore: boolean;
+  userMessageOffset: number;
+  version: number;
+  continuity: SessionHistoryContinuity;
+  lineage: number;
+  activeTurnId: string | null;
+}
+
+function emptyHistoryState(key: string | null, loading = false): SessionHistoryState {
+  return {
+    key,
+    messages: [],
+    loading,
+    loadingOlder: false,
+    error: null,
+    hasPendingToolCalls: false,
+    completedTurnIds: [],
+    forkBoundaryMessageCount: null,
+    beforeCursor: null,
+    hasMoreBefore: false,
+    userMessageOffset: 0,
+    version: 0,
+    continuity: "initial",
+    lineage: 0,
+    activeTurnId: null,
+  };
+}
+
+function cachedHistoryState(
+  key: string,
+  body: WebuiThreadPersistedPayload,
+  version: number,
+): SessionHistoryState {
+  const messages = persistedMessagesToUi(body.messages ?? []);
+  return {
+    key,
+    messages,
+    loading: false,
+    loadingOlder: false,
+    error: null,
+    hasPendingToolCalls: hasPendingToolCallsFromThread(body, messages),
+    completedTurnIds: completedTurnIdsFromThread(body),
+    forkBoundaryMessageCount: typeof body.fork_boundary_message_count === "number"
+      ? Math.max(0, Math.min(body.fork_boundary_message_count, messages.length))
+      : null,
+    beforeCursor: body.page?.before_cursor ?? null,
+    hasMoreBefore: body.page?.has_more_before === true,
+    userMessageOffset: Math.max(0, body.page?.user_message_offset ?? 0),
+    version,
+    continuity: "initial",
+    lineage: version,
+    activeTurnId: typeof body.active_turn_id === "string" ? body.active_turn_id : null,
+  };
+}
 
 /** Sidebar state: fetches the full session list and exposes create / delete actions. */
 export function useSessions(): {
@@ -19,38 +194,98 @@ export function useSessions(): {
   loading: boolean;
   error: string | null;
   refresh: () => Promise<void>;
-  createChat: () => Promise<string>;
-  deleteChat: (key: string) => Promise<void>;
+  createChat: (
+    workspaceScope?: WorkspaceScopePayload | null,
+    modelPreset?: string | null,
+  ) => Promise<string>;
+  forkChat: (sourceChatId: string, beforeUserIndex: number, title?: string) => Promise<string>;
+  deleteChat: (
+    key: string,
+    options?: { deleteAutomations?: boolean },
+  ) => Promise<SessionDeleteResult>;
+  getSessionAutomations: (key: string) => Promise<SessionAutomationJob[]>;
 } {
   const { client, token } = useClient();
   const [sessions, setSessions] = useState<ChatSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const tokenRef = useRef(token);
+  const optimisticKeysRef = useRef<Set<string>>(new Set());
+  const refreshPendingRef = useRef(false);
+  const refreshInFlightRef = useRef<Promise<void> | null>(null);
   tokenRef.current = token;
 
-  const refresh = useCallback(async () => {
-    try {
+  const refresh = useCallback((): Promise<void> => {
+    refreshPendingRef.current = true;
+    if (refreshInFlightRef.current) return refreshInFlightRef.current;
+    const request = (async () => {
       setLoading(true);
-      const rows = await listSessions(tokenRef.current);
-      setSessions(rows);
-      setError(null);
-    } catch (e) {
-      const msg =
-        e instanceof ApiError ? `HTTP ${e.status}` : (e as Error).message;
-      setError(msg);
-    } finally {
-      setLoading(false);
-    }
+      try {
+        while (refreshPendingRef.current) {
+          refreshPendingRef.current = false;
+          try {
+            const rows = await listSessions(tokenRef.current);
+            const serverKeys = new Set(rows.map((row) => row.key));
+            setSessions((prev) => {
+              const byKey = new Map(prev.map((row) => [row.key, row]));
+              const next = [
+                ...rows.map((row) => {
+                  const previous = byKey.get(row.key);
+                  return previous && JSON.stringify(previous) === JSON.stringify(row) ? previous : row;
+                }),
+                ...prev.filter(
+                  (session) =>
+                    optimisticKeysRef.current.has(session.key)
+                    && !serverKeys.has(session.key),
+                ),
+              ];
+              return next.length === prev.length && next.every((row, index) => row === prev[index]) ? prev : next;
+            });
+            for (const key of Array.from(optimisticKeysRef.current)) {
+              if (serverKeys.has(key)) optimisticKeysRef.current.delete(key);
+            }
+            setError(null);
+          } catch (e) {
+            const msg =
+              e instanceof ApiError ? `HTTP ${e.status}` : (e as Error).message;
+            setError(msg);
+          }
+        }
+      } finally {
+        refreshInFlightRef.current = null;
+        setLoading(false);
+      }
+    })();
+    refreshInFlightRef.current = request;
+    return request;
   }, []);
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
 
-  const createChat = useCallback(async (): Promise<string> => {
-    const chatId = await client.newChat();
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const unsubscribe = client.onSessionUpdate(() => {
+      if (timer !== undefined) return;
+      timer = setTimeout(() => {
+        timer = undefined;
+        void refresh();
+      }, 250);
+    });
+    return () => {
+      clearTimeout(timer);
+      unsubscribe();
+    };
+  }, [client, refresh]);
+
+  const createChat = useCallback(async (
+    workspaceScope?: WorkspaceScopePayload | null,
+    modelPreset?: string | null,
+  ): Promise<string> => {
+    const chatId = await client.newChat(CHAT_CREATE_TIMEOUT_MS, workspaceScope);
     const key = `websocket:${chatId}`;
+    optimisticKeysRef.current.add(key);
     // Optimistic insert; a subsequent refresh will replace it with the
     // authoritative row once the server persists the session.
     setSessions((prev) => [
@@ -60,7 +295,39 @@ export function useSessions(): {
         chatId,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
+        title: "",
         preview: "",
+        modelPreset: modelPreset ?? null,
+        workspaceScope: workspaceScope ?? null,
+      },
+      ...prev.filter((s) => s.key !== key),
+    ]);
+    return chatId;
+  }, [client]);
+
+  const forkChat = useCallback(async (
+    sourceChatId: string,
+    beforeUserIndex: number,
+    title?: string,
+  ): Promise<string> => {
+    const chatId = await client.forkChat(
+      sourceChatId,
+      beforeUserIndex,
+      title,
+      CHAT_CREATE_TIMEOUT_MS,
+    );
+    const key = `websocket:${chatId}`;
+    optimisticKeysRef.current.add(key);
+    setSessions((prev) => [
+      {
+        key,
+        channel: "websocket",
+        chatId,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        title: title ?? "",
+        preview: "",
+        workspaceScope: null,
       },
       ...prev.filter((s) => s.key !== key),
     ]);
@@ -68,116 +335,353 @@ export function useSessions(): {
   }, [client]);
 
   const deleteChat = useCallback(
-    async (key: string) => {
-      await apiDeleteSession(tokenRef.current, key);
+    async (key: string, options?: { deleteAutomations?: boolean }) => {
+      const optimistic = optimisticKeysRef.current.has(key);
+      const result = await apiDeleteSession(client, key, options);
+      if (result.blocked_by_automations || (!result.deleted && !optimistic)) return result;
+      optimisticKeysRef.current.delete(key);
+      webuiThreadCache.delete(key);
       setSessions((prev) => prev.filter((s) => s.key !== key));
+      // The gateway may have restarted and forgotten an unpersisted chat's
+      // draft scope, but removing that optimistic session is still a deletion.
+      return result.deleted ? result : { ...result, deleted: true };
     },
-    [],
+    [client],
   );
 
-  return { sessions, loading, error, refresh, createChat, deleteChat };
+  const getSessionAutomations = useCallback(async (key: string) => {
+    const result = await fetchSessionAutomations(tokenRef.current, key);
+    return result.jobs;
+  }, []);
+
+  return {
+    sessions,
+    loading,
+    error,
+    refresh,
+    createChat,
+    forkChat,
+    deleteChat,
+    getSessionAutomations,
+  };
 }
 
 /** Lazy-load a session's on-disk messages the first time the UI displays it. */
 export function useSessionHistory(key: string | null): {
   messages: UIMessage[];
   loading: boolean;
+  loadingOlder: boolean;
   error: string | null;
+  refresh: () => void;
+  loadOlder: () => Promise<void>;
+  hasMoreBefore: boolean;
+  userMessageOffset: number;
+  version: number;
+  forkBoundaryMessageCount: number | null;
+  /** ``true`` when the server reports that the turn is still in flight. */
+  hasPendingToolCalls: boolean;
+  /** Turn identities backed by explicit persisted completion events. */
+  completedTurnIds: string[];
+  /** Relationship between the latest canonical page and its predecessor. */
+  continuity: SessionHistoryContinuity;
+  /** Stable across overlapping latest pages; changes on initial load or reset. */
+  lineage: number;
+  /** Exact active turn when supplied by a current gateway. */
+  activeTurnId: string | null;
 } {
-  const { token } = useClient();
-  const [state, setState] = useState<{
-    key: string | null;
-    messages: UIMessage[];
-    loading: boolean;
-    error: string | null;
-  }>({
-    key: null,
-    messages: [],
-    loading: false,
-    error: null,
+  const { getToken } = useClient();
+  const loadingOlderRef = useRef(false);
+  const olderRequestAbortRef = useRef<AbortController | null>(null);
+  const historyVersionRef = useRef(0);
+  const [refreshSeq, setRefreshSeq] = useState(0);
+  const refresh = useCallback(() => {
+    setRefreshSeq((value) => value + 1);
+  }, []);
+  const [state, setState] = useState<SessionHistoryState>(() => {
+    if (!key) return emptyHistoryState(null);
+    const cached = webuiThreadCache.get(key);
+    if (!cached) return emptyHistoryState(key, true);
+    historyVersionRef.current = 1;
+    return cachedHistoryState(key, cached, historyVersionRef.current);
   });
+
+  useEffect(() => () => {
+    olderRequestAbortRef.current?.abort();
+    olderRequestAbortRef.current = null;
+    loadingOlderRef.current = false;
+  }, []);
 
   useEffect(() => {
     if (!key) {
-      setState({
-        key: null,
-        messages: [],
-        loading: false,
-        error: null,
-      });
+      olderRequestAbortRef.current?.abort();
+      olderRequestAbortRef.current = null;
+      loadingOlderRef.current = false;
+      setState(emptyHistoryState(null));
       return;
     }
     let cancelled = false;
-    // Mark the new key as loading immediately so callers never see stale
-    // messages from the previous session during the render right after a switch.
-    setState({
-      key,
-      messages: [],
-      loading: true,
-      error: null,
-    });
+    const controller = new AbortController();
+    olderRequestAbortRef.current?.abort();
+    olderRequestAbortRef.current = null;
+    loadingOlderRef.current = false;
+    const cachedBody = webuiThreadCache.get(key);
+    const cachedVersion = cachedBody ? historyVersionRef.current + 1 : 0;
+    if (cachedBody) historyVersionRef.current = cachedVersion;
+    setState((prev) => prev.key === key
+      ? {
+          ...prev,
+          loading: cachedBody ? false : prev.messages.length === 0 && prev.lineage === 0,
+          loadingOlder: false,
+          error: null,
+        }
+      : cachedBody
+        ? cachedHistoryState(key, cachedBody, cachedVersion)
+        : emptyHistoryState(key, true));
     (async () => {
       try {
-        const body = await fetchSessionMessages(token, key);
-        if (cancelled) return;
-        const ui: UIMessage[] = body.messages.flatMap((m, idx) => {
-          if (m.role !== "user" && m.role !== "assistant") return [];
-          if (typeof m.content !== "string") return [];
-          return [
-            {
-              id: `hist-${idx}`,
-              role: m.role,
-              content: m.content,
-              createdAt: m.timestamp ? Date.parse(m.timestamp) : Date.now(),
-            },
-          ];
+        const body = await fetchWebuiThread(getToken(), key, {
+          limit: INITIAL_HISTORY_PAGE_LIMIT,
+          direction: "latest",
+          signal: controller.signal,
+          revision: cachedBody?.revision,
+          cached: cachedBody,
         });
-        setState({
-          key,
-          messages: ui,
-          loading: false,
-          error: null,
+        if (cancelled) return;
+        if (body === cachedBody && cachedBody !== undefined) {
+          setState((prev) => prev.key === key
+            ? { ...prev, loading: false, error: null }
+            : prev);
+          return;
+        }
+        if (body) webuiThreadCache.set(key, body);
+        else webuiThreadCache.delete(key);
+        historyVersionRef.current += 1;
+        const responseVersion = historyVersionRef.current;
+        const completedTurnIds = completedTurnIdsFromThread(body);
+        const ui = persistedMessagesToUi(body?.messages ?? []);
+        const hasPending = hasPendingToolCallsFromThread(body, ui);
+        const forkBoundary = typeof body?.fork_boundary_message_count === "number"
+          ? Math.max(0, Math.min(body.fork_boundary_message_count, ui.length))
+          : null;
+        setState((prev) => {
+          const merged = prev.key === key
+            ? mergeLatestHistory(prev.messages, ui, prev.lineage === 0)
+            : mergeLatestHistory([], ui, true);
+          const retainedPrefix = merged.retainedPrefixLength > 0;
+          const retainedForkBoundary = (
+            retainedPrefix
+            && prev.forkBoundaryMessageCount !== null
+            && prev.forkBoundaryMessageCount <= merged.retainedPrefixLength
+          )
+            ? prev.forkBoundaryMessageCount
+            : null;
+          return {
+            key,
+            messages: merged.messages,
+            loading: false,
+            loadingOlder: false,
+            error: null,
+            hasPendingToolCalls: hasPending,
+            completedTurnIds,
+            forkBoundaryMessageCount: forkBoundary === null
+              ? retainedForkBoundary
+              : forkBoundary + merged.retainedPrefixLength,
+            beforeCursor: retainedPrefix
+              ? prev.beforeCursor
+              : body?.page?.before_cursor ?? null,
+            hasMoreBefore: retainedPrefix
+              ? prev.hasMoreBefore
+              : body?.page?.has_more_before === true,
+            userMessageOffset: retainedPrefix
+              ? prev.userMessageOffset
+              : Math.max(0, body?.page?.user_message_offset ?? 0),
+            version: responseVersion,
+            continuity: merged.continuity,
+            lineage: merged.continuity === "overlap"
+              ? prev.lineage
+              : responseVersion,
+            activeTurnId: typeof body?.active_turn_id === "string"
+              ? body.active_turn_id
+              : null,
+          };
         });
       } catch (e) {
-        if (cancelled) return;
-        // A 404 just means the session hasn't been persisted yet (brand-new
-        // chat, first message not sent). That's a normal state, not an error.
+        if (cancelled || isAbortError(e)) return;
         if (e instanceof ApiError && e.status === 404) {
-          setState({
-            key,
-            messages: [],
-            loading: false,
-            error: null,
+          webuiThreadCache.delete(key);
+          historyVersionRef.current += 1;
+          const responseVersion = historyVersionRef.current;
+          setState((prev) => {
+            const continuity = prev.key === key && prev.lineage > 0
+              ? "reset"
+              : "initial";
+            return {
+              key,
+              messages: [],
+              loading: false,
+              loadingOlder: false,
+              error: null,
+              hasPendingToolCalls: false,
+              completedTurnIds: [],
+              forkBoundaryMessageCount: null,
+              beforeCursor: null,
+              hasMoreBefore: false,
+              userMessageOffset: 0,
+              version: responseVersion,
+              continuity,
+              lineage: responseVersion,
+              activeTurnId: null,
+            };
           });
         } else {
-          setState({
-            key,
-            messages: [],
-            loading: false,
-            error: (e as Error).message,
-          });
+          setState((prev) => prev.key === key && prev.messages.length > 0
+            ? { ...prev, loading: false, error: (e as Error).message }
+            : { ...emptyHistoryState(key), error: (e as Error).message });
         }
       }
     })();
     return () => {
       cancelled = true;
+      controller.abort();
     };
-  }, [key, token]);
+  }, [getToken, key, refreshSeq]);
+
+  const loadOlder = useCallback(async () => {
+    if (!key || loadingOlderRef.current) return;
+    const requestKey = key;
+    const requestLineage = state.key === requestKey ? state.lineage : 0;
+    const beforeCursor = state.key === requestKey ? state.beforeCursor : null;
+    if (!beforeCursor || !state.hasMoreBefore || requestLineage === 0) return;
+    const matchesRequest = (candidate: typeof state) => (
+      candidate.key === requestKey
+      && candidate.lineage === requestLineage
+      && candidate.beforeCursor === beforeCursor
+    );
+    loadingOlderRef.current = true;
+    const controller = new AbortController();
+    olderRequestAbortRef.current = controller;
+    setState((prev) => matchesRequest(prev)
+      ? { ...prev, loadingOlder: true, error: null }
+      : prev);
+    try {
+      const body = await fetchWebuiThread(getToken(), requestKey, {
+        limit: OLDER_HISTORY_PAGE_LIMIT,
+        before: beforeCursor,
+        signal: controller.signal,
+      });
+      setState((prev) => {
+        if (!matchesRequest(prev)) return prev;
+        if (!body?.messages?.length) {
+          return {
+            ...prev,
+            loadingOlder: false,
+            hasMoreBefore: false,
+            beforeCursor: null,
+          };
+        }
+        const older = persistedMessagesToUi(body.messages);
+        const olderBoundary = typeof body.fork_boundary_message_count === "number"
+          ? Math.max(0, Math.min(body.fork_boundary_message_count, older.length))
+          : null;
+        const shiftedBoundary = prev.forkBoundaryMessageCount === null
+          ? null
+          : prev.forkBoundaryMessageCount + older.length;
+        const nextMessages = [...older, ...prev.messages];
+        // An older page cannot change the authoritative latest-turn lifecycle
+        // state or masquerade as a completed latest-page refresh.
+        return {
+          ...prev,
+          messages: nextMessages,
+          loadingOlder: false,
+          error: null,
+          forkBoundaryMessageCount: olderBoundary ?? shiftedBoundary,
+          beforeCursor: body.page?.before_cursor ?? null,
+          hasMoreBefore: body.page?.has_more_before === true,
+          userMessageOffset: Math.max(0, body.page?.user_message_offset ?? 0),
+        };
+      });
+    } catch (e) {
+      if (isAbortError(e)) return;
+      setState((prev) => matchesRequest(prev)
+        ? {
+            ...prev,
+            loadingOlder: false,
+            error: (e as Error).message,
+          }
+        : prev);
+    } finally {
+      if (olderRequestAbortRef.current === controller) {
+        olderRequestAbortRef.current = null;
+        loadingOlderRef.current = false;
+      }
+    }
+  }, [
+    key,
+    state.beforeCursor,
+    state.hasMoreBefore,
+    state.key,
+    state.lineage,
+    getToken,
+  ]);
 
   if (!key) {
-    return { messages: EMPTY_MESSAGES, loading: false, error: null };
+    return {
+      messages: EMPTY_MESSAGES,
+      loading: false,
+      loadingOlder: false,
+      error: null,
+      refresh,
+      loadOlder,
+      hasMoreBefore: false,
+      userMessageOffset: 0,
+      version: 0,
+      forkBoundaryMessageCount: null,
+      hasPendingToolCalls: false,
+      completedTurnIds: [],
+      continuity: "initial",
+      lineage: 0,
+      activeTurnId: null,
+    };
   }
 
   // Even before the effect above commits its loading state, never surface the
   // previous session's payload for a brand-new key.
   if (state.key !== key) {
-    return { messages: EMPTY_MESSAGES, loading: true, error: null };
+    return {
+      messages: EMPTY_MESSAGES,
+      loading: true,
+      loadingOlder: false,
+      error: null,
+      refresh,
+      loadOlder,
+      hasMoreBefore: false,
+      userMessageOffset: 0,
+      version: 0,
+      forkBoundaryMessageCount: null,
+      hasPendingToolCalls: false,
+      completedTurnIds: [],
+      continuity: "initial",
+      lineage: 0,
+      activeTurnId: null,
+    };
   }
 
   return {
     messages: state.messages,
     loading: state.loading,
+    loadingOlder: state.loadingOlder,
     error: state.error,
+    refresh,
+    loadOlder,
+    hasMoreBefore: state.hasMoreBefore,
+    userMessageOffset: state.userMessageOffset,
+    version: state.version,
+    forkBoundaryMessageCount: state.forkBoundaryMessageCount,
+    hasPendingToolCalls: state.hasPendingToolCalls,
+    completedTurnIds: state.completedTurnIds,
+    continuity: state.continuity,
+    lineage: state.lineage,
+    activeTurnId: state.activeTurnId,
   };
 }
 
@@ -187,7 +691,7 @@ export function sessionTitle(
   firstUserMessage?: string,
 ): string {
   return deriveTitle(
-    firstUserMessage || session.preview,
+    session.title || firstUserMessage || session.preview,
     i18n.t("chat.newChat"),
   );
 }

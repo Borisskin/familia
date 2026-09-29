@@ -145,6 +145,26 @@ class PrincipalRegistry:
     def resolve(self, channel: str, sender_id: str) -> str | None:
         return self._index.get((channel, str(sender_id)))
 
+    def resolve_unique(self, channel: str, sender_id: str) -> str | None:
+        """Return one owner of a route, refusing missing and ambiguous routes."""
+        route = str(sender_id)
+        if not channel or not route:
+            return None
+        matches = {
+            principal.id
+            for principal in self._by_id.values()
+            for identity in principal.identities
+            if identity.channel == channel
+            and (
+                str(identity.sender_id) == route
+                or (
+                    channel == "telegram"
+                    and str(identity.sender_id).split("|", 1)[0] == route
+                )
+            )
+        }
+        return matches.pop() if len(matches) == 1 else None
+
     def get(self, principal_id: str) -> Principal | None:
         return self._by_id.get(principal_id)
 

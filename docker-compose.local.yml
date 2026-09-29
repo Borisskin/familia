@@ -10,6 +10,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      network: "${FAMILIA_BUILD_NETWORK:-default}"
       args:
         # Forwarded by bootstrap.sh on restricted-egress hosts. Defaults
         # are empty → Dockerfile keeps upstream pypi/debian/npmjs URLs.

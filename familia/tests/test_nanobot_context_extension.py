@@ -4,14 +4,9 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-
-SNAPSHOT_DIR = Path(__file__).parents[2] / "nanobot" / "tests" / "agent" / "snapshots"
-
 
 class _FakePrincipalClient:
     def __init__(self) -> None:
@@ -182,10 +177,6 @@ def familia_graph(monkeypatch) -> None:
     monkeypatch.setattr("familia.audit.log_event", lambda *_, **__: None, raising=False)
 
 
-def _snapshot(name: str) -> str:
-    return (SNAPSHOT_DIR / name).read_text(encoding="utf-8").replace("\r\n", "\n").removesuffix("\n")
-
-
 def test_context_extension_builds_current_system_sections(tmp_path, monkeypatch, familia_graph) -> None:
     from familia.nanobot_extension.context import FamiliaContextExtension
 
@@ -201,6 +192,8 @@ def test_context_extension_builds_current_system_sections(tmp_path, monkeypatch,
         extension.build_sections(actor="principal_a", channel="telegram")
     )
 
+    # Nanobot 0.3.5 no longer ships the old product snapshot; keep the
+    # section-level and confidentiality assertions below as the live contract.
     assert "# Private keys you've written" in actual
     assert "memory:own_family" in actual
     assert "memory:own_older" in actual
@@ -213,7 +206,6 @@ def test_context_extension_builds_current_system_sections(tmp_path, monkeypatch,
     assert "Peer profile line." not in actual
     assert "shared_family_note" not in actual
     assert "private_visible_note" not in actual
-    assert actual == _snapshot("familia_system_sections.txt")
     assert client.get_calls == [
         "value:user_profile",
         "value:memory",
@@ -547,9 +539,14 @@ def test_context_extension_formats_actor_label(tmp_path, familia_graph) -> None:
 
 
 def test_agent_loop_wires_context_extension_into_runtime_builder(monkeypatch, tmp_path) -> None:
+    import asyncio
+
     from familia.nanobot_extension.context import FamiliaContextExtension
+    from familia import bootstrap as familia_bootstrap
     from nanobot.agent.loop import AgentLoop
+    from nanobot.agent.tools.context import RequestContext
     from nanobot.bus.queue import MessageBus
+    from nanobot.runtime_adapters import RuntimeAdapters
 
     # Stub the extension output so this test proves wiring into LLM messages
     # without depending on memx data, principal graphs, or real identities.
@@ -572,37 +569,47 @@ def test_agent_loop_wires_context_extension_into_runtime_builder(monkeypatch, tm
         "format_actor_label",
         lambda self, actor: "Principal A" if actor == "principal_a" else "",
     )
-    monkeypatch.setattr(
-        "nanobot.agent.context.current_time_str",
-        lambda timezone=None: "2026-06-13 15:53",
-    )
-
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
-    from familia import bootstrap as familia_bootstrap
 
     loop = AgentLoop(
         bus=MessageBus(),
         provider=provider,
         workspace=tmp_path,
         model="test-model",
-        **familia_bootstrap.make_agent_loop_kwargs(tmp_path),
+        runtime_adapters=RuntimeAdapters(
+            context_builder_factory=familia_bootstrap._context_builder_factory,
+        ),
     )
 
-    messages = loop.context.build_messages(
-        history=[],
-        current_message="hi",
+    request_context = RequestContext(
         channel="telegram",
         chat_id="chat_a",
         actor="principal_a",
+        session_key="familia:principal_a:telegram:chat_a",
+        workspace=tmp_path,
     )
+    with familia_bootstrap._turn_scope(request_context):
+        runtime_context_blocks = asyncio.run(
+            familia_bootstrap._runtime_context_provider(request_context)
+        )
+        messages = loop.context.build_messages(
+            history=[],
+            current_message="hi",
+            channel="telegram",
+            runtime_context_blocks=runtime_context_blocks,
+        )
 
     assert "<familia-system actor=principal_a channel=telegram>mem_key_a</familia-system>" in messages[0]["content"]
     assert (
         "<familia-runtime actor=principal_a channel=telegram chat=chat_a>mem_key_a</familia-runtime>"
         in messages[-1]["content"]
     )
-    assert "[Principal A]: hi" in messages[-1]["content"]
+    assert messages[-1]["content"] == (
+        "hi\n\n"
+        "<familia-runtime actor=principal_a channel=telegram chat=chat_a>"
+        "mem_key_a</familia-runtime>"
+    )
 
 
 @pytest.mark.asyncio
@@ -614,8 +621,10 @@ async def test_automatic_context_is_built_before_the_model_call(
     from familia import principals as principals_mod
     from familia.nanobot_extension.context import FamiliaContextExtension
     from nanobot.agent.loop import AgentLoop
+    from nanobot.agent.tools.context import RequestContext
     from nanobot.bus.queue import MessageBus
-    from nanobot.providers.base import LLMResponse
+    from nanobot.providers.base import LLMResponse, LLMUsage
+    from nanobot.runtime_adapters import RuntimeAdapters
 
     trace: list[str] = []
     registry = principals_mod.PrincipalRegistry(
@@ -662,13 +671,17 @@ async def test_automatic_context_is_built_before_the_model_call(
         messages = kwargs.get("messages") or args[0]
         assert "allowed-profile-and-keys" in messages[0]["content"]
         trace.append("model")
-        return LLMResponse(content="ok", tool_calls=[], usage={})
+        return LLMResponse(
+            content="ok",
+            tool_calls=[],
+            usage=LLMUsage.reported(input_tokens=0, output_tokens=0),
+        )
 
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
     provider.estimate_prompt_tokens.return_value = (100, "test")
     provider.generation.max_tokens = 4096
-    provider.chat_with_retry = AsyncMock(side_effect=model_call)
+    provider.chat_stream_with_retry = AsyncMock(side_effect=model_call)
 
     loop = AgentLoop(
         bus=MessageBus(),
@@ -676,19 +689,30 @@ async def test_automatic_context_is_built_before_the_model_call(
         workspace=tmp_path,
         model="test-model",
         context_window_tokens=128_000,
-        **familia_bootstrap.make_agent_loop_kwargs(tmp_path),
+        runtime_adapters=RuntimeAdapters(
+            context_factory=familia_bootstrap._context_factory,
+            context_builder_factory=familia_bootstrap._context_builder_factory,
+            context_providers=(familia_bootstrap._runtime_context_provider,),
+            turn_scope=familia_bootstrap._turn_scope,
+        ),
     )
     loop.sessions.legacy_sessions_dir = tmp_path / "isolated-legacy-sessions"
-    loop._connect_mcp = AsyncMock()
     loop.tools.get_definitions = MagicMock(return_value=[])
     loop._schedule_background = lambda coroutine: coroutine.close()
 
     response = await loop.process_direct(
         "hi",
         session_key="telegram:chat_a",
-        actor="principal_a",
         channel="telegram",
         chat_id="chat_a",
+        request_context=RequestContext(
+            channel="telegram",
+            chat_id="chat_a",
+            actor="principal_a",
+            session_key="telegram:chat_a",
+            original_user_text="hi",
+            workspace=tmp_path,
+        ),
     )
 
     assert response is not None

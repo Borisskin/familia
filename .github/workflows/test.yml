@@ -22,7 +22,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: HKUDS/nanobot
-          ref: 950dddec499fbbe0353e997158c99808f0bb41e1
+          ref: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
           path: upstream-nanobot
 
       - name: Expose upstream checkout at the patch-tool path
@@ -64,17 +64,13 @@ jobs:
             nanobot/tests/agent/test_loop_cron_timezone.py \
             nanobot/tests/agent/test_loop_save_turn.py \
             nanobot/tests/agent/test_memory_store.py \
-            nanobot/tests/agent/test_memory_store_durability.py \
-            nanobot/tests/agent/test_consolidate_offset.py \
+            nanobot/tests/session/test_consolidated_offset_clamp.py \
             nanobot/tests/cli/test_commands.py \
-            nanobot/tests/cli/test_extension_boundaries.py \
             nanobot/tests/cron/test_cron_tool_list.py \
-            nanobot/tests/cron/test_cron_tool_schema_contract.py \
-            nanobot/tests/cron/test_cron_tool_to_override.py \
-            nanobot/tests/cron/test_cron_tool_visibility.py
+            nanobot/tests/cron/test_cron_tool_schema_contract.py
 
       - name: Verify exact nanobot patch reconstruction
-        run: python patches/test_check_exact_reconstruction.py -v
+        run: python -m patches.test_check_exact_reconstruction -v
 
       - name: Verify patch header normalization
         run: pytest -q patches/test_regenerate_headers.py

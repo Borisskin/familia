@@ -84,6 +84,13 @@ move and the source messages remain available. A conflict permits a safe
 retry after a fresh point read; a full catalog requires explicit resolution
 and never loses messages.
 
+### Scheduled-message delivery
+
+A job runs as the principal who created it and is first delivered through its
+original route. If the channel reports a final delivery failure, the server
+may try another connected channel owned by the same principal. A foreign or
+ambiguous recipient is denied; there is no broadcast.
+
 ## Storage layout
 
 Two storage planes that intentionally don't mix:

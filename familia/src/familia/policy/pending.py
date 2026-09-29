@@ -39,6 +39,7 @@ class PendingApproval:
     # verdict notifications land in the chat they're actually watching,
     # not the actor's first-registered identity.
     requester_channel: str | None = None
+    requester_chat_id: str | None = None
     rule_name: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -46,11 +47,44 @@ class PendingApproval:
         return (now or time.time()) >= self.expires_at
 
     def allows_approver(self, actor: str | None) -> bool:
-        if not self.approvers:
+        if not actor:
             return False
-        if "*" in self.approvers:
-            return actor is not None
-        return actor is not None and actor in self.approvers
+        # Records without the original request route are ambiguous legacy
+        # state. Never turn their stored approver snapshot into authority.
+        if not self.requester_channel or not self.requester_chat_id:
+            return False
+
+        try:
+            from familia.policy.engine import Decision, PolicyContext, get_engine
+            from familia.principals import get_registry
+
+            if get_registry().get(actor) is None:
+                return False
+            decision = get_engine().evaluate(
+                PolicyContext(
+                    action=self.action,
+                    actor=self.requester_actor,
+                    channel=self.requester_channel,
+                    to_channel=self.outbound.channel,
+                    to_chat=self.outbound.chat_id,
+                )
+            )
+            if decision.decision is not Decision.ASK:
+                return False
+            for pattern in decision.approver:
+                if pattern in {"*", actor}:
+                    return True
+                if pattern == "@principal":
+                    return True
+                if pattern.startswith("@"):
+                    from familia.roles import get_effective_roles
+
+                    if pattern[1:] in get_effective_roles(actor):
+                        return True
+            return False
+        except Exception:  # noqa: BLE001
+            # Authorization is a trust boundary; a broken live lookup denies.
+            return False
 
 
 class PendingStore:
@@ -68,6 +102,7 @@ class PendingStore:
         reason: str = "",
         rule_name: str = "",
         requester_channel: str | None = None,
+        requester_chat_id: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> PendingApproval:
         token = secrets.token_urlsafe(6)
@@ -81,6 +116,7 @@ class PendingStore:
             reason=reason,
             expires_at=time.time() + self._ttl,
             rule_name=rule_name,
+            requester_chat_id=requester_chat_id,
             extra=dict(extra or {}),
         )
         with self._lock:
@@ -97,6 +133,26 @@ class PendingStore:
         if pending.is_expired():
             return None
         return pending
+
+    def take_if_authorized(
+        self, token: str, actor: str | None
+    ) -> tuple[PendingApproval | None, str]:
+        """Consume one approval only after a live authorization check.
+
+        The status is ``taken``, ``unauthorized`` or ``missing``.  The check
+        and removal share the store lock, so an unauthorized or repeated press
+        cannot spend the one-shot token.
+        """
+        with self._lock:
+            pending = self._by_token.get(token)
+            if pending is None:
+                return None, "missing"
+            if pending.is_expired():
+                self._by_token.pop(token, None)
+                return None, "missing"
+            if not pending.allows_approver(actor):
+                return None, "unauthorized"
+            return self._by_token.pop(token), "taken"
 
     def cancel(self, token: str) -> PendingApproval | None:
         """Remove without checking expiry — used to discard a parked

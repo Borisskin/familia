@@ -1,103 +1,106 @@
-# nanobot baseline: 0.1.5.post2
-# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
 diff --git a/nanobot/nanobot/agent/autocompact.py b/nanobot/nanobot/agent/autocompact.py
-index eabd861..20a100d 100644
+index 4c77f10..52b667f 100644
 --- a/nanobot/nanobot/agent/autocompact.py
 +++ b/nanobot/nanobot/agent/autocompact.py
-@@ -3,6 +3,7 @@
- from __future__ import annotations
+@@ -9,7 +9,13 @@ from typing import TYPE_CHECKING, Any, Callable, Coroutine
+ from loguru import logger
  
- from collections.abc import Collection
-+from copy import deepcopy
- from datetime import datetime
- from typing import TYPE_CHECKING, Any, Callable, Coroutine
+ from nanobot.events import NO_EVENTS, EventSink
+-from nanobot.session.manager import Session, SessionManager
++from nanobot.session.manager import (
++    SESSION_FILE_CAP_CHECKED_KEY,
++    SESSION_FILE_CAP_MAX_MESSAGES,
++    SESSION_FILE_CAP_PENDING_KEY,
++    Session,
++    SessionManager,
++)
+ from nanobot.session.summary import (
+     SessionSummary,
+     is_summary_checkpoint,
+@@ -79,6 +85,19 @@ class AutoCompact:
+                 continue
+             if key in active_session_keys:
+                 continue
++            read_metadata = getattr(self.sessions, "read_session_metadata", None)
++            metadata_payload = read_metadata(key) if callable(read_metadata) else None
++            metadata = (
++                metadata_payload.get("metadata", {})
++                if metadata_payload
++                else {SESSION_FILE_CAP_CHECKED_KEY: True}
++            )
++            if (
++                metadata.get(SESSION_FILE_CAP_CHECKED_KEY) is not True
++                or metadata.get(SESSION_FILE_CAP_PENDING_KEY) is True
++            ):
++                self._schedule_file_cap(key, schedule_background, resolve_runtime)
++                continue
+             updated_at = info.get("updated_at")
+             if self._is_expired(updated_at, now) and self._has_unarchived_messages(key):
+                 session = self.sessions.get_or_create(key)
+@@ -90,6 +109,63 @@ class AutoCompact:
+                 self._archiving.add(key)
+                 schedule_background(self._archive(key, runtime=runtime))
  
-@@ -74,33 +75,60 @@ class AutoCompact:
- 
-     async def _archive(self, key: str) -> None:
-         try:
--            self.sessions.invalidate(key)
--            session = self.sessions.get_or_create(key)
--            archive_msgs, kept_msgs = self._split_unconsolidated(session)
--            if not archive_msgs and not kept_msgs:
--                session.updated_at = datetime.now()
--                self.sessions.save(session)
--                return
--
--            last_active = session.updated_at
--            summary = ""
--            if archive_msgs:
--                summary = await self.consolidator.archive(archive_msgs) or ""
--            if summary and summary != "(nothing)":
--                self._summaries[key] = (summary, last_active)
--                session.metadata["_last_summary"] = {"text": summary, "last_active": last_active.isoformat()}
--            session.messages = kept_msgs
--            session.last_consolidated = 0
--            session.updated_at = datetime.now()
--            self.sessions.save(session)
--            if archive_msgs:
--                logger.info(
--                    "Auto-compact: archived {} (archived={}, kept={}, summary={})",
--                    key,
--                    len(archive_msgs),
--                    len(kept_msgs),
--                    bool(summary),
--                )
-+            lock = self.consolidator.get_lock(key)
-+            async with lock:
-+                self.sessions.invalidate(key)
-+                session = self.sessions.get_or_create(key)
-+                original_messages = deepcopy(session.messages)
-+                original_last_consolidated = session.last_consolidated
-+                original_metadata = deepcopy(session.metadata)
-+                original_updated_at = session.updated_at
-+                try:
-+                    archive_msgs, kept_msgs = self._split_unconsolidated(session)
-+                    if not archive_msgs and not kept_msgs:
-+                        session.updated_at = datetime.now()
-+                        self.sessions.save(session)
-+                        return
++    def schedule_file_cap_after_turn(
++        self,
++        key: str,
++        schedule_background: Callable[[Coroutine[Any, Any, None]], None],
++        resolve_runtime: Callable[[Session], LLMRuntime],
++    ) -> None:
++        """Schedule retention after a completed save, including busy sessions."""
++        session = self.sessions.get_cached(key)
++        if (
++            session is None
++            or self._is_internal_session(key)
++            or key in self._archiving
++            or (
++                len(session.messages) <= SESSION_FILE_CAP_MAX_MESSAGES
++                and not session.metadata.get(SESSION_FILE_CAP_PENDING_KEY)
++            )
++        ):
++            return
++        self._schedule_file_cap(key, schedule_background, resolve_runtime)
 +
-+                    last_active = session.updated_at
-+                    summary = ""
-+                    if archive_msgs:
-+                        archive_kwargs: dict[str, Any] = {"session_key": key}
-+                        route_context = session.metadata.get(
-+                            "_private_session_route"
-+                        )
-+                        if route_context is not None:
-+                            archive_kwargs["session_context"] = route_context
-+                        summary = await self.consolidator.archive(
-+                            archive_msgs,
-+                            **archive_kwargs,
-+                        ) or ""
-+                    if summary and summary != "(nothing)":
-+                        session.metadata["_last_summary"] = {
-+                            "text": summary,
-+                            "last_active": last_active.isoformat(),
-+                        }
-+                    session.messages = kept_msgs
-+                    session.last_consolidated = 0
-+                    session.updated_at = datetime.now()
-+                    self.sessions.save(session)
-+                except Exception:
-+                    session.messages = original_messages
-+                    session.last_consolidated = original_last_consolidated
-+                    session.metadata = original_metadata
-+                    session.updated_at = original_updated_at
-+                    raise
++    def _schedule_file_cap(
++        self,
++        key: str,
++        schedule_background: Callable[[Coroutine[Any, Any, None]], None],
++        resolve_runtime: Callable[[Session], LLMRuntime],
++    ) -> None:
++        if self._is_internal_session(key) or key in self._archiving:
++            return
++        self._archiving.add(key)
++        schedule_background(self._enforce_file_cap(key, resolve_runtime))
 +
-+                if summary and summary != "(nothing)":
-+                    self._summaries[key] = (summary, last_active)
-+                if archive_msgs:
-+                    logger.info(
-+                        "Auto-compact: archived {} (archived={}, kept={}, summary={})",
-+                        key,
-+                        len(archive_msgs),
-+                        len(kept_msgs),
-+                        bool(summary),
-+                    )
-         except Exception:
-             logger.exception("Auto-compact: failed for {}", key)
-         finally:
++    async def _enforce_file_cap(
++        self,
++        key: str,
++        resolve_runtime: Callable[[Session], LLMRuntime],
++    ) -> None:
++        try:
++            session = self.sessions.get_or_create(key)
++            if len(session.messages) <= SESSION_FILE_CAP_MAX_MESSAGES:
++                session.metadata[SESSION_FILE_CAP_CHECKED_KEY] = True
++                session.metadata.pop(SESSION_FILE_CAP_PENDING_KEY, None)
++                self.sessions.save(session)
++                return
++
++            session.metadata[SESSION_FILE_CAP_CHECKED_KEY] = True
++            session.metadata[SESSION_FILE_CAP_PENDING_KEY] = True
++            self.sessions.save(session)
++            try:
++                runtime = resolve_runtime(session)
++            except (KeyError, ValueError):
++                return
++            await self.consolidator.enforce_file_cap(key, runtime=runtime)
++        except Exception:
++            logger.exception("Auto-compact: file-cap retention failed for {}", key)
++        finally:
++            self._archiving.discard(key)
++
+     async def _archive(self, key: str, *, runtime: LLMRuntime) -> None:
+         if self._is_internal_session(key):
+             self._archiving.discard(key)

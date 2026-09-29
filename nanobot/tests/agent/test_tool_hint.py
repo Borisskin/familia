@@ -1,16 +1,16 @@
 """Tests for tool hint formatting (nanobot.utils.tool_hints)."""
 
-from nanobot.utils.tool_hints import format_tool_hints
 from nanobot.providers.base import ToolCallRequest
+from nanobot.utils.tool_hints import format_tool_hints
 
 
 def _tc(name: str, args) -> ToolCallRequest:
     return ToolCallRequest(id="c1", name=name, arguments=args)
 
 
-def _hint(calls):
+def _hint(calls, max_length=40):
     """Shortcut for format_tool_hints."""
-    return format_tool_hints(calls)
+    return format_tool_hints(calls, max_length=max_length)
 
 
 class TestToolHintKnownTools:
@@ -33,10 +33,6 @@ class TestToolHintKnownTools:
         result = _hint([_tc("edit", {"file_path": "src/main.py", "old_string": "x", "new_string": "y"})])
         assert "main.py" in result
         assert "edit " in result
-
-    def test_glob_shows_pattern(self):
-        result = _hint([_tc("glob", {"pattern": "**/*.py", "path": "src"})])
-        assert result == 'glob "**/*.py"'
 
     def test_grep_shows_pattern(self):
         result = _hint([_tc("grep", {"pattern": "TODO|FIXME", "path": "src"})])
@@ -87,10 +83,6 @@ class TestToolHintKnownTools:
         assert "\u2026/" in result
         assert '"C:/Program Files/Git/project"' not in result
         assert '"' in result
-
-    def test_exec_short_command_unchanged(self):
-        result = _hint([_tc("exec", {"command": "npm install typescript"})])
-        assert result == "$ npm install typescript"
 
     def test_exec_chained_commands_truncated_not_mid_path(self):
         """Long chained commands should truncate preserving abbreviated paths."""
@@ -254,3 +246,115 @@ class TestToolHintMixedFolding:
         assert "\u00d7" not in result
         parts = result.split(", ")
         assert len(parts) == 5
+
+
+class TestToolHintMaxLength:
+    """Test max_length parameter controls truncation of tool hints."""
+
+    def test_exec_default_truncates_at_40(self):
+        cmd = "cd /very/long/path/to/some/project && npm run build && npm test"
+        result = _hint([_tc("exec", {"command": cmd})], max_length=40)
+        assert len(result) <= 50  # "$ " prefix + 40 + ellipsis
+        assert "\u2026" in result
+
+    def test_exec_larger_max_length_shows_more(self):
+        cmd = "cd /very/long/path/to/some/project && npm run build && npm test"
+        short = _hint([_tc("exec", {"command": cmd})], max_length=40)
+        long = _hint([_tc("exec", {"command": cmd})], max_length=120)
+        assert len(long) > len(short)
+        assert "npm test" in long
+
+    def test_exec_max_length_120_shows_full_command(self):
+        cmd = "cd /home/user/project && npm install && npm run build"
+        result = _hint([_tc("exec", {"command": cmd})], max_length=120)
+        assert "npm run build" in result
+
+    def test_fallback_respects_max_length(self):
+        long_val = "a" * 100
+        result = _hint([_tc("custom_tool", {"data": long_val})], max_length=60)
+        assert "\u2026" in result
+        result_40 = _hint([_tc("custom_tool", {"data": long_val})], max_length=40)
+        assert len(result) > len(result_40)
+
+    def test_mcp_respects_max_length(self):
+        long_url = "https://example.com/very/long/path/to/resource"
+        result = _hint([_tc("mcp_github__fetch", {"url": long_url})], max_length=80)
+        result_40 = _hint([_tc("mcp_github__fetch", {"url": long_url})], max_length=40)
+        assert len(result) >= len(result_40)
+
+    def test_path_type_respects_max_length(self):
+        """Path-type tools (read_file, write_file, etc.) should honor max_length."""
+        long_path = "/home/user/.local/share/uv/tools/nanobot/agent/loop.py"
+        short = _hint([_tc("read_file", {"path": long_path})], max_length=40)
+        long = _hint([_tc("read_file", {"path": long_path})], max_length=120)
+        assert len(long) > len(short)
+
+    def test_edit_path_respects_max_length(self):
+        """edit (is_path=True) should honor max_length, not stay hardcoded at 40."""
+        long_path = "/home/user/projects/nanobot/src/agent/loop.py"
+        short = _hint([_tc("edit", {"file_path": long_path})], max_length=40)
+        long = _hint([_tc("edit", {"file_path": long_path})], max_length=120)
+        assert len(long) > len(short)
+
+    def test_list_dir_path_respects_max_length(self):
+        """list_dir (is_path=True) should honor max_length."""
+        long_path = "/home/user/.local/share/uv/tools/nanobot/"
+        short = _hint([_tc("list_dir", {"path": long_path})], max_length=40)
+        long = _hint([_tc("list_dir", {"path": long_path})], max_length=120)
+        assert len(long) > len(short)
+
+    def test_plain_value_tools_respect_max_length(self):
+        """Plain-value tools must truncate like the is_path/is_command branches.
+
+        grep, web_search, x_search and find_files carry no path or command
+        structure to fold, so their raw value used to reach the progress hint
+        untruncated: a 400-char search query produced a 400-char hint.
+        """
+        for name, key in (
+            ("grep", "pattern"),
+            ("web_search", "query"),
+            ("x_search", "query"),
+            ("find_files", "query"),
+        ):
+            short = _hint([_tc(name, {key: "x" * 400})], max_length=40)
+            long = _hint([_tc(name, {key: "x" * 400})], max_length=120)
+            assert len(long) > len(short), name
+            # Longest template is 'search X "{}"' — 12 chars of overhead.
+            assert len(short) <= 40 + 12, name
+            assert "\u2026" in short, name
+
+    def test_plain_value_short_value_untouched(self):
+        """Values inside the budget must not gain an ellipsis."""
+        result = _hint([_tc("grep", {"pattern": "TODO|FIXME"})], max_length=40)
+        assert result == 'grep "TODO|FIXME"'
+
+    def test_plain_value_exactly_at_max_length_untouched(self):
+        """A value exactly at max_length already fits."""
+        query = "a" * 40
+        result = _hint([_tc("web_search", {"query": query})], max_length=40)
+        assert result == f'search "{query}"'
+        assert "\u2026" not in result
+
+    def test_plain_value_one_over_max_length_truncates(self):
+        """One character over the budget truncates instead of overflowing."""
+        result = _hint([_tc("grep", {"pattern": "a" * 41})], max_length=40)
+        assert result == 'grep "' + "a" * 39 + "\u2026" + '"'
+
+
+class TestToolHintMalformedCalls:
+    """Malformed tool calls must not crash hint formatting (see HKUDS/nanobot)."""
+
+    def test_none_name_is_skipped(self):
+        """A tool call with name=None should be skipped, not raise AttributeError."""
+        result = _hint([_tc(None, None)])
+        assert result == ""
+
+    def test_empty_name_is_skipped(self):
+        """A tool call with an empty name should be skipped."""
+        result = _hint([_tc("", {"path": "foo.txt"})])
+        assert result == ""
+
+    def test_none_name_mixed_with_valid_call(self):
+        """A degenerate call must not suppress hints for the valid calls beside it."""
+        result = _hint([_tc(None, None), _tc("read_file", {"path": "foo.txt"})])
+        assert result == "read foo.txt"

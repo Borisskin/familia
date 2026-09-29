@@ -1,39 +1,78 @@
-# nanobot baseline: 0.1.5.post2
-# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
 diff --git a/nanobot/nanobot/bus/queue.py b/nanobot/nanobot/bus/queue.py
-index 7c0616f..70cd81b 100644
+index 16b4b12..fd93ff7 100644
 --- a/nanobot/nanobot/bus/queue.py
 +++ b/nanobot/nanobot/bus/queue.py
-@@ -2,7 +2,7 @@
+@@ -8,7 +8,7 @@ from typing import Any, TypeVar, overload
  
- import asyncio
+ from loguru import logger
  
 -from nanobot.bus.events import InboundMessage, OutboundMessage
 +from nanobot.bus.events import CallbackEvent, InboundMessage, OutboundMessage
+ from nanobot.bus.outbound_events import outbound_message_for_event
+ from nanobot.events import AgentEvent
  
+@@ -28,9 +28,11 @@ class MessageBus:
+     ``publish_event``. Local state transitions never wait for network sends.
+     """
  
- class MessageBus:
-@@ -16,6 +16,7 @@ class MessageBus:
-     def __init__(self):
+-    def __init__(self):
++    def __init__(self, callback_handler: Callable[[CallbackEvent], Any] | None = None):
          self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue()
          self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
 +        self.callbacks: asyncio.Queue[CallbackEvent] = asyncio.Queue()
++        self.callback_handler = callback_handler
+         self._handlers: list[EventHandler] = []
+         self._pending: set[asyncio.Task[None]] = set()
  
-     async def publish_inbound(self, msg: InboundMessage) -> None:
-         """Publish a message from a channel to the agent."""
-@@ -33,6 +34,14 @@ class MessageBus:
-         """Consume the next outbound message (blocks until available)."""
-         return await self.outbound.get()
+@@ -42,6 +44,36 @@ class MessageBus:
+         """Consume the next inbound message (blocks until available)."""
+         return await self.inbound.get()
  
-+    async def publish_callback(self, evt: CallbackEvent) -> None:
-+        """Publish an inline-keyboard callback press from a channel."""
-+        await self.callbacks.put(evt)
++    async def publish_callback(self, event: CallbackEvent) -> None:
++        """Queue a typed channel callback without trusting its actor field."""
++        if not isinstance(event, CallbackEvent):
++            raise TypeError("callback queue accepts CallbackEvent")
++        await self.callbacks.put(event)
 +
 +    async def consume_callback(self) -> CallbackEvent:
-+        """Consume the next callback event (blocks until available)."""
++        """Consume the next callback event."""
 +        return await self.callbacks.get()
 +
-     @property
-     def inbound_size(self) -> int:
-         """Number of pending inbound messages."""
++    def set_callback_handler(
++        self,
++        handler: Callable[[CallbackEvent], Any] | None,
++    ) -> None:
++        self.callback_handler = handler
++
++    async def dispatch_callback(self, event: CallbackEvent | None = None) -> Any:
++        """Run the configured callback handler for one queued event."""
++        if event is None:
++            event = await self.consume_callback()
++        callback = self.callback_handler
++        if callback is None:
++            return None
++        if not callable(callback):
++            callback = getattr(callback, "handle_callback", None)
++        if not callable(callback):
++            return None
++        result = callback(event)
++        return await result if inspect.isawaitable(result) else result
++
+     async def publish_outbound(self, msg: OutboundMessage) -> None:
+         """Queue a routed message or event for its channel."""
+         await self.outbound.put(msg)
+@@ -78,6 +110,11 @@ class MessageBus:
+         """Number of pending outbound messages."""
+         return self.outbound.qsize()
+ 
++    @property
++    def callback_size(self) -> int:
++        """Number of callbacks waiting for the runtime adapter."""
++        return self.callbacks.qsize()
++
+     @overload
+     def subscribe(
+         self, handler: Callable[[_EventT], Awaitable[None] | None],

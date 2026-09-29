@@ -1,0 +1,15 @@
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
+
+diff --git a/nanobot/tests/command/test_compact_command.py b/nanobot/tests/command/test_compact_command.py
+index 67734a3..66a5894 100644
+--- a/nanobot/tests/command/test_compact_command.py
++++ b/nanobot/tests/command/test_compact_command.py
+@@ -176,7 +176,6 @@ async def test_empty_compact_finishes_silently_and_does_not_schedule_idle_archiv
+     loop.auto_compact.check_expired(schedule, loop.runtime_for_session)
+     schedule.assert_not_called()
+ 
+-
+ @pytest.mark.asyncio
+ async def test_compact_during_active_turn_waits_for_the_session_lock(loop) -> None:
+     key = "websocket:test"

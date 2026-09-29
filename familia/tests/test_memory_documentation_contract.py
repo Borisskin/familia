@@ -275,16 +275,13 @@ def test_executable_memory_prompts_use_simplified_contract() -> None:
 def test_full_assembled_prompt_declares_catalog_server_revision_and_safe_retry(
     tmp_path: Path,
 ) -> None:
-    from familia.nanobot_extension.context import FamiliaContextExtension
-    from nanobot.agent.context import ContextBuilder
+    from familia import bootstrap
 
-    prompt = ContextBuilder(
+    prompt = bootstrap._context_builder_factory(
         tmp_path,
-        context_extensions=[FamiliaContextExtension(tmp_path)],
-    ).build_system_prompt(
-        actor=None,
-        channel="documentation-contract",
-    )
+        None,
+        None,
+    ).build_system_prompt(channel="documentation-contract")
 
     for literal in (
         "private:<principal>:value:user_profile",

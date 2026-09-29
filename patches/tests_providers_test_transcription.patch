@@ -1,0 +1,207 @@
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
+
+diff --git a/nanobot/tests/providers/test_transcription.py b/nanobot/tests/providers/test_transcription.py
+index 7c4cffd..9a4f5a9 100644
+--- a/nanobot/tests/providers/test_transcription.py
++++ b/nanobot/tests/providers/test_transcription.py
+@@ -27,6 +27,7 @@ from nanobot.providers.transcription import (
+     OpenAITranscriptionProvider,
+     OpenRouterTranscriptionProvider,
+     XiaomiMiMoTranscriptionProvider,
++    YandexTranscriptionProvider,
+     _audio_format,
+     _resolve_chat_completions_url,
+     _resolve_transcription_url,
+@@ -1006,3 +1007,191 @@ def test_groq_provider_normalizes_chat_style_api_base() -> None:
+     """Regression for #3637: apiBase set to the v1 base resolves to the audio endpoint."""
+     provider = GroqTranscriptionProvider(api_key="gsk-test", api_base="https://api.groq.com/openai/v1")
+     assert provider.api_url == "https://api.groq.com/openai/v1/audio/transcriptions"
++
++
++def test_resolver_supports_yandex_credentials_and_folder_id() -> None:
++    config = Config()
++    config.transcription.provider = "yandex"
++    config.transcription.language = "ru"
++    config.providers.yandex.api_key = "yc-api-key"
++    config.providers.yandex.folder_id = "b1-folder"
++    config.providers.yandex.api_base = "https://speech.example/stt:recognize"
++
++    resolved = resolve_transcription_config(config)
++
++    assert resolved.provider == "yandex"
++    assert resolved.api_key == "yc-api-key"
++    assert resolved.folder_id == "b1-folder"
++    assert resolved.api_base == "https://speech.example/stt:recognize"
++    assert resolved.configured is True
++
++
++def test_resolver_uses_yandex_environment_credentials() -> None:
++    config = Config()
++    config.transcription.provider = "yandex"
++
++    with patch.dict(
++        os.environ,
++        {"YANDEX_API_KEY": "env-key", "YC_FOLDER_ID": "env-folder"},
++        clear=True,
++    ):
++        resolved = resolve_transcription_config(config)
++
++    assert resolved.api_key == "env-key"
++    assert resolved.folder_id == "env-folder"
++    assert resolved.configured is True
++
++
++@pytest.mark.asyncio
++async def test_missing_yandex_folder_id_refuses_without_outbound(audio_file: Path) -> None:
++    config = Config()
++    config.transcription.provider = "yandex"
++    config.providers.yandex.api_key = "yc-api-key"
++    resolved = resolve_transcription_config(config)
++    post = AsyncMock()
++
++    with patch("httpx.AsyncClient.post", post):
++        assert await transcribe_audio_file(audio_file, resolved) == ""
++
++    assert resolved.configured is False
++    assert post.await_count == 0
++
++
++@pytest.mark.asyncio
++async def test_unknown_provider_refuses_without_outbound(audio_file: Path) -> None:
++    config = Config()
++    config.transcription.provider = "made_up_provider"
++    resolved = resolve_transcription_config(config)
++    post = AsyncMock()
++
++    with patch("httpx.AsyncClient.post", post):
++        assert await transcribe_audio_file(audio_file, resolved) == ""
++
++    assert resolved.provider == "made_up_provider"
++    assert resolved.configured is False
++    assert post.await_count == 0
++
++
++@pytest.mark.asyncio
++async def test_yandex_sends_raw_audio_with_api_key_and_folder_id(audio_file: Path) -> None:
++    provider = YandexTranscriptionProvider(
++        api_key="yc-api-key",
++        folder_id="b1-folder",
++        api_base="https://speech.example/stt:recognize",
++        language="ru-RU",
++    )
++    post = AsyncMock(return_value=_response(200, {"result": "привет"}))
++
++    with (
++        patch("nanobot.providers.transcription.probe_audio_duration_s", AsyncMock(return_value=1)),
++        patch("httpx.AsyncClient.post", post),
++        patch("asyncio.sleep", AsyncMock()),
++    ):
++        result = await provider.transcribe(audio_file)
++
++    assert result == "привет"
++    assert post.await_count == 1
++    call = post.await_args
++    assert call.args == (provider.api_url,)
++    assert call.kwargs["headers"] == {"Authorization": "Api-Key yc-api-key"}
++    assert call.kwargs["params"] == {
++        "folderId": "b1-folder",
++        "lang": "ru-RU",
++        "format": "oggopus",
++    }
++    assert call.kwargs["content"] == audio_file.read_bytes()
++
++
++@pytest.mark.parametrize(
++    "provider_name,provider_class_name",
++    [
++        ("openai", "OpenAITranscriptionProvider"),
++        ("groq", "GroqTranscriptionProvider"),
++    ],
++)
++@pytest.mark.asyncio
++async def test_existing_provider_routes_keep_common_kwargs(
++    audio_file: Path, provider_name: str, provider_class_name: str
++) -> None:
++    captured: dict[str, object] = {}
++
++    class StubProvider:
++        def __init__(self, **kwargs: object) -> None:
++            captured.update(kwargs)
++
++        async def transcribe(self, file_path: str | Path) -> str:
++            captured["file_path"] = Path(file_path)
++            return "ok"
++
++    config = EffectiveTranscriptionConfig(
++        enabled=True,
++        provider=provider_name,
++        model="custom-model",
++        language="en",
++        api_key="provider-key",
++        api_base="https://speech.example/v1",
++        max_duration_sec=120,
++        max_upload_mb=25,
++    )
++
++    with patch(f"nanobot.providers.transcription.{provider_class_name}", StubProvider):
++        assert await transcribe_audio_file(audio_file, config) == "ok"
++
++    assert captured == {
++        "api_key": "provider-key",
++        "api_base": "https://speech.example/v1",
++        "language": "en",
++        "model": "custom-model",
++        "file_path": audio_file,
++    }
++
++
++@pytest.mark.asyncio
++async def test_yandex_long_audio_splits_and_cleans_chunks(tmp_path: Path) -> None:
++    source = tmp_path / "voice.ogg"
++    source.write_bytes(b"source-too-large")
++    chunks = [tmp_path / "segment-1.ogg", tmp_path / "segment-2.ogg"]
++    for chunk in chunks:
++        chunk.write_bytes(b"x")
++    provider = YandexTranscriptionProvider(api_key="k", folder_id="f")
++    provider.MAX_PAYLOAD_BYTES = 1
++    split = AsyncMock(return_value=chunks)
++    post = AsyncMock(side_effect=["first", "second"])
++    cleanup = patch("nanobot.providers.transcription._cleanup_chunks")
++
++    with (
++        patch("nanobot.providers.transcription.probe_audio_duration_s", AsyncMock(return_value=31)),
++        patch("nanobot.providers.transcription.split_audio_with_ffmpeg", split),
++        patch("nanobot.providers.transcription._post_yandex_transcription_with_retry", post),
++        cleanup as cleanup_mock,
++    ):
++        result = await provider.transcribe(source)
++
++    assert result == "first second"
++    split.assert_awaited_once_with(
++        source,
++        target_bytes=1,
++        duration_s=provider.CHUNK_DURATION_S,
++        log_prefix="Yandex STT",
++    )
++    assert post.await_count == 2
++    assert cleanup_mock.call_args.args == (chunks,)
++
++
++@pytest.mark.asyncio
++async def test_yandex_split_failure_returns_empty_without_http(tmp_path: Path) -> None:
++    source = tmp_path / "voice.ogg"
++    source.write_bytes(b"source-too-large")
++    provider = YandexTranscriptionProvider(api_key="k", folder_id="f")
++    provider.MAX_PAYLOAD_BYTES = 1
++    split = AsyncMock(return_value=None)
++    post = AsyncMock()
++
++    with (
++        patch("nanobot.providers.transcription.probe_audio_duration_s", AsyncMock(return_value=31)),
++        patch("nanobot.providers.transcription.split_audio_with_ffmpeg", split),
++        patch("nanobot.providers.transcription._post_yandex_transcription_with_retry", post),
++    ):
++        assert await provider.transcribe(source) == ""
++
++    assert post.await_count == 0

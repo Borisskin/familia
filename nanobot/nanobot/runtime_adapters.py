@@ -1,108 +1,321 @@
-"""Discover optional runtime adapter providers through neutral entry points."""
+"""Neutral runtime wiring for optional product integrations."""
 
 from __future__ import annotations
 
-from functools import lru_cache
-from importlib.metadata import entry_points
+import os
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager, AbstractContextManager, contextmanager
+from dataclasses import dataclass
+from importlib.metadata import EntryPoint, entry_points
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeAlias
 
-from loguru import logger
-
-_ENTRY_POINT_GROUP = "nanobot.runtime_adapters"
+from nanobot.runtime_context import RuntimeContextProvider, RuntimeContextResult
 
 
-@lru_cache
-def _load_adapters() -> tuple[Any, ...]:
-    adapters: list[Any] = []
-    for ep in entry_points(group=_ENTRY_POINT_GROUP):
-        try:
-            adapters.append(ep.load())
-        except Exception as exc:
-            logger.warning("Failed to load runtime adapter '{}': {}", ep.name, exc)
-    return tuple(adapters)
+# Keep preparation evidence in-process.  The storage preparer owns migration;
+# a second gateway construction must reuse its receipt instead of running it
+# over the source tree again.  A receipt is scoped to the workspace namespace,
+# not just the shared parent directory.
+_PREPARED_SESSION_NAMESPACES: set[tuple[Path, Path, str]] = set()
+_PREPARATION_CACHE: dict[tuple[int, str, str], tuple[Path, Path, str]] = {}
+
+if TYPE_CHECKING:
+    from nanobot.agent.outbound import OutboundDecision, OutboundGuard, OutboundRequest
+    from nanobot.agent.tools.context import RequestContext, ToolContext
+    from nanobot.bus.events import InboundMessage, OutboundMessage
+    from nanobot.bus.queue import MessageBus
 
 
-def _call(adapter: Any, method_name: str, *args: Any) -> Any:
-    method = getattr(adapter, method_name, None)
-    if not callable(method):
+ENTRY_POINT_GROUP = "nanobot.runtime_adapters"
+RUNTIME_MODE_ENV = "NANOBOT_RUNTIME_ADAPTERS"
+RUNTIME_REQUEST_CONTEXT_KEY = "_runtime_request_context"
+
+
+class RuntimeAdapterError(RuntimeError):
+    """Raised when a selected runtime adapter cannot be loaded safely."""
+
+
+@dataclass(frozen=True)
+class Admission:
+    """Server-authoritative result of admitting one inbound message."""
+
+    actor: str | None = None
+    session_key: str | None = None
+    message: InboundMessage | None = None
+    response: OutboundMessage | None = None
+
+    def __post_init__(self) -> None:
+        if (self.message is None) == (self.response is None):
+            raise ValueError("admission must contain exactly one message or response")
+        if self.message is not None:
+            if not isinstance(self.actor, str) or not self.actor.strip():
+                raise ValueError("admitted message requires a non-empty actor")
+            if not isinstance(self.session_key, str) or not self.session_key.strip():
+                raise ValueError("admitted message requires a non-empty session_key")
+        elif self.session_key is not None:
+            raise ValueError("rejected admission cannot create a session")
+
+    @property
+    def admitted(self) -> bool:
+        return self.message is not None
+
+
+@dataclass(frozen=True)
+class ArchiveResult:
+    """Durable outcome of one archive attempt."""
+
+    committed: bool
+    retryable: bool = False
+
+
+AdmissionHandler: TypeAlias = Callable[[Any], Admission | Awaitable[Admission]]
+ContextFactory: TypeAlias = Callable[[Admission, Any], Any]
+ContextBuilderFactory: TypeAlias = Callable[[Path, str | None, list[str] | None], Any]
+ToolInstaller: TypeAlias = Callable[[Any, Any], Sequence[str] | None]
+TurnScopeFactory: TypeAlias = Callable[
+    [Any],
+    AbstractContextManager[Any] | AbstractAsyncContextManager[Any],
+]
+PromptBuilder: TypeAlias = Callable[[str], Any | Awaitable[Any]]
+OutboundGuard: TypeAlias = Callable[[Any], Awaitable[Any]]
+ArchiveHandler: TypeAlias = Callable[
+    [str, Sequence[Mapping[str, Any]]], ArchiveResult | Awaitable[ArchiveResult]
+]
+ArchiveOwnerResolver: TypeAlias = Callable[[str], str | None]
+SessionStoragePreparer: TypeAlias = Callable[[Any], Any]
+SessionAccessGuard: TypeAlias = Callable[[str], bool]
+ChannelEnabledResolver: TypeAlias = Callable[[str, bool], bool]
+DeliveryObserver: TypeAlias = Callable[[Any, str], Awaitable[None]]
+DeliveryObserverFactory: TypeAlias = Callable[
+    [Callable[..., Awaitable[Any]], Any, Callable[[], list[str]]], DeliveryObserver | None
+]
+SystemJobRegistrar: TypeAlias = Callable[[Any], Any]
+RuntimeAdapterFactory: TypeAlias = Callable[[Any, "MessageBus | None"], "RuntimeAdapters"]
+
+
+@dataclass(frozen=True)
+class RuntimeAdapters:
+    """All optional product hooks passed through one neutral object."""
+
+    admit: AdmissionHandler | None = None
+    context_factory: ContextFactory | None = None
+    context_builder_factory: ContextBuilderFactory | None = None
+    context_providers: tuple[RuntimeContextProvider, ...] = ()
+    install_tools: ToolInstaller | None = None
+    turn_scope: TurnScopeFactory | None = None
+    build_prompt: PromptBuilder | None = None
+    archive: ArchiveHandler | None = None
+    archive_owner: ArchiveOwnerResolver | None = None
+    prepare_session_storage: SessionStoragePreparer | None = None
+    session_access: SessionAccessGuard | None = None
+    channel_enabled: ChannelEnabledResolver | None = None
+    make_delivery_observer: DeliveryObserverFactory | None = None
+    run_dream: Callable[[str, Any], Any | Awaitable[Any]] | None = None
+    run_heartbeat: Callable[[str, Any], Any | Awaitable[Any]] | None = None
+    run_scheduled: Callable[[Any, Any], Any | Awaitable[Any]] | None = None
+    register_system_jobs: SystemJobRegistrar | None = None
+    resolve_heartbeat_target: Callable[[str, set[str]], tuple[str, str] | None] | None = None
+    make_heartbeat_source_reader: Callable[[str | None], Any] | None = None
+    channel_plugins: Callable[[set[str] | None], Mapping[str, Any]] | None = None
+    register_channel_descriptor: Callable[[Any], None] | None = None
+    callback_handler: Callable[[Any], Any | Awaitable[Any]] | None = None
+    outbound_guard: OutboundGuard | None = None
+    # Re-read product state kept in memory (gateway SIGHUP).
+    reload_runtime: Callable[[], Any] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.context_providers, tuple):
+            object.__setattr__(self, "context_providers", tuple(self.context_providers))
+        if any(not callable(provider) for provider in self.context_providers):
+            raise TypeError("context_providers must contain callables")
+
+
+@contextmanager
+def default_turn_scope(ctx: RequestContext):
+    from nanobot.agent.tools.context import request_context
+
+    with request_context(ctx):
+        yield ctx
+
+
+def default_context_factory(
+    admission: Admission,
+    message: InboundMessage,
+    *,
+    runtime: Any = None,
+    turn_id: str | None = None,
+) -> RequestContext:
+    """Build a trusted request context from an admitted message."""
+    from nanobot.agent.tools.context import RequestContext
+
+    if not admission.admitted or admission.actor is None or admission.session_key is None:
+        raise ValueError("context factory requires an admitted message")
+    metadata = dict(message.metadata or {})
+    metadata["actor"] = admission.actor
+    return RequestContext(
+        channel=message.channel,
+        chat_id=message.chat_id,
+        message_id=metadata.get("message_id"),
+        session_key=admission.session_key,
+        original_user_text=message.content,
+        runtime=runtime,
+        metadata=metadata,
+        sender_id=message.sender_id,
+        turn_id=turn_id,
+        actor=admission.actor,
+    )
+
+
+def _entry_points() -> tuple[EntryPoint, ...]:
+    return tuple(entry_points(group=ENTRY_POINT_GROUP))
+
+
+def _load_factory(entry_point: EntryPoint) -> RuntimeAdapterFactory:
+    try:
+        factory = entry_point.load()
+    except Exception as exc:
+        raise RuntimeAdapterError(
+            f"failed to load runtime adapter '{entry_point.name}'"
+        ) from exc
+    if not callable(factory):
+        raise RuntimeAdapterError(
+            f"runtime adapter '{entry_point.name}' must expose make_runtime_adapters(config, bus)"
+        )
+    return factory
+
+
+def _validate_adapters(value: Any, name: str) -> RuntimeAdapters:
+    if not isinstance(value, RuntimeAdapters):
+        raise RuntimeAdapterError(
+            f"runtime adapter '{name}' returned {type(value).__name__}, expected RuntimeAdapters"
+        )
+    return value
+
+
+def load_runtime_adapters(
+    config: Any = None,
+    *,
+    bus: "MessageBus | None" = None,
+    adapters: RuntimeAdapters | None = None,
+) -> RuntimeAdapters:
+    """Load an explicitly selected adapter before engine state is constructed."""
+    if adapters is not None:
+        return _validate_adapters(adapters, "explicit")
+    mode = os.environ.get(RUNTIME_MODE_ENV, "").strip()
+    if not mode:
+        return RuntimeAdapters()
+    matches = tuple(entry for entry in _entry_points() if entry.name == mode)
+    if len(matches) != 1:
+        detail = "was not found" if not matches else "has a name collision"
+        raise RuntimeAdapterError(f"required runtime adapter '{mode}' {detail}")
+    return _validate_adapters(_load_factory(matches[0])(config, bus), mode)
+
+
+def prepare_session_storage_root(config: Any, adapters: RuntimeAdapters) -> Path | None:
+    """Run the selected storage preparer and return its parent sessions root."""
+    preparer = adapters.prepare_session_storage
+    if preparer is None:
         return None
-    # Adapter method failures are real runtime failures, not "adapter absent".
-    # Let callers fail closed instead of silently falling back to legacy paths.
-    return method(*args)
+    workspace_value = getattr(config, "workspace_path", None)
+    if not isinstance(workspace_value, (str, os.PathLike)):
+        raise RuntimeAdapterError(
+            "runtime session storage preparer requires a workspace path"
+        )
+    workspace = Path(workspace_value).expanduser().resolve(strict=False)
+    cache_key = (
+        id(preparer),
+        str(workspace),
+        str(getattr(config, "runtime_data_dir", "")),
+    )
+    cached = _PREPARATION_CACHE.get(cache_key)
+    if cached is not None:
+        root, prepared_workspace, workspace_id = cached
+        _PREPARED_SESSION_NAMESPACES.add((root, prepared_workspace, workspace_id))
+        return root
+    prepared = preparer(config)
+    root = getattr(prepared, "sessions_root", None)
+    if root is None:
+        raise RuntimeAdapterError(
+            "runtime session storage preparer returned no sessions_root"
+        )
+    workspace_id = getattr(prepared, "workspace_id", None)
+    if not isinstance(workspace_id, str) or not workspace_id:
+        raise RuntimeAdapterError(
+            "runtime session storage preparer returned no workspace_id"
+        )
+    resolved = Path(root).expanduser().resolve(strict=False)
+    receipt = (resolved, workspace, workspace_id)
+    _PREPARATION_CACHE[cache_key] = receipt
+    _PREPARED_SESSION_NAMESPACES.add(receipt)
+    return resolved
 
 
-def _merge_kwargs(items: list[dict[str, Any]]) -> dict[str, Any]:
-    merged: dict[str, Any] = {}
-    for kwargs in items:
-        for key, value in kwargs.items():
-            if key in merged and isinstance(merged[key], list) and isinstance(value, list):
-                merged[key].extend(value)
-            elif key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
-                merged[key].update(value)
-            else:
-                merged[key] = value
-    return merged
+def validate_prepared_session_manager(
+    session_manager: Any,
+    workspace: Any,
+) -> None:
+    """Reject a manager without a receipt for its workspace namespace."""
+    sessions_dir = getattr(session_manager, "sessions_dir", None)
+    if not isinstance(sessions_dir, (str, os.PathLike)):
+        raise RuntimeAdapterError(
+            "runtime session manager has no prepared sessions root"
+        )
+    manager_workspace = getattr(session_manager, "workspace", None)
+    if not isinstance(manager_workspace, (str, os.PathLike)):
+        raise RuntimeAdapterError(
+            "runtime session manager has no prepared workspace"
+        )
+    if not isinstance(workspace, (str, os.PathLike)):
+        raise RuntimeAdapterError("runtime session loop has no workspace")
+    expected_workspace = Path(workspace).expanduser().resolve(strict=False)
+    actual_workspace = Path(manager_workspace).expanduser().resolve(strict=False)
+    if actual_workspace != expected_workspace:
+        raise RuntimeAdapterError(
+            "runtime session manager does not belong to the loop workspace"
+        )
+    sessions_path = Path(sessions_dir).expanduser().resolve(strict=False)
+    receipt = (sessions_path.parent, expected_workspace, sessions_path.name)
+    if receipt not in _PREPARED_SESSION_NAMESPACES:
+        raise RuntimeAdapterError(
+            "runtime session storage must be prepared before direct AgentLoop "
+            "construction for this workspace namespace"
+        )
 
 
-def make_agent_loop_kwargs(workspace: Path) -> dict[str, Any]:
-    """Return adapter kwargs for AgentLoop without importing product packages directly."""
-    items = [
-        kwargs
-        for adapter in _load_adapters()
-        if isinstance((kwargs := _call(adapter, "make_agent_loop_kwargs", workspace)), dict)
-    ]
-    return _merge_kwargs(items)
+def __getattr__(name: str) -> Any:
+    if name in {"OutboundDecision", "OutboundGuard", "OutboundRequest"}:
+        from nanobot.agent.outbound import OutboundDecision, OutboundGuard, OutboundRequest
+
+        return {
+            "OutboundDecision": OutboundDecision,
+            "OutboundGuard": OutboundGuard,
+            "OutboundRequest": OutboundRequest,
+        }[name]
+    raise AttributeError(name)
 
 
-def make_channel_manager_kwargs() -> dict[str, Any]:
-    """Return adapter kwargs for ChannelManager."""
-    items = [
-        kwargs
-        for adapter in _load_adapters()
-        if isinstance((kwargs := _call(adapter, "make_channel_manager_kwargs")), dict)
-    ]
-    return _merge_kwargs(items)
-
-
-def make_callback_handlers(bus: Any) -> list[Any]:
-    """Return callback handlers provided by installed runtime adapters."""
-    handlers: list[Any] = []
-    for adapter in _load_adapters():
-        result = _call(adapter, "make_callback_handlers", bus)
-        if isinstance(result, list):
-            handlers.extend(result)
-    return handlers
-
-
-def resolve_heartbeat_target(
-    target_actor: str,
-    enabled_channels: set[str],
-) -> tuple[str, str] | None:
-    """Resolve heartbeat target through the first adapter that owns it."""
-    for adapter in _load_adapters():
-        result = _call(adapter, "resolve_heartbeat_target", target_actor, enabled_channels)
-        if result is not None:
-            return result
-    return None
-
-
-def apply_heartbeat_defaults(hb_cfg: Any) -> None:
-    """Let installed adapters fill heartbeat defaults."""
-    for adapter in _load_adapters():
-        _call(adapter, "apply_heartbeat_defaults", hb_cfg)
-
-
-def make_heartbeat_source_reader(target_actor: str | None) -> Any:
-    """Return a heartbeat source reader from the first adapter that provides one."""
-    for adapter in _load_adapters():
-        result = _call(adapter, "make_heartbeat_source_reader", target_actor)
-        if result is not None:
-            return result
-    return None
-
-
-def reload_runtime_registry() -> None:
-    """Reload mutable adapter registry state during gateway hot reload."""
-    for adapter in _load_adapters():
-        _call(adapter, "reload_runtime_registry")
+__all__ = [
+    "Admission",
+    "AdmissionHandler",
+    "ArchiveHandler",
+    "ArchiveOwnerResolver",
+    "ArchiveResult",
+    "OutboundDecision",
+    "OutboundGuard",
+    "OutboundRequest",
+    "RUNTIME_REQUEST_CONTEXT_KEY",
+    "RuntimeAdapterError",
+    "RuntimeAdapters",
+    "SystemJobRegistrar",
+    "RuntimeContextProvider",
+    "RuntimeContextResult",
+    "SessionAccessGuard",
+    "SessionStoragePreparer",
+    "ChannelEnabledResolver",
+    "default_context_factory",
+    "default_turn_scope",
+    "load_runtime_adapters",
+    "prepare_session_storage_root",
+    "validate_prepared_session_manager",
+]

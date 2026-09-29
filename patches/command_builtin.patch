@@ -1,101 +1,225 @@
-# nanobot baseline: 0.1.5.post2
-# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
 diff --git a/nanobot/nanobot/command/builtin.py b/nanobot/nanobot/command/builtin.py
-index 87d4bf6..30bfa05 100644
+index 27021b9..03dec68 100644
 --- a/nanobot/nanobot/command/builtin.py
 +++ b/nanobot/nanobot/command/builtin.py
-@@ -3,6 +3,7 @@
+@@ -3,11 +3,13 @@
  from __future__ import annotations
  
  import asyncio
-+from copy import deepcopy
++import inspect
  import os
+ import subprocess
  import sys
+ import time
+ from contextlib import suppress
++from copy import deepcopy
+ from dataclasses import dataclass, replace
+ from typing import TYPE_CHECKING, Any, Literal, cast
  
-@@ -52,7 +53,7 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
-         pass
-     if ctx_est <= 0:
-         ctx_est = loop._last_usage.get("prompt_tokens", 0)
--    
-+
-     # Fetch web search provider usage (best-effort, never blocks the response)
-     search_usage_text: str | None = None
-     try:
-@@ -95,13 +96,29 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
+@@ -310,13 +312,16 @@ async def cmd_status(ctx: CommandContext) -> OutboundMessage:
+     )
+ 
+ 
+-async def cmd_new(ctx: CommandContext) -> OutboundMessage:
++async def _cmd_new_unlocked(ctx: CommandContext) -> OutboundMessage:
      """Stop active task and start a fresh session."""
      loop = ctx.loop
-     await loop._cancel_active_tasks(ctx.key)
--    session = ctx.session or loop.sessions.get_or_create(ctx.key)
--    snapshot = session.messages[session.last_consolidated:]
+     await loop._cancel_active_tasks(ctx.key)  # pyright: ignore[reportPrivateUsage]
+-    loop.discard_session_file_state(ctx.key)
+     session = ctx.session or loop.sessions.get_or_create(ctx.key)
+     snapshot = list(session.messages)
++    original_metadata = deepcopy(session.metadata)
++    original_last_archived = session.last_archived
++    original_provider_state = session.provider_state
++    original_updated_at = session.updated_at
+     archive_snapshot = None
+     runtime = None
+     if session.last_archived < len(snapshot):
+@@ -327,17 +332,47 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
+             metadata=dict(session.metadata),
+             provider_state=None,
+         )
 -    session.clear()
 -    loop.sessions.save(session)
 -    loop.sessions.invalidate(session.key)
--    if snapshot:
--        loop._schedule_background(loop.consolidator.archive(snapshot))
-+    lock = loop.consolidator.get_lock(ctx.key)
-+    async with lock:
-+        session = loop.sessions.get_or_create(ctx.key)
-+        original_messages = deepcopy(session.messages)
-+        original_last_consolidated = session.last_consolidated
-+        original_metadata = deepcopy(session.metadata)
-+        original_updated_at = session.updated_at
-+        snapshot = session.messages[session.last_consolidated:]
-+        if snapshot:
-+            await loop.consolidator.archive(
-+                snapshot,
-+                session_key=session.key,
-+            )
-+        session.clear()
+     if archive_snapshot is not None and runtime is not None:
+-        loop.schedule_background(
+-            loop.consolidator.archive_session(  # pyright: ignore[reportUnknownMemberType]
 +        try:
-+            loop.sessions.save(session)
++            archived = await loop.consolidator.archive_session(
+                 archive_snapshot,
+                 archive_end=len(snapshot),
+                 runtime=runtime,
+             )
 +        except Exception:
-+            session.messages = original_messages
-+            session.last_consolidated = original_last_consolidated
-+            session.metadata = original_metadata
-+            session.updated_at = original_updated_at
-+            raise
-+        loop.sessions.invalidate(session.key)
++            logger.exception("Could not archive session {} before /new", ctx.key)
++            return OutboundMessage(
++                channel=ctx.msg.channel,
++                chat_id=ctx.msg.chat_id,
++                content="Could not start a new session; existing history was kept.",
++                metadata=dict(ctx.msg.metadata or {}),
++            )
++        if archived is None:
++            logger.error("Session archive was not committed before /new for {}", ctx.key)
++            return OutboundMessage(
++                channel=ctx.msg.channel,
++                chat_id=ctx.msg.chat_id,
++                content="Could not start a new session; existing history was kept.",
++                metadata=dict(ctx.msg.metadata or {}),
++            )
++    session.clear()
++    try:
++        loop.sessions.save(session)
++    except Exception:
++        session.messages = snapshot
++        session.metadata = original_metadata
++        session.last_archived = original_last_archived
++        session.provider_state = original_provider_state
++        session.updated_at = original_updated_at
++        logger.exception("Could not persist /new for session {}", ctx.key)
++        return OutboundMessage(
++            channel=ctx.msg.channel,
++            chat_id=ctx.msg.chat_id,
++            content="Could not start a new session; existing history was kept.",
++            metadata=dict(ctx.msg.metadata or {}),
+         )
++    loop.sessions.invalidate(session.key)
++    loop.discard_session_file_state(ctx.key)
      return OutboundMessage(
          channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
          content="New session started.",
-@@ -287,19 +304,27 @@ async def cmd_dream_restore(ctx: CommandContext) -> OutboundMessage:
-         sha = args.split()[0]
-         result = git.show_commit_diff(sha)
-         changed_files = _format_changed_files(result[1]) if result else "the tracked memory files"
--        new_sha = git.revert(sha)
--        if new_sha:
--            content = (
--                f"Restored Dream memory to the state before `{sha}`.\n\n"
--                f"- New safety commit: `{new_sha}`\n"
--                f"- Restored files: {changed_files}\n\n"
--                f"Use `/dream-log {new_sha}` to inspect the restore diff."
--            )
-+        changed_file_paths = _extract_changed_files(result[1]) if result else None
-+        restore_policy = getattr(ctx.loop, "dream_restore_policy", None)
-+        restore_block_reason = (
-+            restore_policy(changed_file_paths) if callable(restore_policy) else None
+@@ -345,6 +380,19 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
+     )
+ 
+ 
++async def cmd_new(ctx: CommandContext) -> OutboundMessage:
++    """Stop active work and reset only after the shared archive lock is held."""
++    lock_factory = getattr(ctx.loop, "_session_lock", None)
++    if callable(lock_factory):
++        async with lock_factory(ctx.key):
++            return await _cmd_new_unlocked(ctx)
++    lock_factory = getattr(getattr(ctx.loop, "consolidator", None), "get_lock", None)
++    if callable(lock_factory):
++        async with lock_factory(ctx.key):
++            return await _cmd_new_unlocked(ctx)
++    return await _cmd_new_unlocked(ctx)
++
++
+ async def cmd_compact(ctx: CommandContext) -> None:
+     """Compact the current session without resetting the conversation."""
+     loop = ctx.loop
+@@ -448,6 +496,50 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
+     )
+ 
+ 
++async def _publish_dream_outbound(
++    loop: Any,
++    outbound: OutboundMessage,
++    inbound: Any,
++) -> None:
++    """Route Dream status through the same outbound policy as a normal turn."""
++    publisher = getattr(loop, "_publish_outbound", None)
++    if callable(publisher):
++        result = publisher(
++            outbound,
++            inbound=inbound,
++            actor=getattr(inbound, "actor", None),
++            action="dream",
 +        )
-+        if restore_block_reason is not None:
-+            content = restore_block_reason
-         else:
--            content = (
--                f"Couldn't restore Dream change `{sha}`.\n\n"
--                "It may not exist, or it may be the first saved version with no earlier state to restore."
--            )
-+            new_sha = git.revert(sha)
-+            if new_sha:
-+                content = (
-+                    f"Restored Dream memory to the state before `{sha}`.\n\n"
-+                    f"- New safety commit: `{new_sha}`\n"
-+                    f"- Restored files: {changed_files}\n\n"
-+                    f"Use `/dream-log {new_sha}` to inspect the restore diff."
-+                )
-+            else:
-+                content = (
-+                    f"Couldn't restore Dream change `{sha}`.\n\n"
-+                    "It may not exist, or it may be the first saved version with no earlier state to restore."
-+                )
++        if inspect.isawaitable(result):
++            await result
++        return
++    guard = getattr(getattr(loop, "runtime_adapters", None), "outbound_guard", None)
++    bus = getattr(loop, "bus", None)
++    publish = getattr(bus, "publish_outbound", None)
++    if not callable(publish):
++        return
++    if guard is None:
++        await publish(outbound)
++        return
++    from nanobot.agent.outbound import OutboundDecision, OutboundRequest
++
++    result = guard(
++        OutboundRequest(
++            action="dream",
++            outbound=outbound,
++            actor=getattr(inbound, "actor", None),
++            inbound_channel=getattr(inbound, "channel", None),
++            inbound_chat_id=getattr(inbound, "chat_id", None),
++            metadata=dict(getattr(inbound, "metadata", {}) or {}),
++            publish_outbound=publish,
++        )
++    )
++    if inspect.isawaitable(result):
++        result = await result
++    if isinstance(result, OutboundDecision) and result.kind == "allow":
++        await publish(result.outbound or outbound)
++
++
+ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
+     """Manually trigger a Dream consolidation run."""
+     import time
+@@ -455,6 +547,34 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
+     loop = ctx.loop
+     msg = ctx.msg
+ 
++    service_runner = getattr(getattr(loop, "runtime_adapters", None), "run_dream", None)
++    if callable(service_runner) and getattr(msg, "actor", None):
++        async def _run_service_dream() -> None:
++            try:
++                result = service_runner(msg.actor, loop)
++                if inspect.isawaitable(result):
++                    result = await result
++                if isinstance(result, OutboundMessage):
++                    outbound = result
++                elif isinstance(result, str) and result.strip():
++                    outbound = OutboundMessage(
++                        channel=msg.channel,
++                        chat_id=msg.chat_id,
++                        content=result,
++                    )
++                else:
++                    return
++                await _publish_dream_outbound(loop, outbound, msg)
++            except Exception:
++                logger.exception("Dream service hook failed")
++
++        asyncio.create_task(_run_service_dream())
++        return OutboundMessage(
++            channel=msg.channel,
++            chat_id=msg.chat_id,
++            content="Dreaming...",
++        )
++
+     async def _run_dream():
+         from nanobot.agent.memory import MemoryStore
+ 
+@@ -473,11 +593,11 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
+         try:
+             result = store.build_dream_prompt()
+             if result is None:
+-                await loop.bus.publish_outbound(OutboundMessage(
++                await _publish_dream_outbound(loop, OutboundMessage(
+                     channel=msg.channel, chat_id=msg.chat_id,
+                     content=_format_dream_no_input_message(),
+                     metadata={"render_as": "text"},
+-                ))
++                ), msg)
+                 return
+             prompt, last_cursor = result
+             key = dream_session_key()
+@@ -518,9 +638,9 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
+                     content += f" (commit {sha})"
+             store.compact_history()
+             prune_dream_sessions(loop.sessions)
+-        await loop.bus.publish_outbound(OutboundMessage(
++        await _publish_dream_outbound(loop, OutboundMessage(
+             channel=msg.channel, chat_id=msg.chat_id, content=content,
+-        ))
++        ), msg)
+ 
+     asyncio.create_task(_run_dream())
      return OutboundMessage(
-         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-         content=content, metadata={"render_as": "text"},

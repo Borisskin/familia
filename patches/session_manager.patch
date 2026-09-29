@@ -1,115 +1,33 @@
-# nanobot baseline: 0.1.5.post2
-# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
 diff --git a/nanobot/nanobot/session/manager.py b/nanobot/nanobot/session/manager.py
-index 4add4fd..e21dc9d 100644
+index bbf0d5c..db59930 100644
 --- a/nanobot/nanobot/session/manager.py
 +++ b/nanobot/nanobot/session/manager.py
-@@ -3,6 +3,7 @@
- import json
- import os
- import shutil
-+import threading
- from dataclasses import dataclass, field
- from datetime import datetime
- from pathlib import Path
-@@ -106,6 +107,16 @@ class SessionManager:
-         self.sessions_dir = ensure_dir(self.workspace / "sessions")
-         self.legacy_sessions_dir = get_legacy_sessions_dir()
-         self._cache: dict[str, Session] = {}
-+        self._save_locks_guard = threading.Lock()
-+        self._save_locks: dict[str, threading.RLock] = {}
-+
-+    def _save_lock_for(self, key: str) -> threading.RLock:
-+        with self._save_locks_guard:
-+            lock = self._save_locks.get(key)
-+            if lock is None:
-+                lock = threading.RLock()
-+                self._save_locks[key] = lock
-+            return lock
+@@ -42,6 +42,9 @@ from nanobot.utils.helpers import (
+ from nanobot.utils.subagent_channel_display import scrub_subagent_announce_body
  
-     @staticmethod
-     def safe_key(key: str) -> str:
-@@ -169,6 +180,8 @@ class SessionManager:
-                         continue
+ SESSION_CACHE_MAX_SIZE = 128
++SESSION_FILE_CAP_MAX_MESSAGES = 2000
++SESSION_FILE_CAP_CHECKED_KEY = "_file_cap_checked"
++SESSION_FILE_CAP_PENDING_KEY = "_file_cap_pending"
+ _MESSAGE_TIME_PREFIX_RE = re.compile(r"^\[Message Time: [^\]]+\]\n?")
+ _LOCAL_IMAGE_BREADCRUMB_RE = re.compile(r"^\[image: (?:/|~)[^\]]+\]\s*$")
+ _TOOL_CALL_ECHO_RE = re.compile(r'^\s*(?:generate_image|message)\([^)]*\)\s*$')
+@@ -1316,6 +1319,15 @@ class JsonlSessionStore:
+         tmp_path = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
  
-                     data = json.loads(line)
-+                    if not isinstance(data, dict):
-+                        raise TypeError("session JSONL record must be an object")
- 
-                     if data.get("_type") == "metadata":
-                         metadata = data.get("metadata", {})
-@@ -184,7 +197,7 @@ class SessionManager:
-                 created_at=created_at or datetime.now(),
-                 updated_at=updated_at or datetime.now(),
-                 metadata=metadata,
--                last_consolidated=last_consolidated
-+                last_consolidated=last_consolidated,
-             )
-         except Exception as e:
-             logger.warning("Failed to load session {}: {}", key, e)
-@@ -217,6 +230,9 @@ class SessionManager:
-                     except json.JSONDecodeError:
-                         skipped += 1
-                         continue
-+                    if not isinstance(data, dict):
-+                        skipped += 1
-+                        continue
- 
-                     if data.get("_type") == "metadata":
-                         metadata = data.get("metadata", {})
-@@ -246,7 +262,7 @@ class SessionManager:
-                 created_at=created_at or datetime.now(),
-                 updated_at=updated_at or datetime.now(),
-                 metadata=metadata,
--                last_consolidated=last_consolidated
-+                last_consolidated=last_consolidated,
-             )
-         except Exception as e:
-             logger.warning("Repair failed for session {}: {}", key, e)
-@@ -259,11 +275,11 @@ class SessionManager:
-             "created_at": session.created_at.isoformat(),
-             "updated_at": session.updated_at.isoformat(),
-             "metadata": session.metadata,
--            "messages": session.messages,
-+            "messages": [dict(message) for message in session.messages],
-         }
- 
--    def save(self, session: Session) -> None:
--        """Save a session to disk atomically."""
-+    def _write_session(self, session: Session) -> None:
-+        """Atomically write the session."""
-         path = self._get_session_path(session.key)
-         tmp_path = path.with_suffix(".jsonl.tmp")
- 
-@@ -275,7 +291,7 @@ class SessionManager:
-                     "created_at": session.created_at.isoformat(),
-                     "updated_at": session.updated_at.isoformat(),
-                     "metadata": session.metadata,
--                    "last_consolidated": session.last_consolidated
-+                    "last_consolidated": session.last_consolidated,
-                 }
-                 f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
-                 for msg in session.messages:
-@@ -286,7 +302,11 @@ class SessionManager:
-             tmp_path.unlink(missing_ok=True)
-             raise
- 
--        self._cache[session.key] = session
-+    def save(self, session: Session) -> None:
-+        """Atomically save a session."""
-+        with self._save_lock_for(session.key):
-+            self._write_session(session)
-+            self._cache[session.key] = session
- 
-     def invalidate(self, key: str) -> None:
-         """Remove a session from the in-memory cache."""
-@@ -341,7 +361,7 @@ class SessionManager:
-                 "created_at": created_at,
-                 "updated_at": updated_at,
-                 "metadata": metadata,
--                "messages": messages,
-+                "messages": [dict(message) for message in messages],
-             }
-         except Exception as e:
-             logger.warning("Failed to read session {}: {}", key, e)
+         try:
++            if session.messages:
++                session.metadata[SESSION_FILE_CAP_CHECKED_KEY] = True
++                if len(session.messages) > SESSION_FILE_CAP_MAX_MESSAGES:
++                    session.metadata[SESSION_FILE_CAP_PENDING_KEY] = True
++                else:
++                    session.metadata.pop(SESSION_FILE_CAP_PENDING_KEY, None)
++            else:
++                session.metadata.pop(SESSION_FILE_CAP_CHECKED_KEY, None)
++                session.metadata.pop(SESSION_FILE_CAP_PENDING_KEY, None)
+             with open(tmp_path, "x", encoding="utf-8") as f:
+                 metadata_line = {
+                     "_type": "metadata",

@@ -1,43 +1,50 @@
-"""Neutral outbound policy extension point for agent sends."""
+"""Neutral outbound policy request and decision types."""
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from typing import Literal
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Literal
 
-from nanobot.bus.events import OutboundMessage
+if TYPE_CHECKING:
+    from nanobot.bus.events import OutboundMessage
+
+
+RUNTIME_REQUEST_CONTEXT_KEY = "_runtime_request_context"
 
 
 @dataclass(frozen=True)
 class OutboundRequest:
-    """Context passed to an outbound guard before a message is published."""
+    """Server-owned context passed to a guard before publication."""
 
     action: str
     outbound: OutboundMessage
+    actor: str | None = None
     inbound_channel: str | None = None
     inbound_chat_id: str | None = None
+    metadata: Mapping[str, object] | None = None
     publish_outbound: Callable[[OutboundMessage], Awaitable[None]] | None = None
 
 
 @dataclass(frozen=True)
 class OutboundDecision:
-    """Guard decision understood by nanobot without policy-specific imports."""
+    """Policy result understood by nanobot and product adapters."""
 
     kind: Literal["allow", "deny", "asked"]
     reason: str = ""
     approvers_label: str = ""
+    outbound: OutboundMessage | None = None
 
     @classmethod
-    def allow(cls) -> OutboundDecision:
-        return cls(kind="allow")
+    def allow(cls, outbound: OutboundMessage | None = None) -> "OutboundDecision":
+        return cls(kind="allow", outbound=outbound)
 
     @classmethod
-    def deny(cls, reason: str) -> OutboundDecision:
+    def deny(cls, reason: str) -> "OutboundDecision":
         return cls(kind="deny", reason=reason)
 
     @classmethod
-    def asked(cls, reason: str, approvers_label: str) -> OutboundDecision:
+    def asked(cls, reason: str, approvers_label: str) -> "OutboundDecision":
         return cls(kind="asked", reason=reason, approvers_label=approvers_label)
 
 
@@ -45,6 +52,11 @@ OutboundGuard = Callable[[OutboundRequest], Awaitable[OutboundDecision]]
 
 
 async def allow_outbound(request: OutboundRequest) -> OutboundDecision:
-    """Default standalone behavior: no external policy, publish normally."""
+    """Standalone default: permit publication without product policy."""
     del request
     return OutboundDecision.allow()
+
+
+def replace_outbound(request: OutboundRequest, outbound: OutboundMessage) -> OutboundRequest:
+    """Return the same authorization request with a guarded message."""
+    return replace(request, outbound=outbound)

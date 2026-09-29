@@ -41,6 +41,7 @@ async def request_approval(
     rule_name: str,
     publish_outbound: Callable[[OutboundMessage], Awaitable[None]],
     extra: dict[str, Any] | None = None,
+    requester_chat_id: str | None = None,
 ) -> tuple[PendingApproval, list[str]]:
     """Park ``outbound`` and prompt each approver with Confirm/Reject buttons.
 
@@ -59,6 +60,7 @@ async def request_approval(
         reason=reason,
         rule_name=rule_name,
         extra=extra,
+        requester_chat_id=requester_chat_id,
     )
     audit.log_event(
         "policy_park",

@@ -90,6 +90,20 @@ def principal_registry(monkeypatch: pytest.MonkeyPatch) -> PrincipalRegistry:
     return registry
 
 
+@pytest.fixture
+def allow_memory_writes(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    from familia.policy import Decision, PolicyDecision, PolicyRule
+    from familia.tools import memory as memory_mod
+
+    allowed = MagicMock()
+    allowed.evaluate.return_value = PolicyDecision(
+        Decision.ALLOW,
+        PolicyRule(name="allow memory writes in tool test"),
+    )
+    monkeypatch.setattr(memory_mod, "get_engine", lambda: allowed)
+    return allowed
+
+
 def test_memory_set_schema_requires_fact_id_and_keeps_value_for_write() -> None:
     import re
 
@@ -155,6 +169,7 @@ def test_memory_set_schema_requires_fact_id_and_keeps_value_for_write() -> None:
 async def test_memory_set_deletes_exact_fact_without_value_or_topic(
     monkeypatch: pytest.MonkeyPatch,
     principal_registry: PrincipalRegistry,
+    allow_memory_writes: MagicMock,
     ingestor_result: str,
 ) -> None:
     from familia.principals import get_current_actor, set_current_actor
@@ -296,6 +311,7 @@ async def test_topic_write_state_uses_only_admin_managed_graph(
 async def test_memory_set_always_writes_actor_private_fact_and_topic_is_only_tag(
     monkeypatch: pytest.MonkeyPatch,
     principal_registry: PrincipalRegistry,
+    allow_memory_writes: MagicMock,
     topic_state: str,
     expected_topic: str | None,
     expected_notice: str | None,
@@ -375,6 +391,7 @@ async def test_memory_set_always_writes_actor_private_fact_and_topic_is_only_tag
 async def test_memory_set_topic_notice_does_not_claim_failed_write_was_saved(
     monkeypatch: pytest.MonkeyPatch,
     principal_registry: PrincipalRegistry,
+    allow_memory_writes: MagicMock,
     topic_state: str,
     ingestor_result: str,
     expected_notice: str,

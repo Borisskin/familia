@@ -5,9 +5,9 @@ baseline to the current vendored nanobot tree in this repository.
 
 Baseline:
 
-- upstream version: `0.1.5.post2`;
+- upstream version: `0.3.5`;
 - upstream repo: sibling `../nanobot` next to this repository by default;
-- upstream commit: `950dddec499fbbe0353e997158c99808f0bb41e1`.
+- upstream commit: `1bb712d3488915ca4ed9ccc1a93067ff722f5ab9`.
 
 The upstream package layout is `nanobot/...`. This repository vendors the
 package under `nanobot/nanobot/...`, so patch paths are normalized to the
@@ -23,8 +23,8 @@ Optional overrides:
 
 ```bash
 UPSTREAM_REPO=../nanobot \
-UPSTREAM=950dddec499fbbe0353e997158c99808f0bb41e1 \
-UPSTREAM_VERSION=0.1.5.post2 \
+UPSTREAM=1bb712d3488915ca4ed9ccc1a93067ff722f5ab9 \
+UPSTREAM_VERSION=0.3.5 \
 bash patches/regenerate.sh
 ```
 
@@ -36,18 +36,18 @@ bash patches/validate_baseline.sh
 
 ## Scope
 
-Patch files are generated for runtime nanobot package deltas and
-`nanobot/pyproject.toml`; `nanobot/README.md` is also inside the declared
-comparison scope and currently matches the pinned baseline. The checker proves
-that the sorted patch set reconstructs the current non-ignored worktree scope
-with the exact path set, blob bytes, and Git modes. Patch applicability alone is
-reported separately and is not accepted as equality.
+Patch files cover the complete vendored `nanobot/**` product tree. The checker
+proves that the sorted patch set reconstructs every included path with the exact
+path set, blob bytes, and Git modes; the five upstream-only AI-agent guidance
+files are explicit exclusions in `ownership.yaml`, not silent omissions. Patch
+applicability alone is reported separately and is not accepted as equality.
 
-`ownership.yaml` is JSON-compatible YAML with one row per current delta path.
-Every patch hunk has a category (`familia-invariant`, `upstream-alignment`,
-`generated-noise`, or `unknown`) and an explicit release decision owner. The
-checker rejects missing/stale paths, missing hunk coverage, filename drift, and
-direct imports of Familia from nanobot core.
+`ownership.yaml` is JSON-compatible YAML with one row per current delta path
+and a reviewed record for every upstream-only exclusion. Every patch hunk has a
+category (`familia-invariant`, `upstream-alignment`, `generated-noise`, or
+`unknown`) and an explicit release decision owner. The checker rejects
+missing/stale paths, missing hunk coverage, filename drift, and direct imports
+of Familia from nanobot core.
 
 Phase 10 must still do hunk-by-hunk review:
 
@@ -58,15 +58,22 @@ Phase 10 must still do hunk-by-hunk review:
 
 ## Notable baseline deltas
 
-| Patch area | Meaning against `0.1.5.post2` |
+| Patch area | Meaning against `0.3.0` |
 | --- | --- |
-| `command___init__.patch` | Disables package-level slash-command re-exports while keeping upstream command implementation modules physically present. |
-| `runtime_adapters.patch` | Current familia tree adds neutral runtime adapter discovery for optional product wiring. |
-| `agent_outbound.patch`, `channels_inbound.patch`, `bus_callbacks.patch` | Current familia tree adds neutral extension point modules that are absent in upstream `0.1.5.post2`. |
-| `agent_context.patch`, `agent_loop.patch`, `agent_memory.patch`, `agent_tools_message.patch`, `channels_base.patch`, `cli_commands.patch` | Core behavioral deltas that need Phase 10 hunk-by-hunk audit. |
-| `pyproject.patch` | Fork/version/dependency delta against upstream `0.1.5.post2`; audit before changing package metadata. |
+| `agent___init__.patch`, `runtime_adapters.patch` | Current Familia tree keeps neutral runtime extension points without product imports. |
+| `agent_loop.patch`, `agent_memory.patch`, `session_manager.patch` | Core lifecycle, persistence, and identity deltas against nanobot `0.3.0`. |
+| `channels_telegram_runtime.patch`, `channels_manager.patch`, `channels_registry.patch` | Channel discovery and Telegram runtime integration remain explicit. |
+| `agent_tools_*.patch`, `audio_*.patch`, `security_workspace_access.patch` | Neutral tool, transcription, and workspace boundaries owned by Familia. |
+| `pyproject.patch` | Fork/version/dependency delta against upstream `0.3.0`; audit before changing package metadata. |
 
 `command_builtin.patch` records the synchronized `/new` archive-and-clear flow,
 save rollback, and the injected Dream restore policy in
 `nanobot/nanobot/command/builtin.py`. These are Familia-owned behavioral
 invariants in `ownership.yaml`.
+
+The upstream `nanobot/tests/agent/test_new_command_archival.py` is intentionally
+not selected in Familia's integration job. Its `/new` cases require background
+archival and clearing after an unconfirmed write, which contradict the
+Familia-owned archive-before-clear contract. Tracked acceptance coverage lives
+in `familia/tests/test_nanobot_035_acceptance.py`; the separate background-task
+shutdown check there does not couple task draining to `/new`.

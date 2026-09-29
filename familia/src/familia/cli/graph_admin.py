@@ -34,6 +34,7 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable
 from contextlib import ExitStack
 from datetime import UTC
 from pathlib import Path
@@ -47,6 +48,18 @@ from familia.acl.schema import (
     ALLOWED_RELATIONS,
     TOPIC_KINDS,
 )
+from familia.cli.model_catalog import (
+    CatalogRequest,
+    list_providers,
+    load_catalog,
+)
+from familia.model_settings import (
+    ModelSettingsError,
+    apply_slot,
+    clear_fallback,
+    read_model_settings,
+    resolve_slot,
+)
 
 FAMILY_KEY = "shared:family.graph"
 TOPICS_KEY = "shared:topics.graph"
@@ -59,31 +72,24 @@ TOPICS_KEY = "shared:topics.graph"
 # and sandbox mode dies whenever the admin logs out of mp.weixin.qq.com —
 # both fail the "works for non-technical owner without ops" bar. Re-add
 # when we have a public-domain story.
+# China-only channels (DingTalk, Feishu, QQ, WeCom, MoChat) were dropped
+# from the admin 2026-09-25: they need Chinese accounts. The nanobot
+# adapters stay available through config.json.
 POLL_CHANNEL_KINDS = frozenset({
-    "telegram", "vk", "discord", "slack", "matrix",
-    "email", "dingtalk", "feishu", "qq", "wecom", "mochat",
+    "telegram", "vk", "discord", "slack", "matrix", "mattermost",
+    "email", "whatsapp",
 })
-
-# Speech-to-Text providers we support. ``off`` and ``inherit`` are
-# control words used by the per-channel override (see ``channels set-stt``).
-# Only the names in ``STT_CRED_PROVIDERS`` actually own credentials in
-# config.providers — ``off`` and ``inherit`` are bookkeeping values.
-STT_CRED_PROVIDERS = frozenset({"groq", "openai", "yandex"})
-STT_PROVIDER_CHOICES = frozenset({"off", "inherit", *STT_CRED_PROVIDERS})
-
 
 # Mapping channel kind → import-name + pip-spec for runtime extras
 # install. Channels not listed here ship with no extras (use stdlib /
-# nanobot core deps).
+# nanobot core deps). Both fields may list several space-separated names.
 CHANNEL_DEPS: dict[str, tuple[str, str]] = {
     "discord":  ("discord",          "discord.py"),
     "slack":    ("slack_sdk",        "slack-sdk"),
     "matrix":   ("nio",              "matrix-nio"),
-    "dingtalk": ("dingtalk_stream",  "dingtalk-stream"),
-    "feishu":   ("lark_oapi",        "lark-oapi"),
-    "qq":       ("botpy",            "qq-botpy"),
-    "wecom":    ("wecom_aibot_sdk",  "wecom-aibot-sdk"),
-    "mochat":   ("socketio",         "python-socketio"),
+    # nanobot's WhatsApp channel also imports ``magic`` (python-magic).
+    "whatsapp": ("neonize segno magic",
+                 "neonize>=0.4.3.post0,<0.5.0 segno>=1.6.1,<2.0.0 python-magic>=0.4.27,<0.5"),
 }
 
 # SR-18: kinship terms must be resolved contextually via KINSHIP_RU, never
@@ -1464,6 +1470,26 @@ def build_parser() -> argparse.ArgumentParser:
                               help="health snapshot for admin dashboard")
     p_health.set_defaults(func=cmd_health)
 
+    # models ...  provider and selected-catalog JSON seam for admin clients
+    p_models = sub.add_parser("models", help="model provider catalogs")
+    p_models_sub = p_models.add_subparsers(dest="models_cmd", required=True)
+    p_models_providers = p_models_sub.add_parser(
+        "providers", parents=[json_parent], help="list providers without network"
+    )
+    p_models_providers.add_argument("--kind", choices=["chat", "transcription"], required=True)
+    p_models_providers.set_defaults(func=cmd_models_providers)
+    p_models_catalog = p_models_sub.add_parser(
+        "catalog", parents=[json_parent], help="load one provider catalog"
+    )
+    p_models_catalog.add_argument("--kind", choices=["chat", "transcription"], required=True)
+    p_models_catalog.add_argument("--provider", required=True)
+    p_models_catalog.add_argument("--refresh", action="store_true")
+    p_models_catalog.add_argument(
+        "--request-stdin", action="store_true",
+        help="read one JSON object with unsaved credentials from stdin",
+    )
+    p_models_catalog.set_defaults(func=cmd_models_catalog)
+
     # graph ...
     pg = sub.add_parser("graph", help="graph admin")
     pg_sub = pg.add_subparsers(dest="graph_cmd", required=True)
@@ -1722,6 +1748,21 @@ def build_parser() -> argparse.ArgumentParser:
                            help="JSON object with creds to test")
     p_ch_test.set_defaults(func=cmd_channels_test)
 
+    # WhatsApp links as a device by QR. The session lives in this process,
+    # so start/poll/cancel only work across calls inside ``rpc-server``.
+    p_ch_wa = pch_sub.add_parser("whatsapp-connect", parents=[json_parent],
+                                 help="link WhatsApp by QR: start, poll or cancel")
+    p_ch_wa.add_argument("action", choices=["start", "poll", "cancel"])
+    p_ch_wa.add_argument("--session-id", default="", dest="session_id")
+    p_ch_wa.add_argument("--force", action="store_true",
+                         help="start: re-link even if a session database exists")
+    p_ch_wa.add_argument(
+        "--request-stdin", action="store_true",
+        help='start: read {"proxy": ...} from stdin (the form value, may be the '
+             "redacted preview); keeps proxy credentials out of argv logs",
+    )
+    p_ch_wa.set_defaults(func=cmd_channels_whatsapp_connect)
+
     # Per-channel STT override. ``inherit`` clears the field so the channel
     # falls back to the global ``channels.transcriptionProvider`` default;
     # ``off`` disables transcription entirely; otherwise stores the named
@@ -1729,8 +1770,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ch_stt = pch_sub.add_parser("set-stt",
                                   help="pick the STT (voice transcription) provider for a channel")
     p_ch_stt.add_argument("name")
-    p_ch_stt.add_argument("provider",
-                          choices=sorted(STT_PROVIDER_CHOICES))
+    p_ch_stt.add_argument("provider")
     p_ch_stt.set_defaults(func=cmd_channels_set_stt)
 
     # ``stt`` ... configure STT (voice transcription) providers globally.
@@ -1743,17 +1783,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_stt_set = pst_sub.add_parser("set",
                                    help="store credentials for a STT provider")
-    p_stt_set.add_argument("provider", choices=sorted(STT_CRED_PROVIDERS))
+    p_stt_set.add_argument("provider")
     p_stt_set.add_argument("--api-key", default="", dest="api_key")
     p_stt_set.add_argument("--api-base", default="", dest="api_base")
     p_stt_set.add_argument("--folder-id", default="", dest="folder_id",
                            help="Yandex Cloud folder id (yandex only)")
     p_stt_set.set_defaults(func=cmd_stt_set)
 
+    p_stt_model = pst_sub.add_parser(
+        "set-model", help="store the selected speech model for a provider"
+    )
+    p_stt_model.add_argument("provider")
+    p_stt_model.add_argument("--model", default="")
+    p_stt_model.set_defaults(func=cmd_stt_set_model)
+
     p_stt_default = pst_sub.add_parser("set-default",
                                        help="set the global STT default that channels inherit when they have no override")
-    p_stt_default.add_argument("provider",
-                               choices=sorted(STT_PROVIDER_CHOICES))
+    p_stt_default.add_argument("provider")
     p_stt_default.set_defaults(func=cmd_stt_set_default)
 
     p_stt_budget = pst_sub.add_parser(
@@ -1791,6 +1837,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help="API key for the provider (omit for OAuth providers)")
     p_ag_set.add_argument("--api-base", default="", dest="api_base",
                           help="custom API base URL (optional)")
+    p_ag_set.add_argument(
+        "--request-stdin",
+        action="store_true",
+        help="read secret fields from a JSON request body instead of argv",
+    )
     p_ag_set.set_defaults(func=cmd_agents_set)
 
     p_ag_clear = pag_sub.add_parser("clear",
@@ -1807,12 +1858,6 @@ def build_parser() -> argparse.ArgumentParser:
                                     help="check whether an OAuth provider is logged in")
     p_ag_oauth.add_argument("provider")
     p_ag_oauth.set_defaults(func=cmd_agents_oauth_status)
-
-    p_ag_refresh = pag_sub.add_parser("refresh-models", parents=[json_parent],
-                                      help="pull /v1/models from each configured provider into a local cache")
-    p_ag_refresh.add_argument("--provider", default="",
-                              help="refresh only this provider (default: all configured)")
-    p_ag_refresh.set_defaults(func=cmd_agents_refresh_models)
 
     return p
 
@@ -2524,16 +2569,19 @@ def _save_config_json(path: Path, raw: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def _redact_channel_section(name: str, section: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy with secrets redacted for safe display in admin UI."""
+def redact_channel_section(kind: str, section: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy for the admin UI: legacy keys under their nanobot
+    names (so old Email/Matrix sections open filled in) and secrets
+    redacted. The file itself is not touched."""
     out = dict(section)
-    for key in ("token", "access_token", "password", "api_key"):
+    _migrate_legacy_channel_keys(kind, out)
+    for key in _SECRET_FIELDS:
         if isinstance(out.get(key), str) and out[key]:
-            out[key] = f"***{out[key][-4:]}"
+            out[key] = _redacted(out[key])
     # Proxy URLs may carry inline credentials (``socks5://user:pass@host``);
     # keep host:port visible for debugging but blank the userinfo so the
     # admin UI doesn't paint passwords.
-    for proxy_key in ("proxy", "media_proxy"):
+    for proxy_key in _PROXY_FIELDS:
         url = out.get(proxy_key)
         if isinstance(url, str) and url:
             out[proxy_key] = _redact_proxy_url(url)
@@ -2568,7 +2616,7 @@ def cmd_channels_list(args: argparse.Namespace) -> int:
         rows.append({
             "name": name,
             "enabled": bool(section.get("enabled", False)),
-            "config": _redact_channel_section(name, section),
+            "config": redact_channel_section(name, section),
             "addable": name in POLL_CHANNEL_KINDS,
         })
     rows.sort(key=lambda r: r["name"])
@@ -2590,9 +2638,133 @@ def cmd_channels_list(args: argparse.Namespace) -> int:
 
 
 _SECRET_FIELDS = (
-    "token", "access_token", "app_token", "password",
-    "client_secret", "app_secret", "secret",
+    "token", "access_token", "app_token", "bot_token", "password",
+    "imap_password", "smtp_password",
+    "client_secret", "app_secret", "secret", "api_key",
 )
+
+# Keys the old admin forms wrote but nanobot never read.
+_LEGACY_CHANNEL_KEYS = {
+    "email": {"user": "imap_username", "password": "imap_password"},
+    "matrix": {"user": "user_id"},
+}
+
+
+def _redacted(value: str) -> str:
+    return f"***{value[-4:]}"
+
+
+_PROXY_FIELDS = ("proxy", "media_proxy")
+
+# Fields a saved section must carry; empty tuple = nothing beyond enabled.
+_REQUIRED_CHANNEL_FIELDS: dict[str, tuple[str, ...]] = {
+    "telegram": ("token",),
+    "vk": ("access_token", "group_id"),
+    "discord": ("token",),
+    "slack": ("bot_token", "app_token"),
+    "matrix": ("homeserver", "user_id", "access_token"),
+    "mattermost": ("server_url", "token"),
+    "email": ("imap_host", "smtp_host", "imap_username", "imap_password"),
+}
+
+# Email SMTP fields the form never shows: they follow their IMAP source
+# unless someone set them to something else by hand.
+_EMAIL_DERIVED_FIELDS = (
+    ("imap_username", "smtp_username"),
+    ("imap_username", "from_address"),
+    ("imap_password", "smtp_password"),
+)
+
+
+class ChannelConfigError(ValueError):
+    """A channel form cannot become a config section; text is for the owner."""
+
+
+def _migrate_legacy_channel_keys(kind: str, section: dict[str, Any]) -> None:
+    for old, new in _LEGACY_CHANNEL_KEYS.get(kind, {}).items():
+        if old in section:
+            value = section.pop(old)
+            section.setdefault(new, value)
+
+
+def merge_channel_section(
+    kind: str, incoming: dict[str, Any], stored: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge a form payload with the stored section, shared by save,
+    connection test and WhatsApp linking.
+
+    Legacy keys are renamed on both sides; redacted previews the form
+    echoes back (``***xxxx`` secrets, ``scheme://***@host`` proxies) turn
+    back into the stored values; blank secrets keep the stored ones and
+    other blank strings mean "cleared".
+    """
+    section = dict(incoming)
+    stored = dict(stored)
+    _migrate_legacy_channel_keys(kind, stored)
+    _migrate_legacy_channel_keys(kind, section)
+    for key in _SECRET_FIELDS:
+        # A real secret never starts with the ``***`` of a redacted preview.
+        if isinstance(section.get(key), str) and section[key].startswith("***"):
+            del section[key]
+    for key in _PROXY_FIELDS:
+        value, kept = section.get(key), stored.get(key)
+        if not isinstance(value, str) or "://***@" not in value:
+            continue
+        if isinstance(kept, str) and value == _redact_proxy_url(kept):
+            section[key] = kept
+        else:
+            raise ChannelConfigError(
+                f"{key}: enter the full proxy address including login and password"
+            )
+    for key in _SECRET_FIELDS:
+        if not section.get(key) and stored.get(key):
+            section[key] = stored[key]
+    # The UI sends "" for an optional field the operator cleared (e.g. a
+    # removed proxy); ``proxy: ""`` on disk would break the adapter.
+    return {k: v for k, v in section.items() if v != ""}
+
+
+def _apply_email_defaults(section: dict[str, Any], stored: dict[str, Any]) -> None:
+    """Fill the nanobot email keys the form does not ask for.
+
+    Derived SMTP fields follow the IMAP login and password on every save
+    while they still equal the previous IMAP value; nanobot refuses to run
+    without ``consent_granted``.
+    """
+    for source, derived in _EMAIL_DERIVED_FIELDS:
+        value = section.get(source)
+        if value and (not section.get(derived) or section[derived] == stored.get(source)):
+            section[derived] = value
+    try:
+        ssl = int(section.get("smtp_port") or 0) == 465
+    except (TypeError, ValueError):
+        raise ChannelConfigError("smtp_port must be a number") from None
+    section["smtp_use_ssl"] = ssl
+    section["smtp_use_tls"] = not ssl
+    section["consent_granted"] = True
+
+
+def prepare_channel_section(
+    kind: str,
+    incoming: dict[str, Any],
+    stored: dict[str, Any],
+    *,
+    whatsapp_linked: Callable[[], bool],
+) -> dict[str, Any]:
+    """Turn a form payload into the section to save or raise
+    ``ChannelConfigError``."""
+    section = merge_channel_section(kind, incoming, stored)
+    missing = [k for k in _REQUIRED_CHANNEL_FIELDS.get(kind, ()) if not section.get(k)]
+    if missing:
+        raise ChannelConfigError(f"{kind} requires " + " and ".join(repr(k) for k in missing))
+    if kind == "email":
+        previous = dict(stored)
+        _migrate_legacy_channel_keys(kind, previous)
+        _apply_email_defaults(section, previous)
+    if kind == "whatsapp" and section.get("enabled", True) and not whatsapp_linked():
+        raise ChannelConfigError("whatsapp is not linked yet; scan the QR code first")
+    section.setdefault("enabled", True)
+    return section
 
 
 def cmd_channels_add(args: argparse.Namespace) -> int:
@@ -2627,45 +2799,13 @@ def cmd_channels_add(args: argparse.Namespace) -> int:
     path, raw = _load_config_json()
     channels = raw.setdefault("channels", {})
     existing = channels.get(args.name) if isinstance(channels.get(args.name), dict) else {}
-
-    # Carry over any secret field that the caller didn't include in the
-    # new section. We do this BEFORE validation so e.g. a proxy-only
-    # edit doesn't fail on "telegram requires 'token'" just because the
-    # form left the field blank.
-    for key in _SECRET_FIELDS:
-        if key not in section and existing.get(key):
-            section[key] = existing[key]
-
-    # Empty-string semantics on non-secret keys: the admin UI sends
-    # ``""`` for an optional text field that the operator deliberately
-    # cleared (e.g. removing a previously-set proxy). The cfg-merge on
-    # the frontend can't distinguish "didn't touch" from "explicitly
-    # cleared", so it leans on this convention. Drop those keys here
-    # so the persisted section reflects the operator's intent — if we
-    # left ``proxy: ""`` on disk the running adapter would read it as
-    # an empty proxy URL and httpx would refuse to talk to it.
-    # Secret fields are out of scope: the UI never sends an empty
-    # secret directly (the merge above already filled the gap).
-    for key in list(section.keys()):
-        if key in _SECRET_FIELDS:
-            continue
-        v = section[key]
-        if isinstance(v, str) and v == "":
-            del section[key]
-
-    # Light schema validation per channel — fail loudly so the operator
-    # learns about missing tokens before a restart silently drops the
-    # adapter from `_init_channels`.
-    if args.name == "telegram" and not section.get("token"):
-        print("error: telegram requires 'token'", file=sys.stderr)
+    try:
+        section = prepare_channel_section(
+            args.name, section, existing, whatsapp_linked=_whatsapp_linked,
+        )
+    except ChannelConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
-    if args.name == "vk" and (
-        not section.get("access_token") or not section.get("group_id")
-    ):
-        print("error: vk requires 'access_token' and 'group_id'", file=sys.stderr)
-        return 2
-
-    section.setdefault("enabled", True)
 
     channels[args.name] = section
     _save_config_json(path, raw)
@@ -2681,9 +2821,21 @@ def cmd_channels_add(args: argparse.Namespace) -> int:
 
 
 def _is_dep_importable(import_name: str) -> bool:
-    """Return True iff ``import_name`` resolves on the current sys.path."""
+    """Return True iff every name in ``import_name`` resolves on sys.path.
+
+    The long-lived ``rpc-server`` may predate a ``pip install --user``:
+    add a freshly created user-site and drop stale finder caches so the
+    same process can import the new package (WhatsApp links right after
+    installing neonize).
+    """
+    import importlib
     import importlib.util as _u
-    return _u.find_spec(import_name) is not None
+    import site
+    user_site = site.getusersitepackages()
+    if os.path.isdir(user_site) and user_site not in sys.path:
+        site.addsitedir(user_site)
+    importlib.invalidate_caches()
+    return all(_u.find_spec(name) is not None for name in import_name.split())
 
 
 def cmd_channels_deps_status(args: argparse.Namespace) -> int:
@@ -2740,7 +2892,7 @@ def cmd_channels_deps_install(args: argparse.Namespace) -> int:
         print(f"deps for {kind!r} already importable ({import_name}) — no-op")
         return 0
     import subprocess
-    cmd = [sys.executable, "-m", "pip", "install", "--user", "--no-cache-dir", pip_spec]
+    cmd = [sys.executable, "-m", "pip", "install", "--user", "--no-cache-dir", *pip_spec.split()]
     print(f"running: {' '.join(cmd)}", file=sys.stderr)
     try:
         result = subprocess.run(
@@ -2896,10 +3048,10 @@ def _channel_test_email(cfg: dict[str, Any]) -> tuple[bool, str]:
     import imaplib
     host = (cfg.get("imap_host") or "").strip()
     port = int(cfg.get("imap_port") or 993)
-    user = (cfg.get("user") or "").strip()
-    pwd = (cfg.get("password") or "").strip()
+    user = (cfg.get("imap_username") or "").strip()
+    pwd = (cfg.get("imap_password") or "").strip()
     if not host or not user or not pwd:
-        return False, "imap_host / user / password missing"
+        return False, "imap_host / imap_username / imap_password missing"
     try:
         with imaplib.IMAP4_SSL(host, port, timeout=10) as imap:
             imap.login(user, pwd)
@@ -2908,13 +3060,33 @@ def _channel_test_email(cfg: dict[str, Any]) -> tuple[bool, str]:
         return False, f"error: {e}"
 
 
+def _channel_test_mattermost(cfg: dict[str, Any]) -> tuple[bool, str]:
+    import httpx
+    url = (cfg.get("server_url") or "").strip().rstrip("/")
+    tok = (cfg.get("token") or "").strip()
+    if not url or not tok:
+        return False, "server_url or token missing"
+    try:
+        r = httpx.get(
+            f"{url}/api/v4/users/me",
+            headers={"Authorization": f"Bearer {tok}"},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            return True, f"connected as @{r.json().get('username')}"
+        return False, f"HTTP {r.status_code}: {r.text[:200]}"
+    except Exception as e:  # noqa: BLE001 - external channel probe boundary
+        return False, f"error: {e}"
+
+
 _CHANNEL_TESTERS = {
-    "telegram": _channel_test_telegram,
-    "vk":       _channel_test_vk,
-    "discord":  _channel_test_discord,
-    "slack":    _channel_test_slack,
-    "matrix":   _channel_test_matrix,
-    "email":    _channel_test_email,
+    "telegram":   _channel_test_telegram,
+    "vk":         _channel_test_vk,
+    "discord":    _channel_test_discord,
+    "slack":      _channel_test_slack,
+    "matrix":     _channel_test_matrix,
+    "mattermost": _channel_test_mattermost,
+    "email":      _channel_test_email,
 }
 
 
@@ -2940,19 +3112,22 @@ def cmd_channels_test(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "message": "--config must be JSON object"}))
         return 0
 
-    # Secret merge: same _SECRET_FIELDS list as cmd_channels_add.
+    # Same merge as cmd_channels_add, so masks never reach the tester.
     try:
         _, raw = _load_config_json()
-        existing = (raw.get("channels") or {}).get(args.kind) or {}
-        if isinstance(existing, dict):
-            for key in _SECRET_FIELDS:
-                if not cfg.get(key) and existing.get(key):
-                    cfg[key] = existing[key]
+        existing = (raw.get("channels") or {}).get(args.kind)
     except (OSError, json.JSONDecodeError):
         # Test must keep working when there's no on-disk config yet
-        # (fresh install) — fall through with whatever the caller
-        # supplied; the tester will surface the missing-secret error.
-        pass
+        # (fresh install); the tester will surface the missing-secret error.
+        existing = None
+    try:
+        cfg = merge_channel_section(
+            args.kind, cfg, existing if isinstance(existing, dict) else {},
+        )
+    except ChannelConfigError as exc:
+        print(json.dumps({"ok": False, "message": str(exc), "implemented": True},
+                         ensure_ascii=False))
+        return 0
 
     tester = _CHANNEL_TESTERS.get(args.kind)
     if tester is None:
@@ -2969,165 +3144,127 @@ def cmd_channels_test(args: argparse.Namespace) -> int:
     return 0
 
 
+def _use_gateway_nanobot_config() -> None:
+    """Point nanobot path helpers at the gateway's config.json, so the
+    WhatsApp session database is written and looked up where the
+    gateway's WhatsAppChannel reads it."""
+    from nanobot.config.loader import set_config_path
+    set_config_path(_config_path())
+
+
+def _whatsapp_linked() -> bool:
+    from nanobot.channels.whatsapp.state import local_state_present
+    _use_gateway_nanobot_config()
+    _, raw = _load_config_json()
+    return local_state_present((raw.get("channels") or {}).get("whatsapp") or {})
+
+
+class _NanobotWhatsAppLink:
+    """Production WhatsApp link: nanobot's connect store on its own asyncio
+    loop in a daemon thread, so a pending QR session survives between
+    ``rpc-server`` calls."""
+
+    def __init__(self) -> None:
+        import asyncio
+        import threading
+
+        from nanobot.channels.whatsapp.connect import WhatsAppConnectStore
+
+        class _Store(WhatsAppConnectStore):
+            # nanobot builds the login channel from the saved config only;
+            # the admin links before saving, so the form's proxy goes here.
+            proxy_override: str | None = None
+
+            def _build_channel(self) -> tuple[Any, Path]:
+                channel, target = super()._build_channel()
+                if self.proxy_override is not None:
+                    channel.config.proxy = self.proxy_override
+                return channel, target
+
+        _use_gateway_nanobot_config()
+        self._store = _Store()
+        self._loop = asyncio.new_event_loop()
+        threading.Thread(target=self._loop.run_forever, name="whatsapp-connect",
+                         daemon=True).start()
+
+    def handle(self, action: str, *, session_id: str, force: bool,
+               proxy: str | None) -> dict[str, Any]:
+        import asyncio
+
+        query: dict[str, list[str]] = {}
+        if session_id:
+            query["session_id"] = [session_id]
+        if force:
+            query["force"] = ["1"]
+        if action == "start":
+            self._store.proxy_override = proxy
+        return asyncio.run_coroutine_threadsafe(
+            self._store.handle(action, query), self._loop
+        ).result(timeout=60)
+
+
+# One link per rpc-server process; tests replace it.
+_WHATSAPP_LINK: Any = None
+
+
+def _whatsapp_link() -> Any:
+    global _WHATSAPP_LINK
+    if _WHATSAPP_LINK is None:
+        _WHATSAPP_LINK = _NanobotWhatsAppLink()
+    return _WHATSAPP_LINK
+
+
+def cmd_channels_whatsapp_connect(args: argparse.Namespace) -> int:
+    """Drive nanobot's WhatsApp QR linking and print its status payload.
+
+    ``qr_url`` (the raw pairing string) is replaced by ``qr_svg``, a
+    ready-to-show data URI, so the admin needs no QR library.
+    """
+    try:
+        _, raw = _load_config_json()
+        stored = (raw.get("channels") or {}).get("whatsapp")
+        stored = stored if isinstance(stored, dict) else {}
+        proxy = None
+        if args.action == "start" and args.request_stdin:
+            body = json.load(sys.stdin)
+            form_proxy = body.get("proxy") if isinstance(body, dict) else None
+            if isinstance(form_proxy, str):
+                proxy = merge_channel_section(
+                    "whatsapp", {"proxy": form_proxy}, stored,
+                ).get("proxy", "")
+        # nanobot swaps the session database right after the scan; a
+        # running gateway channel must not be using it at that moment.
+        if args.action == "start" and stored.get("enabled") and (
+            args.force or not _whatsapp_linked()
+        ):
+            raise ChannelConfigError("disable the WhatsApp channel before linking a new number")
+        payload = _whatsapp_link().handle(
+            args.action, session_id=args.session_id, force=args.force, proxy=proxy,
+        )
+        qr = payload.pop("qr_url", "")
+        if qr:
+            import segno
+            payload["qr_svg"] = segno.make(qr, error="m").svg_data_uri(scale=6, border=2)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the admin as a JSON error
+        _emit_error_json(f"WhatsApp: {exc}", code="WHATSAPP_CONNECT")
+        return 1
+    print(json.dumps({"schema_version": 1, **payload}, ensure_ascii=False))
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # agents (LLM slots: main + fallback)
 # ---------------------------------------------------------------------------
 
-def _provider_for_model(model: str) -> str:
-    """Best-effort provider key from a model string. Mirrors nanobot's
-    keyword detection, but we keep it simple."""
-    m = (model or "").lower()
-    table = [
-        ("openai-codex/", "openai_codex"),
-        ("github_copilot/", "github_copilot"),
-        ("anthropic/",     "anthropic"),
-        ("claude",         "anthropic"),
-        ("openai/",        "openai"),
-        ("gpt-",           "openai"),
-        ("openrouter/",    "openrouter"),
-        ("deepseek",       "deepseek"),
-        ("gemini",         "gemini"),
-        ("groq/",          "groq"),
-        ("yandex",         "yandex"),
-        ("qwen",           "dashscope"),
-        ("zhipu",          "zhipu"),
-        ("glm",            "zhipu"),
-        ("moonshot",       "moonshot"),
-        ("kimi",           "moonshot"),
-        ("mistral",        "mistral"),
-        ("step",           "stepfun"),
-    ]
-    for kw, prov in table:
-        if kw in m:
-            return prov
-    return ""
-
-
-def _redact(s: str | None) -> str | None:
-    if not s:
-        return s
-    if len(s) <= 8:
-        return "***"
-    return f"***{s[-4:]}"
-
 
 def cmd_agents_get(args: argparse.Namespace) -> int:
-    """Read main + fallback slot from nanobot config.json. fallback is
-    a familia-specific block (``agents.familia_fallback``) — nanobot
-    ignores unknown keys."""
+    """Read the effective Nanobot model chain without changing config."""
     _path, raw = _load_config_json()
-    agents = raw.get("agents") or {}
-    main = (agents.get("defaults") or {})
-    fallback = (agents.get("familia_fallback") or {})
-    providers = raw.get("providers") or {}
-
-    def _slot(d: dict[str, Any]) -> dict[str, Any]:
-        provider = d.get("provider") or ""
-        if provider in ("", "auto"):
-            provider = _provider_for_model(d.get("model") or "")
-        prov_cfg = providers.get(provider, {}) if isinstance(providers, dict) else {}
-        return {
-            "model":    d.get("model", ""),
-            "provider": provider,
-            "api_key":  _redact(prov_cfg.get("api_key")) if isinstance(prov_cfg, dict) else None,
-            "api_base": prov_cfg.get("api_base") if isinstance(prov_cfg, dict) else None,
-            "context_window_tokens": d.get("context_window_tokens"),
-        }
-
-    # Models from the periodic /v1/models pull. Merged into the curated
-    # supported_providers.models list below, so the admin dropdown shows
-    # provider-current model ids without needing manual edits. If the
-    # cache is older than 24h, fire a background refresh so the next
-    # call sees fresh data (subprocess returns immediately).
-    import time as _time
-    cache = _load_models_cache()
-    cache_max_age_ms = 24 * 60 * 60 * 1000
-    now_ms = int(_time.time() * 1000)
-    stale = any(
-        (now_ms - int((cache.get(n) or {}).get("updated_at_ms") or 0)) > cache_max_age_ms
-        for n, c in (providers.items() if isinstance(providers, dict) else [])
-        if isinstance(c, dict) and (c.get("api_key") or "").strip()
-    )
-    if stale:
-        try:
-            import subprocess
-            subprocess.Popen(
-                [sys.executable, "-m", "familia.cli.graph_admin", "agents",
-                 "refresh-models", "--json"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            # Refresh is opportunistic; the current cached response remains valid.
-            logger.debug("model cache background refresh failed to start: {}", exc)
-
-    out = {
-        "schema_version": 1,
-        "main":      _slot(main),
-        "fallback":  _slot(fallback) if fallback else None,
-        "providers": sorted([
-            n for n, c in (providers.items() if isinstance(providers, dict) else [])
-            if isinstance(c, dict) and (c.get("api_key") or c.get("api_base"))
-        ]),
-        "models_cache": {
-            n: {
-                "count": len((c or {}).get("models") or []),
-                "updated_at_ms": (c or {}).get("updated_at_ms"),
-            }
-            for n, c in (cache.items() if isinstance(cache, dict) else [])
-        },
-        # Hardcoded list of provider keys we expose in the UI dropdown.
-        # Mirrors nanobot.providers.registry but flat. ``models`` is a
-        # short curated list of well-known model ids; the UI shows them
-        # as a dropdown with a free-text fallback for anything else.
-        "supported_providers": [
-            {"key": "openai",         "label": "OpenAI",        "is_oauth": False,
-             "models": ["openai/gpt-5", "openai/gpt-5-mini", "openai/gpt-4o", "openai/gpt-4o-mini", "openai/o3", "openai/o3-mini"]},
-            {"key": "anthropic",      "label": "Anthropic",     "is_oauth": False,
-             "models": ["anthropic/claude-opus-4-7", "anthropic/claude-opus-4-6", "anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-5", "anthropic/claude-haiku-4-5"]},
-            {"key": "openai_codex",   "label": "OpenAI Codex (ChatGPT subscription)", "is_oauth": True,
-             "models": ["openai-codex/gpt-5.4", "openai-codex/gpt-5.1-codex", "openai-codex/gpt-5-codex"]},
-            {"key": "github_copilot", "label": "GitHub Copilot", "is_oauth": True,
-             "models": ["github_copilot/gpt-5", "github_copilot/claude-opus-4-7", "github_copilot/claude-sonnet-4-6"]},
-            {"key": "openrouter",     "label": "OpenRouter",    "is_oauth": False,
-             "models": ["openrouter/anthropic/claude-opus-4-7", "openrouter/openai/gpt-5", "openrouter/deepseek/deepseek-chat"]},
-            {"key": "deepseek",       "label": "DeepSeek",      "is_oauth": False,
-             "models": ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"]},
-            {"key": "gemini",         "label": "Google Gemini", "is_oauth": False,
-             "models": ["gemini/gemini-2.5-pro", "gemini/gemini-2.5-flash", "gemini/gemini-2.0-flash"]},
-            {"key": "groq",           "label": "Groq",          "is_oauth": False,
-             "models": ["groq/llama-3.3-70b-versatile", "groq/qwen/qwen3-32b", "groq/openai/gpt-oss-120b"]},
-            {"key": "moonshot",       "label": "Moonshot Kimi", "is_oauth": False,
-             "models": ["moonshot/kimi-k2-turbo-preview", "moonshot/kimi-latest"]},
-            {"key": "mistral",        "label": "Mistral",       "is_oauth": False,
-             "models": ["mistral/mistral-large-latest", "mistral/mistral-medium-latest", "mistral/codestral-latest"]},
-            {"key": "dashscope",      "label": "DashScope (Qwen)", "is_oauth": False,
-             "models": ["dashscope/qwen3-coder-plus", "dashscope/qwen-max", "dashscope/qwen3-max"]},
-            {"key": "zhipu",          "label": "Zhipu GLM",     "is_oauth": False,
-             "models": ["zhipu/glm-4.6", "zhipu/glm-4.5"]},
-            {"key": "yandex",         "label": "Yandex (STT only)", "is_oauth": False, "models": []},
-            {"key": "custom",         "label": "Custom (OpenAI-compatible)", "is_oauth": False, "models": []},
-        ],
-    }
-
-    # Merge cache models with curated. Cache ids come from /v1/models
-    # raw, e.g. "gpt-5", but nanobot expects "openai/gpt-5". Prefix
-    # with provider key when the id doesn't already contain a slash.
-    for sp in out["supported_providers"]:
-        key = sp["key"]
-        cached = (cache.get(key) or {}).get("models") or []
-        if not cached:
-            continue
-        prefix_key = key.replace("_", "-") if key in (
-            "openai_codex", "github_copilot",
-        ) else key
-        normalized = []
-        for m in cached:
-            normalized.append(m if "/" in m else f"{prefix_key}/{m}")
-        merged = list(dict.fromkeys([*normalized, *sp.get("models", [])]))
-        sp["models"] = merged
-        sp["models_updated_at_ms"] = (cache.get(key) or {}).get("updated_at_ms")
+    try:
+        out = read_model_settings(raw)
+    except ModelSettingsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     if args.json:
         print(json.dumps(out, ensure_ascii=False))
@@ -3137,47 +3274,57 @@ def cmd_agents_get(args: argparse.Namespace) -> int:
 
 
 def cmd_agents_set(args: argparse.Namespace) -> int:
-    slot = args.slot
-    model = args.model.strip()
-    provider = args.provider.strip() or _provider_for_model(model)
-    if not model:
-        print("error: --model is required", file=sys.stderr)
-        return 2
+    if getattr(args, "request_stdin", False):
+        try:
+            body = json.load(sys.stdin)
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"error: request body is not valid JSON: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(body, dict):
+            print("error: request body must be a JSON object", file=sys.stderr)
+            return 2
+        # The body is the only accepted source for secrets in the RPC path.
+        args.api_key = body.get("api_key") or ""
+        args.api_base = body.get("api_base") or ""
     path, raw = _load_config_json()
-    raw.setdefault("agents", {})
-    raw.setdefault("providers", {})
-    target_key = "defaults" if slot == "main" else "familia_fallback"
-    section = raw["agents"].get(target_key) or {}
-    section["model"] = model
-    section["provider"] = provider or "auto"
-    raw["agents"][target_key] = section
-
-    if provider and (args.api_key or args.api_base):
-        prov = raw["providers"].get(provider) or {}
-        if args.api_key:
-            prov["api_key"] = args.api_key
-        if args.api_base:
-            prov["api_base"] = args.api_base
-        raw["providers"][provider] = prov
-
+    try:
+        snapshot = apply_slot(
+            raw,
+            slot=args.slot,
+            model=args.model,
+            provider=args.provider,
+            api_key=args.api_key,
+            api_base=args.api_base,
+        )
+    except ModelSettingsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     _save_config_json(path, raw)
+    selected = snapshot.get("main" if args.slot == "main" else "fallback") or {}
+    provider = selected.get("provider") or "auto"
     audit.log_event(
         "agent_slot_set",
         actor=None,
-        reason=f"slot={slot} model={model} provider={provider or 'auto'}",
+        reason=f"slot={args.slot} model={args.model.strip()} provider={provider or 'auto'}",
     )
-    print(f"agent slot {slot!r} set: model={model} provider={provider or 'auto'} "
-          f"(gateway restart required)")
+    if getattr(args, "request_stdin", False):
+        print(json.dumps({"ok": True}, ensure_ascii=False))
+    else:
+        print(f"agent slot {args.slot!r} set: model={args.model.strip()} provider={provider or 'auto'} "
+              f"(gateway restart required)")
     return 0
 
 
 def cmd_agents_clear(args: argparse.Namespace) -> int:
     path, raw = _load_config_json()
-    agents = raw.get("agents") or {}
     if args.slot == "fallback":
-        if "familia_fallback" in agents:
-            del agents["familia_fallback"]
-            raw["agents"] = agents
+        try:
+            before = read_model_settings(raw)
+            clear_fallback(raw)
+        except ModelSettingsError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if before["fallback"] is not None:
             _save_config_json(path, raw)
             audit.log_event("agent_slot_cleared", actor=None, reason="slot=fallback")
             print("fallback slot cleared (gateway restart required)")
@@ -3193,22 +3340,23 @@ def cmd_agents_test(args: argparse.Namespace) -> int:
     OpenAI-compat / Anthropic SDK paths where possible. For OAuth
     providers (codex, copilot) the test reports ``not implemented``."""
     _, raw = _load_config_json()
-    agents = raw.get("agents") or {}
-    target_key = "defaults" if args.slot == "main" else "familia_fallback"
-    section = agents.get(target_key) or {}
-    if not section:
+    try:
+        section = resolve_slot(raw, args.slot)
+    except ModelSettingsError as exc:
+        print(json.dumps({"ok": False, "message": str(exc)}, ensure_ascii=False))
+        return 0
+    if section is None:
         out = {"ok": False, "message": f"slot {args.slot!r} is empty"}
         print(json.dumps(out, ensure_ascii=False))
         return 0
 
-    model = section.get("model") or ""
-    provider = section.get("provider") or _provider_for_model(model)
-    providers = raw.get("providers") or {}
-    prov_cfg = (providers.get(provider) or {}) if isinstance(providers, dict) else {}
-    api_key = (prov_cfg.get("api_key") or "").strip()
-    api_base = (prov_cfg.get("api_base") or "").strip()
+    model = section["model"]
+    provider = section["provider"]
+    api_key = section["api_key"].strip()
+    api_base = section["api_base"].strip()
+    provider_kind = provider.replace("-", "_").lower()
 
-    if provider == "openai_codex":
+    if provider_kind == "openai_codex":
         # Live ping against the Codex Responses API using the cached
         # OAuth token. No api_key is needed.
         try:
@@ -3277,7 +3425,7 @@ def cmd_agents_test(args: argparse.Namespace) -> int:
             print(json.dumps({"ok": False, "message": f"error: {exc}"}, ensure_ascii=False))
             return 0
 
-    if provider == "github_copilot":
+    if provider_kind == "github_copilot":
         try:
             from nanobot.providers.github_copilot_provider import (  # type: ignore
                 _load_github_token,
@@ -3369,147 +3517,6 @@ def cmd_agents_test(args: argparse.Namespace) -> int:
 # manual edits.
 # ---------------------------------------------------------------------------
 
-def _models_cache_path() -> Path:
-    return _principals_path().parent / "models_cache.json"
-
-
-def _load_models_cache() -> dict[str, Any]:
-    p = _models_cache_path()
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-
-
-def _save_models_cache(cache: dict[str, Any]) -> None:
-    p = _models_cache_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, p)
-
-
-# Per-provider /v1/models endpoint shape. Returns (url, headers, parser).
-# parser receives the JSON body and returns a list of model id strings.
-def _models_fetcher_for(provider: str, api_key: str, api_base: str | None
-                        ) -> tuple[str, dict[str, str], Any] | None:
-    bearer = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
-
-    def _data_id(d: dict[str, Any]) -> list[str]:
-        items = d.get("data") or d.get("models") or []
-        out: list[str] = []
-        for it in items:
-            if isinstance(it, dict):
-                mid = it.get("id") or it.get("name")
-                if mid:
-                    out.append(str(mid))
-            elif isinstance(it, str):
-                out.append(it)
-        return out
-
-    bases = {
-        "openai":      "https://api.openai.com/v1",
-        "openrouter":  "https://openrouter.ai/api/v1",
-        "deepseek":    "https://api.deepseek.com",
-        "gemini":      "https://generativelanguage.googleapis.com/v1beta/openai",
-        "groq":        "https://api.groq.com/openai/v1",
-        "moonshot":    "https://api.moonshot.cn/v1",
-        "mistral":     "https://api.mistral.ai/v1",
-        "dashscope":   "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "zhipu":       "https://open.bigmodel.cn/api/paas/v4",
-    }
-    if provider == "anthropic":
-        return (
-            (api_base or "https://api.anthropic.com").rstrip("/") + "/v1/models",
-            {"x-api-key": api_key, "anthropic-version": "2023-06-01", "Accept": "application/json"},
-            _data_id,
-        )
-    if provider in bases:
-        base = (api_base or bases[provider]).rstrip("/")
-        return (f"{base}/models", bearer, _data_id)
-    return None
-
-
-def _refresh_one_provider(name: str, api_key: str, api_base: str | None,
-                          ) -> tuple[bool, list[str], str]:
-    """Call /v1/models for *name*. Returns (ok, models, err_msg)."""
-    if not api_key:
-        return False, [], "no api_key configured"
-    spec = _models_fetcher_for(name, api_key, api_base)
-    if spec is None:
-        return False, [], f"models endpoint not known for {name!r}"
-    url, headers, parser = spec
-    try:
-        import httpx
-        r = httpx.get(url, headers=headers, timeout=15)
-        if r.status_code != 200:
-            return False, [], f"HTTP {r.status_code}: {r.text[:200]}"
-        ids = parser(r.json())
-        return True, sorted(set(ids)), ""
-    except Exception as exc:  # noqa: BLE001
-        return False, [], f"error: {exc}"
-
-
-def cmd_agents_refresh_models(args: argparse.Namespace) -> int:
-    """Pull /v1/models for every configured provider with an api_key and
-    write the result into ``models_cache.json``. Prints a per-provider
-    summary in JSON when --json, plain otherwise."""
-    import time
-
-    _, raw = _load_config_json()
-    providers = raw.get("providers") or {}
-    cache = _load_models_cache()
-    now_ms = int(time.time() * 1000)
-
-    targets: list[str]
-    if args.provider:
-        targets = [args.provider]
-    else:
-        targets = sorted([
-            n for n, c in providers.items()
-            if isinstance(c, dict) and (c.get("api_key") or "").strip()
-        ])
-
-    summary: dict[str, dict[str, Any]] = {}
-    for name in targets:
-        cfg = providers.get(name) if isinstance(providers, dict) else None
-        api_key = (cfg or {}).get("api_key", "")
-        api_base = (cfg or {}).get("api_base") or None
-        ok, models, err = _refresh_one_provider(name, api_key, api_base)
-        if ok:
-            cache[name] = {
-                "models": models,
-                "updated_at_ms": now_ms,
-            }
-            summary[name] = {"ok": True, "count": len(models)}
-        else:
-            summary[name] = {"ok": False, "error": err}
-
-    _save_models_cache(cache)
-    if targets:
-        audit.log_event(
-            "models_refreshed",
-            actor=None,
-            reason=f"providers={','.join(targets)}",
-        )
-
-    if args.json:
-        print(json.dumps({"schema_version": 1, "summary": summary},
-                         ensure_ascii=False))
-        return 0
-    if not summary:
-        print("(no providers with api_key configured)")
-        return 0
-    for name, s in sorted(summary.items()):
-        if s.get("ok"):
-            print(f"  ✓ {name:<14} {s['count']} models")
-        else:
-            print(f"  ✗ {name:<14} {s.get('error')}")
-    return 0
-
-
 def cmd_agents_oauth_status(args: argparse.Namespace) -> int:
     """Check if an OAuth provider has a stored, usable token.
 
@@ -3594,6 +3601,9 @@ def _cmd_channels_set_enabled(args: argparse.Namespace, enabled: bool) -> int:
     if not isinstance(section, dict):
         print(f"error: channel {args.name!r} is not configured", file=sys.stderr)
         return 2
+    if enabled and args.name == "whatsapp" and not _whatsapp_linked():
+        print("error: whatsapp is not linked yet; scan the QR code first", file=sys.stderr)
+        return 2
     if section.get("enabled") == enabled:
         # Idempotent — make the no-op visible to the caller but don't
         # rewrite the file (would also pollute audit log on every UI
@@ -3632,6 +3642,10 @@ def cmd_channels_set_stt(args: argparse.Namespace) -> int:
     is stored on the section.
     """
     path, raw = _load_config_json()
+    valid = {"off", "inherit", *(item.key for item in list_providers(raw, "transcription"))}
+    if args.provider not in valid:
+        print(f"error: invalid STT provider {args.provider!r}; choose from {sorted(valid)}", file=sys.stderr)
+        return 2
     channels = raw.get("channels") or {}
     section = channels.get(args.name)
     if not isinstance(section, dict):
@@ -3723,13 +3737,29 @@ def cmd_stt_get(args: argparse.Namespace) -> int:
         or ""
     )
 
+    provider_rows = []
+    for provider in list_providers(raw, "transcription"):
+        section = providers_raw.get(provider.key) or {}
+        if not isinstance(section, dict):
+            section = {}
+        api_key = section.get("apiKey") or section.get("api_key") or ""
+        provider_rows.append({
+            **provider.to_dict(),
+            "api_key": f"***{api_key[-4:]}" if api_key else "",
+            "api_base": section.get("apiBase") or section.get("api_base") or "",
+            "folder_id": section.get("folderId") or section.get("folder_id") or "",
+            "configured": bool(api_key),
+        })
+    transcription = raw.get("transcription") or {}
+    if not isinstance(transcription, dict):
+        transcription = {}
     payload = {
         "global_default": global_default,
-        "providers": [_provider_view(k) for k in sorted(STT_CRED_PROVIDERS)],
+        "providers": provider_rows,
         "channels": overrides,
-        "supported_choices": sorted(STT_PROVIDER_CHOICES),
         "audio_budget_s": audio_budget_s,
         "lang": lang,
+        "model": transcription.get("model") or "",
     }
     if args.json:
         print(json.dumps(payload, ensure_ascii=False))
@@ -3740,9 +3770,11 @@ def cmd_stt_get(args: argparse.Namespace) -> int:
 
 def cmd_stt_set(args: argparse.Namespace) -> int:
     """Persist creds for a STT provider into ``config.providers.<provider>``."""
-    if args.provider not in STT_CRED_PROVIDERS:
+    _path, current = _load_config_json()
+    valid = {item.key for item in list_providers(current, "transcription")}
+    if args.provider not in valid:
         print(f"error: provider {args.provider!r} doesn't own credentials "
-              f"(choose from {sorted(STT_CRED_PROVIDERS)})", file=sys.stderr)
+              f"(choose from {sorted(valid)})", file=sys.stderr)
         return 2
     if args.provider == "yandex" and args.api_key and not args.folder_id:
         print(
@@ -3796,6 +3828,29 @@ def cmd_stt_set_audio_budget(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stt_set_model(args: argparse.Namespace) -> int:
+    """Persist transcription.provider/model without validating catalog membership."""
+    path, raw = _load_config_json()
+    valid = {item.key for item in list_providers(raw, "transcription")}
+    if args.provider not in valid:
+        print(f"error: invalid STT provider {args.provider!r}", file=sys.stderr)
+        return 2
+    transcription = raw.setdefault("transcription", {})
+    if not isinstance(transcription, dict):
+        transcription = {}
+        raw["transcription"] = transcription
+    transcription["provider"] = args.provider
+    transcription["model"] = "" if args.provider == "yandex" else (args.model or "").strip()
+    _save_config_json(path, raw)
+    audit.log_event(
+        "stt_model_set",
+        actor=None,
+        reason=f"provider={args.provider};reload-required",
+    )
+    print(f"stt model updated in {path} (gateway reload required)")
+    return 0
+
+
 def cmd_stt_set_lang(args: argparse.Namespace) -> int:
     """Persist the BCP-47 STT language hint into config.channels."""
     lang = (args.lang or "").strip()
@@ -3819,6 +3874,10 @@ def cmd_stt_set_lang(args: argparse.Namespace) -> int:
 def cmd_stt_set_default(args: argparse.Namespace) -> int:
     """Set the global default STT provider that channels inherit."""
     path, raw = _load_config_json()
+    valid = {"off", *(item.key for item in list_providers(raw, "transcription"))}
+    if args.provider not in valid and args.provider != "inherit":
+        print(f"error: invalid STT provider {args.provider!r}; choose from {sorted(valid)}", file=sys.stderr)
+        return 2
     channels = raw.setdefault("channels", {})
     if args.provider == "inherit":
         # Bookkeeping value isn't valid here — global default has to be a
@@ -3828,6 +3887,20 @@ def cmd_stt_set_default(args: argparse.Namespace) -> int:
         provider = args.provider
     channels["transcriptionProvider"] = provider
     channels.pop("transcription_provider", None)
+    transcription = raw.setdefault("transcription", {})
+    if not isinstance(transcription, dict):
+        transcription = {}
+        raw["transcription"] = transcription
+    if provider == "off":
+        transcription["provider"] = ""
+        transcription["model"] = ""
+    else:
+        provider_spec = next(
+            (item for item in list_providers(raw, "transcription") if item.key == provider),
+            None,
+        )
+        transcription["provider"] = provider
+        transcription["model"] = provider_spec.default_model if provider_spec else ""
     _save_config_json(path, raw)
     audit.log_event(
         "stt_default_set",
@@ -3836,6 +3909,54 @@ def cmd_stt_set_default(args: argparse.Namespace) -> int:
     )
     print(f"global stt default = {provider!r} in {path} "
           f"(gateway restart required)")
+    return 0
+
+
+def cmd_models_providers(args: argparse.Namespace) -> int:
+    """Return provider metadata without making a network request."""
+    _path, raw = _load_config_json()
+    payload = list_providers(raw, args.kind).to_dict()
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_models_catalog(args: argparse.Namespace) -> int:
+    """Load one selected catalog; optional credentials are stdin-only."""
+    _path, raw = _load_config_json()
+    request: dict[str, Any] = {
+        "kind": args.kind,
+        "provider": args.provider,
+        "refresh": bool(args.refresh),
+    }
+    if args.request_stdin:
+        try:
+            supplied = json.load(sys.stdin)
+        except (ValueError, TypeError) as exc:
+            if args.json:
+                _emit_error_json(f"invalid request JSON ({type(exc).__name__})", code="BAD_REQUEST")
+            else:
+                print("error: invalid request JSON", file=sys.stderr)
+            return 2
+        if not isinstance(supplied, dict):
+            if args.json:
+                _emit_error_json("request JSON must be an object", code="BAD_REQUEST")
+            else:
+                print("error: request JSON must be an object", file=sys.stderr)
+            return 2
+        for key in ("api_key", "api_base", "current_model"):
+            if key in supplied:
+                request[key] = supplied[key]
+        if "refresh" in supplied:
+            request["refresh"] = bool(supplied["refresh"])
+    snapshot = load_catalog(raw, CatalogRequest.from_value(request))
+    payload = snapshot.to_dict()
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -3925,10 +4046,18 @@ def _rpc_server_loop(parser: argparse.ArgumentParser) -> int:
 
         req_id = req.get("id")
         argv = req.get("argv") or []
+        request_stdin = req.get("stdin")
         if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
             sys.stdout.write(_json.dumps(
                 {"id": req_id, "exit": 2, "stdout": "",
                  "stderr": "rpc-server: argv must be list of strings"}
+            ) + "\n")
+            sys.stdout.flush()
+            continue
+        if request_stdin is not None and not isinstance(request_stdin, str):
+            sys.stdout.write(_json.dumps(
+                {"id": req_id, "exit": 2, "stdout": "",
+                 "stderr": "rpc-server: stdin must be a string"}
             ) + "\n")
             sys.stdout.flush()
             continue
@@ -3937,9 +4066,11 @@ def _rpc_server_loop(parser: argparse.ArgumentParser) -> int:
         # its JSON payload to stdout on success, or a structured error
         # envelope to stdout/stderr on failure — same wire as the
         # one-shot CLI mode, so admin's parser stays the same.
-        old_stdout, old_stderr = sys.stdout, sys.stderr
+        old_stdout, old_stderr, old_stdin = sys.stdout, sys.stderr, sys.stdin
         out_buf, err_buf = io.StringIO(), io.StringIO()
         sys.stdout, sys.stderr = out_buf, err_buf
+        if request_stdin is not None:
+            sys.stdin = io.StringIO(request_stdin)
         try:
             try:
                 args = parser.parse_args(argv)
@@ -3974,7 +4105,7 @@ def _rpc_server_loop(parser: argparse.ArgumentParser) -> int:
                         "stdout": out_buf.getvalue(),
                         "stderr": err_buf.getvalue()}
         finally:
-            sys.stdout, sys.stderr = old_stdout, old_stderr
+            sys.stdout, sys.stderr, sys.stdin = old_stdout, old_stderr, old_stdin
 
         try:
             sys.stdout.write(_json.dumps(resp, ensure_ascii=False) + "\n")

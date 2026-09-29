@@ -1,12 +1,6 @@
-"""Slash command package kept for upstream compatibility.
+"""Slash command routing and built-in handlers."""
 
-Runtime command registration is intentionally not re-exported from this
-package. Integrations must not wire ``CommandRouter`` into message
-handling: slash-looking inbound text is ordinary user text, not a
-privileged control plane.
-"""
+from nanobot.command.builtin import register_builtin_commands
+from nanobot.command.router import CommandContext, CommandRouter
 
-# from nanobot.command.builtin import register_builtin_commands
-# from nanobot.command.router import CommandContext, CommandRouter
-
-__all__: list[str] = []
+__all__ = ["CommandContext", "CommandRouter", "register_builtin_commands"]

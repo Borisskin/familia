@@ -10,6 +10,7 @@ services:
     build:
       context: ./memx
       dockerfile: Dockerfile
+      network: "${FAMILIA_BUILD_NETWORK:-default}"
       args:
         APT_MIRROR: "${APT_MIRROR:-}"
         PIP_INDEX_URL: "${PIP_INDEX_URL:-}"

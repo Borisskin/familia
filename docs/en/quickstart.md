@@ -61,7 +61,7 @@ Any Windows 10 / 11 machine with **WebView2** installed. It is present by defaul
 
 ## Install through the admin app
 
-1. Download **two** files from [Releases](../../releases/latest):
+1. Download **two** files from [Releases](https://github.com/Verconto/familia/releases/latest):
    - `FamiliaAdmin-vX.Y.Z.exe`
    - `WebView2Loader.dll`
 
@@ -111,7 +111,7 @@ When a new version is released, download the new `FamiliaAdmin-vX.Y.Z.exe` and r
 - **versions match** — dashboard opens immediately.
 - **admin older than VM** — connection is blocked with "admin too old". Download a newer `.exe`.
 
-Admin version (`0.5.60`) and backend version (`0.2.3`) are separate. Admin can ship without a backend update and the backend can update without admin UI changes.
+Admin build version (`v0.5.74` in the current source) and backend version (`0.4.3`) are separate. Admin can ship without a backend update and the backend can update without admin UI changes. Published files are available in the [latest release](https://github.com/Verconto/familia/releases/latest).
 
 ## Something went wrong?
 

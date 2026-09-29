@@ -1,422 +1,556 @@
 {
   "schema_version": 1,
   "baseline": {
-    "version": "0.1.5.post2",
-    "commit": "950dddec499fbbe0353e997158c99808f0bb41e1",
+    "version": "0.3.5",
+    "commit": "1bb712d3488915ca4ed9ccc1a93067ff722f5ab9",
     "repository": "D:/chat/nanobot"
   },
-  "scope": {
-    "upstream": ["nanobot/**", "pyproject.toml", "README.md"],
-    "target": ["nanobot/nanobot/**", "nanobot/pyproject.toml", "nanobot/README.md"],
-    "source": "tracked and non-ignored current worktree files",
-    "comparison": ["path-set", "blob-bytes", "git-mode"]
-  },
-  "categories": [
-    "familia-invariant",
-    "upstream-alignment",
-    "generated-noise",
-    "unknown"
+  "generated_by": "D1 safe Dulwich reconstruction in familia-upgrade035-d2-environment-20260920",
+  "scope": "nanobot/**",
+  "excluded_upstream_paths": [
+    {
+      "path": ".agent/design.md",
+      "reason": "Upstream guidance for autonomous contributors is not a product runtime or a source-package input of Familia.",
+      "verification": "Full-tree reconstruction excludes this exact path and rejects its unexpected appearance in the vendored target."
+    },
+    {
+      "path": ".agent/gotchas.md",
+      "reason": "Upstream contributor-only operating notes are superseded by Familia project rules outside the vendored tree.",
+      "verification": "Full-tree reconstruction excludes this exact path and rejects its unexpected appearance in the vendored target."
+    },
+    {
+      "path": ".agent/security.md",
+      "reason": "Upstream contributor security guidance is not shipped as nanobot product material; Familia maintains its own security rules.",
+      "verification": "Full-tree reconstruction excludes this exact path and rejects its unexpected appearance in the vendored target."
+    },
+    {
+      "path": "AGENTS.md",
+      "reason": "This is upstream AI-coding-agent guidance, not a runtime or user-facing nanobot artifact.",
+      "verification": "Full-tree reconstruction excludes this exact path and rejects its unexpected appearance in the vendored target."
+    },
+    {
+      "path": "CLAUDE.md",
+      "reason": "This one-line upstream agent alias only points to AGENTS.md and has no product behavior.",
+      "verification": "Full-tree reconstruction excludes this exact path and rejects its unexpected appearance in the vendored target."
+    }
   ],
   "deltas": [
     {
-      "catalog_id": "D-HB-001",
-      "path": "nanobot/nanobot/agent/__init__.py",
-      "patch": "agent___init__.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "neutral ContextExtension API remains exported"
-    },
-    {
-      "catalog_id": "D-HB-042",
-      "path": "nanobot/nanobot/agent/autocompact.py",
-      "patch": "agent_autocompact.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "auto-compaction shares the session lock, rolls back failed saves, and publishes summaries only after persistence"
-    },
-    {
-      "catalog_id": "D-HB-002",
-      "path": "nanobot/nanobot/agent/context.py",
-      "patch": "agent_context.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "prompt assembly remains extensible and actor-filtered before limiting"
-    },
-    {
-      "catalog_id": "D-HB-003",
       "path": "nanobot/nanobot/agent/loop.py",
       "patch": "agent_loop.patch",
-      "owner": "familia",
+      "owner": "familia-core",
       "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "neutral archive callbacks, private-mode proof persistence, and returned consolidated sessions remain wired without product imports"
+      "behavior": "Поток хода агента сохраняет продуктовые хуки Familia, подтверждает очистку /new и запускает сокращение истории после сохранения хода.",
+      "native_gap": "В upstream нет admission/runtime-политики Familia; delta оставляет точку расширения.",
+      "verification": "Docker exact reconstruction; familia/tests/test_nanobot_035_acceptance.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
     },
     {
-      "catalog_id": "D-HB-004",
       "path": "nanobot/nanobot/agent/memory.py",
       "patch": "agent_memory.patch",
-      "owner": "familia",
+      "owner": "familia-core",
       "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "standalone file archiving remains the default while optional owner-resolved private archives and session updates commit only after successful durable writes"
+      "behavior": "Память агента получает контракт Familia для записи хода и области данных; старый префикс сеанса удаляется только после подтверждённой архивации.",
+      "native_gap": "Нативная память nanobot не знает политику идентичности Familia.",
+      "verification": "Docker exact reconstruction; familia/tests/test_nanobot_035_acceptance.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
     },
     {
-      "catalog_id": "D-HB-005",
-      "path": "nanobot/nanobot/agent/outbound.py",
-      "patch": "agent_outbound.patch",
-      "owner": "familia",
+      "path": "nanobot/nanobot/agent/autocompact.py",
+      "patch": "agent_autocompact.patch",
+      "owner": "familia-core",
       "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "neutral outbound authorization hook remains available"
+      "behavior": "Периодическая и послеповоротная обработка обнаруживает старые сеансы без проверки ограничения файла и повторяет незавершённое сокращение.",
+      "native_gap": "Upstream не выполняет ограничение размера сохранённого JSONL-сеанса и миграцию прежних файлов.",
+      "verification": "Docker exact reconstruction; familia/tests/test_nanobot_035_acceptance.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
     },
     {
-      "catalog_id": "D-HB-006",
-      "path": "nanobot/nanobot/agent/runner.py",
-      "patch": "agent_runner.patch",
-      "owner": "familia-release",
-      "category": "unknown",
-      "hunks": [{"range": "all", "category": "unknown"}],
-      "invariant": "inherited provider-error UX retained for release pending upgrade re-decision"
-    },
-    {
-      "catalog_id": "D-HB-007",
-      "path": "nanobot/nanobot/agent/tools/cron.py",
-      "patch": "agent_tools_cron.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "cron tool preserves explicit actor, target, tags, and direct delivery"
-    },
-    {
-      "catalog_id": "D-HB-008",
-      "path": "nanobot/nanobot/agent/tools/message.py",
-      "patch": "agent_tools_message.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "message sends pass the neutral outbound guard"
-    },
-    {
-      "catalog_id": "D-HB-009",
-      "path": "nanobot/nanobot/bus/__init__.py",
-      "patch": "bus___init__.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "callback bus API remains exported"
-    },
-    {
-      "catalog_id": "D-HB-010",
-      "path": "nanobot/nanobot/bus/callbacks.py",
-      "patch": "bus_callbacks.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "optional neutral callback dispatch remains available"
-    },
-    {
-      "catalog_id": "D-HB-011",
-      "path": "nanobot/nanobot/bus/events.py",
-      "patch": "bus_events.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "bus events retain actor and callback metadata"
-    },
-    {
-      "catalog_id": "D-HB-012",
-      "path": "nanobot/nanobot/bus/queue.py",
-      "patch": "bus_queue.patch",
-      "owner": "familia-release",
-      "category": "unknown",
-      "hunks": [{"range": "all", "category": "unknown"}],
-      "invariant": "inherited callback queue topology retained pending upgrade re-decision"
-    },
-    {
-      "catalog_id": "D-HB-013",
-      "path": "nanobot/nanobot/channels/base.py",
-      "patch": "channels_base.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "all channels pass neutral inbound enrichment and transcription boundaries"
-    },
-    {
-      "catalog_id": "D-HB-014",
-      "path": "nanobot/nanobot/channels/discord.py",
-      "patch": "channels_discord.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "Discord uses inbound policy and has no automatic command wiring"
-    },
-    {
-      "catalog_id": "D-HB-015",
-      "path": "nanobot/nanobot/channels/inbound.py",
-      "patch": "channels_inbound.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "neutral inbound gate and enricher protocol remains available"
-    },
-    {
-      "catalog_id": "D-HB-016",
-      "path": "nanobot/nanobot/channels/manager.py",
-      "patch": "channels_manager.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "runtime channel registry accepts neutral classes and enrichers"
-    },
-    {
-      "catalog_id": "D-HB-017",
-      "path": "nanobot/nanobot/channels/matrix.py",
-      "patch": "channels_matrix.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "Matrix inbound events pass the shared gate"
-    },
-    {
-      "catalog_id": "D-HB-018",
-      "path": "nanobot/nanobot/channels/mochat.py",
-      "patch": "channels_mochat.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "Mochat uses the semantic inbound-drop contract"
-    },
-    {
-      "catalog_id": "D-HB-019",
-      "path": "nanobot/nanobot/channels/msteams.py",
-      "patch": "channels_msteams.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "Teams uses the semantic inbound-drop contract"
-    },
-    {
-      "catalog_id": "D-HB-020",
-      "path": "nanobot/nanobot/channels/telegram.py",
-      "patch": "channels_telegram.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "Telegram media, audio, inbound policy, private-mode proof, and disabled command menu remain explicit"
-    },
-    {
-      "catalog_id": "D-HB-021",
-      "path": "nanobot/nanobot/channels/websocket.py",
-      "patch": "channels_websocket.patch",
-      "owner": "familia-release",
-      "category": "unknown",
-      "hunks": [{"range": "all", "category": "unknown"}],
-      "invariant": "inherited WebSocket handshake behavior retained pending upgrade re-decision"
-    },
-    {
-      "catalog_id": "D-HB-022",
-      "path": "nanobot/nanobot/cli/commands.py",
-      "patch": "cli_commands.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "CLI lifecycle starts neutral adapters, heartbeat, maintenance, and web surfaces"
-    },
-    {
-      "catalog_id": "D-HB-023",
-      "path": "nanobot/nanobot/command/__init__.py",
-      "patch": "command___init__.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "slash-command modules remain physically present but are not package-wired"
-    },
-    {
-      "catalog_id": "D-HB-040",
-      "path": "nanobot/nanobot/command/builtin.py",
-      "patch": "command_builtin.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "new-session archival completes under the session lock before clearing, failed saves roll back, and Dream restore policy can deny protected files"
-    },
-    {
-      "catalog_id": "D-HB-024",
-      "path": "nanobot/nanobot/config/schema.py",
-      "patch": "config_schema.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "optional transcription and heartbeat ownership fields remain schema-visible"
-    },
-    {
-      "catalog_id": "D-HB-025",
-      "path": "nanobot/nanobot/cron/service.py",
-      "patch": "cron_service.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "job identity includes actor, target, delivery, and tags without false dedupe"
-    },
-    {
-      "catalog_id": "D-HB-026",
-      "path": "nanobot/nanobot/cron/types.py",
-      "patch": "cron_types.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "cron persistence carries explicit creator, actor, target, and tags"
-    },
-    {
-      "catalog_id": "D-HB-027",
-      "path": "nanobot/nanobot/heartbeat/service.py",
-      "patch": "heartbeat_service.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "adapter-owned heartbeat selection fails closed and never falls back across principals"
-    },
-    {
-      "catalog_id": "D-HB-028",
-      "path": "nanobot/nanobot/nanobot.py",
-      "patch": "nanobot.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "facade passes neutral runtime adapter arguments"
-    },
-    {
-      "catalog_id": "D-HB-029",
-      "path": "nanobot/nanobot/providers/base.py",
-      "patch": "providers_base.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "provider retry timing remains release-approved"
-    },
-    {
-      "catalog_id": "D-HB-030",
-      "path": "nanobot/nanobot/providers/openai_codex_provider.py",
-      "patch": "providers_openai_codex_provider.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "provider timeouts and structured retry metadata remain failure-visible"
-    },
-    {
-      "catalog_id": "D-HB-031",
-      "path": "nanobot/nanobot/providers/openai_compat_provider.py",
-      "patch": "providers_openai_compat_provider.patch",
-      "owner": "familia-release",
-      "category": "unknown",
-      "hunks": [{"range": "all", "category": "unknown"}],
-      "invariant": "inherited compatibility kwarg choice retained pending upgrade re-decision"
-    },
-    {
-      "catalog_id": "D-HB-032",
-      "path": "nanobot/nanobot/providers/transcription.py",
-      "patch": "providers_transcription.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "selected speech-to-text capability remains available"
-    },
-    {
-      "catalog_id": "D-HB-033",
-      "path": "nanobot/pyproject.toml",
-      "patch": "pyproject.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "vendored package includes required web distribution artifacts"
-    },
-    {
-      "catalog_id": "D-HB-034",
-      "path": "nanobot/nanobot/runtime_adapters.py",
-      "patch": "runtime_adapters.patch",
-      "owner": "familia",
-      "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "product adapters load through neutral entry points without direct imports"
-    },
-    {
-      "catalog_id": "D-HB-043",
       "path": "nanobot/nanobot/session/manager.py",
       "patch": "session_manager.patch",
-      "owner": "familia",
+      "owner": "familia-core",
       "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "session JSONL saves stay atomic and serialized per key without archive coordinates or revision protocols"
+      "behavior": "Формат JSONL сохранён; служебные отметки позволяют обнаружить превышение 2000 сообщений и повторить безопасное сокращение.",
+      "native_gap": "В Nanobot 0.3.5 нет ограничения сохранённого файла и отметки миграции старых сеансов.",
+      "verification": "Docker exact reconstruction; familia/tests/test_nanobot_035_acceptance.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
     },
     {
-      "catalog_id": "D-HB-035",
-      "path": "nanobot/nanobot/templates/AGENTS.md",
-      "patch": "templates_AGENTS.patch",
-      "owner": "familia",
+      "path": "nanobot/nanobot/agent/outbound.py",
+      "patch": "agent_outbound.patch",
+      "owner": "familia-core",
       "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "scheduled cron reminders remain distinct from heartbeat context"
+      "behavior": "Добавлен исходящий контракт Familia для маршрутизации сообщений.",
+      "native_gap": "В upstream отсутствует файл и product transport guard.",
+      "verification": "Docker exact reconstruction; nanobot/tests/agent/test_outbound.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
     },
     {
-      "catalog_id": "D-HB-036",
-      "path": "nanobot/nanobot/templates/agent/conversation_rules.md",
-      "patch": "templates_agent_conversation_rules.patch",
+      "path": "nanobot/nanobot/agent/tools/context.py",
+      "patch": "agent_tools_context.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "Инструмент контекста передаёт runtime-контекст Familia, включая типизированный предикат доступа к заданиям cron.",
+      "native_gap": "Нативный ToolContext не содержит продуктового предиката доступа к заданиям cron.",
+      "verification": "Docker exact reconstruction; tests/test_nanobot_context_extension.py; familia/tests/test_cron_access_adapter.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/agent/tools/cron.py",
+      "patch": "agent_tools_cron.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "CronTool фильтрует личные задания по проверенному предикату Familia, скрывает отказ при list/remove, отклоняет неверно подключённый предикат и проверяет доступность новых меток.",
+      "native_gap": "Нативный CronTool 0.3.5 не знает ACL текущего принципала, не проверяет доступ перед чтением или удалением и не поддерживает метки заданий Familia.",
+      "verification": "Docker targeted cron ACL regression; familia/tests/test_cron_access_adapter.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/agent/tools/path_utils.py",
+      "patch": "agent_tools_path_utils.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "Безопасная материализация вложений сохраняет область актора, хеширование и запрет доступа к общей медиатеке.",
+      "native_gap": "Upstream не предоставляет границу доступа Familia для частных вложений.",
+      "verification": "Docker exact reconstruction; familia/tests/test_vk_media_isolation.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/agent/tools/schema.py",
+      "patch": "agent_tools_schema.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "Схемы инструментов согласованы с продуктовым контекстом и проверками Familia.",
+      "native_gap": "Нативные схемы не покрывают обязательные product-owned поля.",
+      "verification": "Docker exact reconstruction; nanobot/tests/agent/test_tools_schema.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/agent/turn_delivery.py",
+      "patch": "agent_turn_delivery.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "Доставка хода связывает ответ агента с продуктовым транспортом.",
+      "native_gap": "Upstream не предоставляет Familia delivery seam.",
+      "verification": "Docker exact reconstruction; tests/test_nanobot_context_extension.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/audio/transcription_registry.py",
+      "patch": "audio_transcription_registry.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "Реестр транскрипции сохраняет совместимость с провайдерами Familia.",
+      "native_gap": "Нативный реестр не содержит product provider registration.",
+      "verification": "Docker exact reconstruction; nanobot/tests/audio/test_transcription_registry.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/audio/transcription.py",
+      "patch": "audio_transcription.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "Транскрипция получает интеграционный контракт Familia.",
+      "native_gap": "Upstream transcription API не знает выбранного продукта и его политики.",
+      "verification": "Docker exact reconstruction; nanobot/tests/audio/test_transcription.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/bus/__init__.py",
+      "patch": "bus___init__.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "Шина экспортирует расширения, необходимые Familia.",
+      "native_gap": "Upstream exports не включают product event surface.",
+      "verification": "Docker exact reconstruction; nanobot/tests/bus/test_events.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/bus/events.py",
+      "patch": "bus_events.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "События шины переносят поля, требуемые продуктовой доставкой Familia.",
+      "native_gap": "Нативные события не фиксируют Familia routing metadata.",
+      "verification": "Docker exact reconstruction; nanobot/tests/bus/test_events.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/bus/queue.py",
+      "patch": "bus_queue.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "Очередь шины учитывает продуктовый порядок и границы доставки.",
+      "native_gap": "Upstream queue не гарантирует Familia delivery semantics.",
+      "verification": "Docker exact reconstruction; nanobot/tests/bus/test_queue.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/channels/base.py",
+      "patch": "channels_base.patch",
+      "category": "familia-invariant",
+      "owner": "familia-core",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ],
+      "behavior": "Базовый канал различает доставку, недоступность и неизвестный результат; явный отказ до принятия сообщения не повторяется.",
+      "native_gap": "Nanobot 0.3.5 не выделяет ошибку отказа до принятия сообщения и считает её повторяемой транспортной ошибкой.",
+      "verification": "Docker reconstruction на полном наборе путей, байтов и режимов; D2 адресные сценарии доставки."
+    },
+    {
+      "path": "nanobot/nanobot/channels/manager.py",
+      "patch": "channels_manager.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "Менеджер каналов подключает product runtime adapters Familia.",
+      "native_gap": "Нативный manager не содержит seam для product-owned adapters.",
+      "verification": "Docker exact reconstruction; nanobot/tests/channels/test_manager.py; familia/tests/test_gateway_sighup_reload.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/channels/telegram/runtime.py",
+      "patch": "channels_telegram_runtime.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "Telegram runtime сохраняет правила доставки Familia.",
+      "native_gap": "Upstream runtime не знает product routing/runtime policy.",
+      "verification": "Docker exact reconstruction; nanobot/tests/channels/test_telegram_runtime.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/cli/commands.py",
+      "patch": "cli_commands.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "CLI команды отображают продуктовую конфигурацию и lifecycle Familia.",
+      "native_gap": "Нативный CLI не содержит Familia command contract.",
+      "verification": "Docker exact reconstruction; nanobot/tests/cli/test_commands.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/cli/gateway_runtime.py",
+      "patch": "cli_gateway_runtime.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "Gateway runtime подключает обязательный runtime adapter и через него идемпотентно регистрирует три Familia-owned maintenance job.",
+      "native_gap": "Нативный gateway не имеет product runtime adapter seam и не знает Familia maintenance jobs.",
+      "verification": "Docker exact reconstruction; familia/tests/test_maintenance_recovery.py; familia/tests/test_gateway_sighup_reload.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/command/builtin.py",
+      "patch": "command_builtin.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "Встроенные команды соблюдают product command policy Familia; /new archives successfully before clearing and preserves history when archival fails.",
+      "native_gap": "Upstream builtin commands не покрывают product-owned policy; upstream test_new_command_archival expects background archive and clear-on-failure behavior that conflicts with Familia's /new contract.",
+      "verification": "Docker exact reconstruction; nanobot/tests/command/test_builtin.py; familia/tests/test_nanobot_035_acceptance.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/config/schema.py",
+      "patch": "config_schema.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "Схема конфигурации содержит product-owned параметры Familia.",
+      "native_gap": "Нативная схема nanobot не знает product identity/configuration.",
+      "verification": "Docker exact reconstruction; nanobot/tests/config/test_schema.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/cron/service.py",
+      "patch": "cron_service.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "CronService сериализует поля владельца и метки без выдумывания владельца и передаёт новые метки из инструмента в задание.",
+      "native_gap": "Нативный CronService 0.3.5 отбрасывает прежние поля владельца и метки при сохранении.",
+      "verification": "Docker targeted cron regression; familia/tests/test_nanobot_cron_extension.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/cron/types.py",
+      "patch": "cron_types.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "CronPayload сохраняет реальные поля владельца старых заданий и их метки при чтении хранилища.",
+      "native_gap": "Нативный CronPayload 0.3.5 не представляет прежние поля владельца и метки Familia.",
+      "verification": "Docker targeted cron regression; familia/tests/test_nanobot_cron_extension.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/providers/transcription.py",
+      "patch": "providers_transcription.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "Провайдеры транскрипции согласованы с Familia runtime.",
+      "native_gap": "Upstream provider contract не содержит product provider hooks.",
+      "verification": "Docker exact reconstruction; nanobot/tests/providers/test_transcription.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/runtime_adapters.py",
+      "patch": "runtime_adapters.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "Добавлен нейтральный runtime seam для безопасного подключения Familia, включая регистрацию system jobs.",
+      "native_gap": "В upstream отсутствует файл; это product integration seam, не upstream API.",
+      "verification": "Docker exact reconstruction; familia/tests/test_maintenance_recovery.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/nanobot/sdk/clients.py",
+      "patch": "sdk_clients.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "SDK-клиенты получают product-aware transport/configuration.",
+      "native_gap": "Нативные клиенты не учитывают Familia runtime policy.",
+      "verification": "Docker exact reconstruction; nanobot/tests/sdk/test_clients.py",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/scripts/install.sh",
+      "patch": "scripts_install.patch",
       "owner": "familia-release",
-      "category": "unknown",
-      "hunks": [{"range": "all", "category": "unknown"}],
-      "invariant": "inherited conversation continuity guidance retained pending upgrade re-decision"
+      "category": "upstream-alignment",
+      "behavior": "Поставочное дерево сохраняет режим 100644: штатный shell-установщик вызывается через sh, как в документации upstream, а не прямым исполнением файла.",
+      "native_gap": "Upstream хранит режим 100755; в Windows-вендоре Familia нет переносимого POSIX executable bit, поэтому режим зафиксирован явным mode-only patch.",
+      "verification": "Docker full-tree reconstruction проверяет mode 100644; README upstream документирует запуск через pipe в sh.",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "upstream-alignment"
+        }
+      ]
     },
     {
-      "catalog_id": "D-HB-037",
-      "path": "nanobot/nanobot/templates/agent/dream_phase1.md",
-      "patch": "templates_agent_dream_phase1.patch",
-      "owner": "familia",
+      "path": "nanobot/tests/channels/test_delivery_outcome.py",
+      "patch": "tests_channels_test_delivery_outcome.patch",
+      "owner": "familia-core",
       "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "Dream classifies FILE, PRIVATE, and PAIR findings explicitly"
+      "behavior": "Добавлены проверки результатов доставки: delivered, unavailable, unknown, частичная VK-отправка и запрет повтора после неоднозначного результата.",
+      "native_gap": "Upstream 0.3.5 не проверяет договор Familia о различении недоступной и уже принятой доставки.",
+      "verification": "Docker targeted delivery scenarios; full-tree reconstruction.",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
     },
     {
-      "catalog_id": "D-HB-038",
-      "path": "nanobot/nanobot/templates/agent/dream_phase2.md",
-      "patch": "templates_agent_dream_phase2.patch",
-      "owner": "familia-release",
-      "category": "unknown",
-      "hunks": [{"range": "all", "category": "unknown"}],
-      "invariant": "inherited scoped-write prompt retained pending upgrade re-decision"
+      "path": "nanobot/tests/cli/test_commands.py",
+      "patch": "tests_cli_test_commands.patch",
+      "owner": "familia-core",
+      "category": "upstream-alignment",
+      "behavior": "Тестовые двойники CLI и gateway принимают sessions_root и runtime_adapters, совпадая с действительным договором 0.3.5 и подключением Familia.",
+      "native_gap": "Старые двойники SessionManager не принимали обязательный sessions_root и скрывали реальный путь сборки gateway.",
+      "verification": "Docker targeted CLI/gateway scenarios; full-tree reconstruction.",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "upstream-alignment"
+        }
+      ]
     },
     {
-      "catalog_id": "D-HB-039",
-      "path": "nanobot/nanobot/utils/maintenance.py",
-      "patch": "utils_maintenance.patch",
-      "owner": "familia",
+      "path": "nanobot/tests/command/test_compact_command.py",
+      "patch": "tests_command_test_compact_command.patch",
+      "owner": "familia-core",
+      "category": "generated-noise",
+      "behavior": "Удалён только лишний пустой ряд; сценарии compact и их утверждения не меняются.",
+      "native_gap": "Штатной поведенческой замены не требуется: это точная текстовая дельта поставляемого теста.",
+      "verification": "Docker full-tree reconstruction; patch содержит один форматный hunk.",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "generated-noise"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/tests/providers/test_transcription.py",
+      "patch": "tests_providers_test_transcription.patch",
+      "owner": "familia-core",
       "category": "familia-invariant",
-      "hunks": [{"range": "all", "category": "familia-invariant"}],
-      "invariant": "maintenance capability remains callable through the documented backend surface"
+      "behavior": "Проверяется Yandex transcription: credentials и folder id, отсутствие выхода без folder id, raw audio, общие kwargs и безопасная обработка длинного аудио.",
+      "native_gap": "Upstream не содержит продуктовый распознаватель Yandex и его границы ошибок.",
+      "verification": "Docker targeted transcription scenarios; full-tree reconstruction.",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/tests/test_runtime_adapters.py",
+      "patch": "tests_test_runtime_adapters.patch",
+      "owner": "familia-core",
+      "category": "familia-invariant",
+      "behavior": "Добавлены проверки server-admitted identity, session key, режима адаптеров, раннего отказа CLI/gateway и подготовки изолированного session storage.",
+      "native_gap": "В upstream отсутствуют runtime adapters Familia и доказательства безопасного подключения до запуска.",
+      "verification": "Docker targeted runtime-adapter scenarios; full-tree reconstruction.",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "familia-invariant"
+        }
+      ]
+    },
+    {
+      "path": "nanobot/tests/webui/test_gateway_webui_smoke.py",
+      "patch": "tests_webui_test_gateway_webui_smoke.patch",
+      "owner": "familia-core",
+      "category": "upstream-alignment",
+      "behavior": "Smoke-сценарий gateway импортирует актуальный InvalidStatus и даёт холодному Docker/CI запуску до 60 секунд на bootstrap.",
+      "native_gap": "Версия websocket API и холодный запуск тестовой среды отличаются от предположений исходного smoke-теста.",
+      "verification": "Docker full-tree reconstruction; D2 запускает применимые WebUI smoke-сценарии отдельно.",
+      "hunks": [
+        {
+          "range": "all",
+          "category": "upstream-alignment"
+        }
+      ]
     }
   ],
-  "non_delta_decisions": [
-    {
-      "catalog_id": "D-HB-041",
-      "owner": "upstream",
-      "category": "upstream-alignment",
-      "paths": [
-        "nanobot/README.md",
-        "nanobot/nanobot/__init__.py",
-        "nanobot/nanobot/agent/tools/filesystem.py",
-        "nanobot/nanobot/channels/feishu.py",
-        "nanobot/nanobot/channels/vk.py",
-        "nanobot/nanobot/channels/wecom.py",
-        "nanobot/nanobot/command/router.py",
-        "nanobot/nanobot/config/__init__.py",
-        "nanobot/nanobot/templates/agent/memory_model.md",
-        "nanobot/nanobot/templates/agent/scope_defaults.md",
-        "nanobot/nanobot/templates/agent/shopping_vkusvill.md",
-        "nanobot/nanobot/utils/document.py"
-      ],
-      "decision": "keep byte-identical to pinned baseline"
-    }
-  ]
+  "c3_snapshot_sha256": {
+    "familia/src/familia/nanobot_extension/cron.py": "b4a7ac39136a27b5a9407404c3ecf4f518d77cbb3342fb5daca07383ec3a2ca8",
+    "nanobot/nanobot/channels/base.py": "4a23bfc224728105aaf0bac141454866eaceb9382d4a46dd28c0ce4ce650203f",
+    "nanobot/nanobot/channels/manager.py": "a1edd643e17795725f12f580aa241f8b4eaed09b0891dcd0b525fe657dee8e92",
+    "nanobot/nanobot/cli/gateway_runtime.py": "948ccd15cd8ce9b40e675c0f338286e8594415e3f37104349596d9ea73ccb207",
+    "nanobot/nanobot/runtime_adapters.py": "d9373615317ad7fa61494d664556eb5e69e6e100109d49e3d5776574039d7fa6"
+  }
 }

@@ -1,36 +1,32 @@
-# nanobot baseline: 0.1.5.post2
-# upstream commit: 950dddec499fbbe0353e997158c99808f0bb41e1
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
 diff --git a/nanobot/nanobot/bus/events.py b/nanobot/nanobot/bus/events.py
-index 018c25b..bf30024 100644
+index 7d0f247..aa6633d 100644
 --- a/nanobot/nanobot/bus/events.py
 +++ b/nanobot/nanobot/bus/events.py
-@@ -17,6 +17,7 @@ class InboundMessage:
-     media: list[str] = field(default_factory=list)  # Media URLs
-     metadata: dict[str, Any] = field(default_factory=dict)  # Channel-specific data
+@@ -35,6 +35,7 @@ class InboundMessage:
      session_key_override: str | None = None  # Optional override for thread-scoped sessions
-+    actor: str | None = None  # Optional actor id supplied by an inbound enricher
+     require_existing_session: bool = False
+     input_role: Literal["user", "system"] | None = None
++    actor: str | None = None  # Server-authoritative identity after admission.
  
      @property
      def session_key(self) -> str:
-@@ -36,3 +37,20 @@ class OutboundMessage:
+@@ -66,3 +67,16 @@ class OutboundMessage:
      metadata: dict[str, Any] = field(default_factory=dict)
- 
- 
+     buttons: list[list[str]] = field(default_factory=list)
+     event: "AgentEvent | None" = None
++
++
 +@dataclass
 +class CallbackEvent:
-+    """Inline-keyboard callback press from a channel.
-+
-+    Separated from ``InboundMessage`` so the agent doesn't treat button
-+    presses as user turns.  Scenarios consume these via
-+    ``MessageBus.consume_callback`` (or a dispatcher on top) and correlate
-+    them with outbound messages they sent using the ``payload``.
-+    """
++    """Typed channel callback kept separate from ordinary user messages."""
 +
 +    channel: str
 +    sender_id: str
 +    chat_id: str
-+    payload: Any  # JSON-decoded if the channel sent JSON, else raw
++    payload: Any
 +    timestamp: datetime = field(default_factory=datetime.now)
 +    actor: str | None = None
 +    metadata: dict[str, Any] = field(default_factory=dict)

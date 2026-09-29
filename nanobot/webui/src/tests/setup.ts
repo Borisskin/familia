@@ -1,7 +1,54 @@
 import "@testing-library/jest-dom/vitest";
-import { beforeEach } from "vitest";
+import { beforeAll, beforeEach } from "vitest";
 
-import i18n from "@/i18n";
+import i18n, { initializeI18n, loadAllLocaleResources } from "@/i18n";
+
+// The DOM test environment does not implement pointer capture used by Radix Select.
+if (!HTMLElement.prototype.hasPointerCapture) {
+  HTMLElement.prototype.hasPointerCapture = () => false;
+  HTMLElement.prototype.setPointerCapture = () => {};
+  HTMLElement.prototype.releasePointerCapture = () => {};
+}
+if (!HTMLElement.prototype.scrollIntoView) {
+  HTMLElement.prototype.scrollIntoView = () => {};
+}
+
+function createTestStorage(): Storage {
+  const store = new Map<string, string>();
+  return {
+    get length() {
+      return store.size;
+    },
+    clear() {
+      store.clear();
+    },
+    getItem(key: string) {
+      return store.get(String(key)) ?? null;
+    },
+    key(index: number) {
+      return Array.from(store.keys())[index] ?? null;
+    },
+    removeItem(key: string) {
+      store.delete(String(key));
+    },
+    setItem(key: string, value: string) {
+      store.set(String(key), String(value));
+    },
+  };
+}
+
+if (typeof window !== "undefined" && typeof localStorage.setItem !== "function") {
+  const storage = createTestStorage();
+  Object.defineProperty(window, "localStorage", {
+    value: storage,
+    configurable: true,
+  });
+  Object.defineProperty(globalThis, "localStorage", {
+    value: storage,
+    configurable: true,
+    writable: true,
+  });
+}
 
 // happy-dom doesn't ship with ``crypto.randomUUID``; shim a tiny v4-ish helper.
 if (!("randomUUID" in globalThis.crypto)) {
@@ -15,6 +62,11 @@ if (!("randomUUID" in globalThis.crypto)) {
     configurable: true,
   });
 }
+
+beforeAll(async () => {
+  await initializeI18n();
+  await loadAllLocaleResources();
+});
 
 beforeEach(async () => {
   await i18n.changeLanguage("en");

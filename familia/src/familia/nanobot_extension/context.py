@@ -6,6 +6,10 @@ from importlib.resources import files as pkg_files
 from pathlib import Path
 from typing import Any
 
+from nanobot.agent.context import ContextBuilder
+from nanobot.agent.tools.context import current_request_context
+from nanobot.session.summary import SessionSummary
+
 
 class FamiliaContextExtension:
     """Build actor-specific prompt sections for familia-backed nanobot turns."""
@@ -280,3 +284,125 @@ class FamiliaContextExtension:
             "key='<memory:name>')``. Values and raw catalogs are not projected."
         )
         return "# Family memory facts\n\n" + intro + "\n\n" + "\n\n".join(sections)
+
+
+class FamiliaContextBuilder(ContextBuilder):
+    """Nanobot context builder that never reads shared USER/MEMORY/history.
+
+    The target builder owns message assembly and skills; this product-owned
+    subclass replaces only system-prompt construction.  The active actor is
+    taken from the turn ContextVar, which the adapter binds before prompting.
+    """
+
+    def __init__(
+        self,
+        workspace: str | Path,
+        timezone: str | None = None,
+        disabled_skills: list[str] | None = None,
+    ) -> None:
+        self._disabled_skills = set(disabled_skills or ())
+        super().__init__(
+            Path(workspace),
+            timezone=timezone,
+            disabled_skills=disabled_skills,
+        )
+        self._extension = FamiliaContextExtension(self.workspace)
+
+    def _load_shared_system_files(self, workspace: Path) -> str:
+        """Read only project instructions/personality, never USER.md."""
+        from nanobot.utils.helpers import load_bundled_template
+
+        parts: list[str] = []
+        for filename, root in (("AGENTS.md", workspace), ("SOUL.md", self.workspace)):
+            path = root / filename
+            if not path.is_file():
+                continue
+            content = path.read_text(encoding="utf-8")
+            if filename == "SOUL.md" and self._is_template_content(
+                content,
+                "legacy/SOUL.md",
+            ):
+                content = load_bundled_template("SOUL.md") or content
+            if not content.strip():
+                continue
+            parts.append(f"## {filename}\n\n{content}")
+        return "\n\n".join(parts)
+
+    def build_system_prompt(
+        self,
+        *,
+        channel: str | None = None,
+        session_summary: SessionSummary | None = None,
+        workspace: Path | None = None,
+        include_memory: bool = True,
+    ) -> str:
+        del include_memory
+        from nanobot.utils.prompt_templates import render_template
+
+        from familia.principals import get_current_actor
+
+        root = workspace or self.workspace
+        request = current_request_context()
+        actor = get_current_actor() or (request.actor if request is not None else None)
+        parts = [self._get_identity(channel=channel, workspace=root)]
+        shared = self._load_shared_system_files(root)
+        if shared:
+            parts.append(shared)
+
+        # Familia templates and actor-owned memX sections are the only profile
+        # and memory source in adapter mode.
+        parts.extend(self._extension.build_sections(actor=actor, channel=channel))
+        parts.append(render_template("agent/tool_contract.md"))
+
+        private_summary = False
+        if actor and request is not None and request.actor == actor:
+            from familia.session_identity import parse_private_session_key
+
+            parsed = parse_private_session_key(request.session_key or "")
+            private_summary = parsed is not None and parsed[0] == actor
+        if private_summary and session_summary and session_summary["text"] != "(nothing)":
+            parts.append(
+                "[Archived Context Summary]\n\n"
+                f"Previous conversation summary (last active {session_summary['last_active']}):\n"
+                f"{session_summary['text']}"
+            )
+
+        # ``self.skills`` is created at loop construction for the central
+        # workspace.  Rebuild this read-only loader from the server-bound
+        # actor root so workspace-level skills cannot cross principals; the
+        # loader still exposes packaged skills as public capabilities.
+        from nanobot.agent.skills import SkillsLoader
+
+        skills = SkillsLoader(root, disabled_skills=self._disabled_skills)
+        always_skills = skills.get_always_skills()
+        if always_skills:
+            always_content = skills.load_skills_for_context(always_skills)
+            if always_content:
+                parts.append(f"# Active Skills\n\n{always_content}")
+        skills_summary = skills.build_skills_summary(exclude=set(always_skills))
+        if skills_summary:
+            parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
+
+        return "\n\n---\n\n".join(part for part in parts if part)
+
+    def build_messages(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        """Delegate message assembly while retaining the safe prompt override."""
+        from familia.principals import get_current_actor
+
+        request = current_request_context()
+        actor = get_current_actor() or (request.actor if request is not None else None)
+        history = kwargs.get("history")
+        if isinstance(history, list):
+            filtered: list[dict[str, Any]] = []
+            for message in history:
+                if not isinstance(message, dict):
+                    continue
+                metadata = message.get("metadata")
+                tagged_actor = message.get("actor")
+                if isinstance(metadata, dict):
+                    tagged_actor = metadata.get("actor", tagged_actor)
+                if tagged_actor not in (None, actor):
+                    continue
+                filtered.append(message)
+            kwargs["history"] = filtered
+        return super().build_messages(*args, **kwargs)
