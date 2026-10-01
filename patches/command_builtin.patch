@@ -2,7 +2,7 @@
 # upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
 diff --git a/nanobot/nanobot/command/builtin.py b/nanobot/nanobot/command/builtin.py
-index 27021b9..03dec68 100644
+index 27021b9..abbf2cc 100644
 --- a/nanobot/nanobot/command/builtin.py
 +++ b/nanobot/nanobot/command/builtin.py
 @@ -3,11 +3,13 @@
@@ -111,7 +111,15 @@ index 27021b9..03dec68 100644
  async def cmd_compact(ctx: CommandContext) -> None:
      """Compact the current session without resetting the conversation."""
      loop = ctx.loop
-@@ -448,6 +496,50 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
+@@ -357,6 +405,7 @@ async def cmd_compact(ctx: CommandContext) -> None:
+             ctx.key,
+             runtime=runtime,
+             events=delivery.events,
++            notify=True,
+         )
+     except Exception:
+         logger.exception("Manual context compaction failed for {}", ctx.key)
+@@ -448,6 +497,50 @@ async def cmd_model(ctx: CommandContext) -> OutboundMessage:
      )
  
  
@@ -162,7 +170,7 @@ index 27021b9..03dec68 100644
  async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
      """Manually trigger a Dream consolidation run."""
      import time
-@@ -455,6 +547,34 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
+@@ -455,6 +548,34 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
      loop = ctx.loop
      msg = ctx.msg
  
@@ -197,7 +205,7 @@ index 27021b9..03dec68 100644
      async def _run_dream():
          from nanobot.agent.memory import MemoryStore
  
-@@ -473,11 +593,11 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
+@@ -473,11 +594,11 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
          try:
              result = store.build_dream_prompt()
              if result is None:
@@ -211,7 +219,7 @@ index 27021b9..03dec68 100644
                  return
              prompt, last_cursor = result
              key = dream_session_key()
-@@ -518,9 +638,9 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
+@@ -518,9 +639,9 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
                      content += f" (commit {sha})"
              store.compact_history()
              prune_dream_sessions(loop.sessions)

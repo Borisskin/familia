@@ -2,7 +2,7 @@
 # upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
 diff --git a/nanobot/nanobot/agent/memory.py b/nanobot/nanobot/agent/memory.py
-index 0e738e3..4dd2326 100644
+index 0e738e3..ffd88cd 100644
 --- a/nanobot/nanobot/agent/memory.py
 +++ b/nanobot/nanobot/agent/memory.py
 @@ -8,12 +8,15 @@
@@ -220,7 +220,14 @@ index 0e738e3..4dd2326 100644
      async def summarize_transcript(
          self,
          accepted_messages: list[dict[str, Any]],
-@@ -1232,8 +1286,7 @@ class Consolidator:
+@@ -1226,14 +1280,14 @@ class Consolidator:
+         runtime: LLMRuntime,
+         max_suffix: int = 0,
+         events: EventSink = NO_EVENTS,
++        notify: bool = False,
+     ) -> str | None:
+         """Replace archived history with a summary checkpoint.
+ 
          ``max_suffix`` is accepted for SDK compatibility and no longer retains
          archived messages. All compaction triggers share checkpoint replay.
          """
@@ -230,7 +237,12 @@ index 0e738e3..4dd2326 100644
              self.sessions.invalidate(session_key)
              session = self.sessions.get_or_create(session_key)
  
-@@ -1252,6 +1305,12 @@ class Consolidator:
+@@ -1248,10 +1302,16 @@ class Consolidator:
+ 
+             compaction_id = uuid4().hex
+             await events.emit(
+-                ContextCompactionEvent(compaction_id=compaction_id, phase="started"),
++                ContextCompactionEvent(compaction_id=compaction_id, phase="started", notify=notify),
              )
              last_active = session.updated_at
              archive_end = archive_start + len(messages_to_archive)
@@ -243,7 +255,7 @@ index 0e738e3..4dd2326 100644
              try:
                  summary = await self.archive_session(
                      session, archive_end=archive_end, runtime=runtime,
-@@ -1265,6 +1324,16 @@ class Consolidator:
+@@ -1265,16 +1325,27 @@ class Consolidator:
                      session.provider_state = None
                      self.sessions.save(session)
              except (Exception, asyncio.CancelledError) as exc:
@@ -260,7 +272,27 @@ index 0e738e3..4dd2326 100644
                  await events.emit(
                      ContextCompactionEvent(
                          compaction_id=compaction_id,
-@@ -1295,3 +1364,122 @@ class Consolidator:
+                         phase="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
++                        notify=notify,
+                     ),
+                 )
+                 raise
+             if not summary:
+                 await events.emit(
+-                    ContextCompactionEvent(compaction_id=compaction_id, phase="failed"),
++                    ContextCompactionEvent(compaction_id=compaction_id, phase="failed", notify=notify),
+                 )
+                 return None
+ 
+@@ -1282,6 +1353,7 @@ class Consolidator:
+                 ContextCompactionEvent(
+                     compaction_id=compaction_id,
+                     phase="succeeded",
++                    notify=notify,
+                 ),
+             )
+ 
+@@ -1295,3 +1367,122 @@ class Consolidator:
              )
  
              return summary

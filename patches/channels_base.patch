@@ -2,7 +2,7 @@
 # upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
 diff --git a/nanobot/nanobot/channels/base.py b/nanobot/nanobot/channels/base.py
-index ed2fb77..5d17660 100644
+index ed2fb77..fe7ff29 100644
 --- a/nanobot/nanobot/channels/base.py
 +++ b/nanobot/nanobot/channels/base.py
 @@ -4,7 +4,7 @@ from __future__ import annotations
@@ -28,7 +28,15 @@ index ed2fb77..5d17660 100644
  class BaseChannel(ABC):
      """
      Abstract base class for chat channel implementations.
-@@ -114,9 +121,10 @@ class BaseChannel(ABC):
+@@ -31,6 +38,7 @@ class BaseChannel(ABC):
+     send_progress: bool = True
+     send_tool_hints: bool = True
+     show_reasoning: bool = True
++    show_compaction_notices: bool = False
+ 
+     def __init__(self, config: Any, bus: MessageBus):
+         """
+@@ -114,9 +122,10 @@ class BaseChannel(ABC):
  
          Channels with protocol-level business errors can override this hook to
          prevent retries that cannot succeed until external state changes.
