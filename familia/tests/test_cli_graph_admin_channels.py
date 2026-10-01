@@ -526,3 +526,34 @@ def test_whatsapp_link_passes_unsaved_proxy_and_draws_qr(config, capsys, fake_ne
     assert rc == 0, again
     assert fake_neonize[-1].proxy_address == PROXY
     connect(capsys, "cancel", "--session-id", again["session_id"])
+
+
+# ---- chat noise defaults ------------------------------------------------------
+
+
+QUIET = {"sendProgress": False, "sendToolHints": False, "showCompactionNotices": False}
+
+
+def _channels(config_path: Path) -> dict[str, Any]:
+    return json.loads(config_path.read_text(encoding="utf-8"))["channels"]
+
+
+def test_channel_add_writes_quiet_chat_defaults(config, capsys, tmp_path):
+    config.write({})
+
+    rc, err = add(capsys, "telegram", {"enabled": True, "token": "tg-secret-1234"})
+
+    assert rc == 0, err
+    channels = _channels(tmp_path / "config.json")
+    assert {k: channels[k] for k in QUIET} == QUIET
+
+
+def test_channel_add_keeps_explicit_user_choice(config, capsys, tmp_path):
+    config.write({"sendToolHints": True})
+
+    rc, err = add(capsys, "telegram", {"enabled": True, "token": "tg-secret-1234"})
+
+    assert rc == 0, err
+    channels = _channels(tmp_path / "config.json")
+    assert channels["sendToolHints"] is True
+    assert channels["sendProgress"] is False

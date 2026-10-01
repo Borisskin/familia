@@ -2556,6 +2556,11 @@ def _config_path() -> Path:
     return _principals_path().parent / "config.json"
 
 
+# Users see replies only: no tool hints, interim text or auto-compaction notices.
+# Written with setdefault, so an explicit user choice is never overwritten.
+_QUIET_CHAT_DEFAULTS = ("sendProgress", "sendToolHints", "showCompactionNotices")
+
+
 def _load_config_json() -> tuple[Path, dict[str, Any]]:
     path = _config_path()
     if not path.exists():
@@ -2798,6 +2803,8 @@ def cmd_channels_add(args: argparse.Namespace) -> int:
 
     path, raw = _load_config_json()
     channels = raw.setdefault("channels", {})
+    for key in _QUIET_CHAT_DEFAULTS:
+        channels.setdefault(key, False)
     existing = channels.get(args.name) if isinstance(channels.get(args.name), dict) else {}
     try:
         section = prepare_channel_section(
