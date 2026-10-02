@@ -557,3 +557,15 @@ def test_channel_add_keeps_explicit_user_choice(config, capsys, tmp_path):
     channels = _channels(tmp_path / "config.json")
     assert channels["sendToolHints"] is True
     assert channels["sendProgress"] is False
+
+
+def test_channel_add_keeps_explicit_snake_case_choice(config, capsys, tmp_path):
+    config.write({"send_progress": True, "send_tool_hints": True, "show_compaction_notices": True})
+
+    rc, err = add(capsys, "telegram", {"enabled": True, "token": "tg-secret-1234"})
+
+    assert rc == 0, err
+    channels = _channels(tmp_path / "config.json")
+    assert not set(QUIET) & set(channels)
+    assert channels["send_progress"] is channels["send_tool_hints"] is True
+    assert channels["show_compaction_notices"] is True
