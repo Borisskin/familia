@@ -77,3 +77,19 @@ archival and clearing after an unconfirmed write, which contradict the
 Familia-owned archive-before-clear contract. Tracked acceptance coverage lives
 in `familia/tests/test_nanobot_035_acceptance.py`; the separate background-task
 shutdown check there does not couple task draining to `/new`.
+
+## Backports from upstream after 0.3.5
+
+Temporary `upstream-alignment` hunks on top of the pinned baseline. Remove them
+when the baseline moves to a release that contains the upstream commit, and
+check that nothing is applied twice.
+
+| Upstream | Subject | Files (vendored) | Remove when |
+| --- | --- | --- | --- |
+| `0b402d04`, `7644d845`, `ab6d5f1d` | Automatic context compaction no longer posts chat notices; `/compact` still does; `showCompactionNotices` setting (default `false`) | `events.py`, `agent/memory.py`, `command/builtin.py`, `config/schema.py`, `channels/base.py`, `channels/manager.py`, `channels/telegram/runtime.py`, `channels/whatsapp/runtime.py` and their upstream tests | baseline release contains `ab6d5f1d` |
+
+Only the net effect of the three commits is taken; their `turn_delivery` and
+`notification_delivery` changes cancel out and are not carried. The QQ,
+WebUI-settings and unused-channel parts are not carried either. Familia's own
+VK channel applies the same rule in `familia/src/familia/channels/vk.py`; it
+is not part of these patches and must be aligned by hand.

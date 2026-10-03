@@ -2556,6 +2556,16 @@ def _config_path() -> Path:
     return _principals_path().parent / "config.json"
 
 
+# Users see replies only: no tool hints, interim text or auto-compaction notices.
+# Config accepts camelCase and snake_case, so an explicit choice in either
+# spelling is never overwritten.
+_QUIET_CHAT_DEFAULTS = (
+    ("sendProgress", "send_progress"),
+    ("sendToolHints", "send_tool_hints"),
+    ("showCompactionNotices", "show_compaction_notices"),
+)
+
+
 def _load_config_json() -> tuple[Path, dict[str, Any]]:
     path = _config_path()
     if not path.exists():
@@ -2798,6 +2808,9 @@ def cmd_channels_add(args: argparse.Namespace) -> int:
 
     path, raw = _load_config_json()
     channels = raw.setdefault("channels", {})
+    for camel, snake in _QUIET_CHAT_DEFAULTS:
+        if camel not in channels and snake not in channels:
+            channels[camel] = False
     existing = channels.get(args.name) if isinstance(channels.get(args.name), dict) else {}
     try:
         section = prepare_channel_section(

@@ -2,10 +2,18 @@
 # upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
 diff --git a/nanobot/nanobot/config/schema.py b/nanobot/nanobot/config/schema.py
-index c3e75dc..ca8eed6 100644
+index c3e75dc..1c05b40 100644
 --- a/nanobot/nanobot/config/schema.py
 +++ b/nanobot/nanobot/config/schema.py
-@@ -237,6 +237,12 @@ class BedrockProviderConfig(ProviderConfig):
+@@ -33,6 +33,7 @@ class ChannelsConfig(Base):
+     send_progress: bool = True  # stream agent's text progress to the channel
+     send_tool_hints: bool = True  # stream tool-call hints (e.g. read_file("…"))
+     show_reasoning: bool = True  # surface model reasoning when channel implements it
++    show_compaction_notices: bool = False  # automatic compaction chat notices, not UI lifecycle events
+     extract_document_text: bool = True  # Deprecated and ignored; documents are read on demand
+     send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
+     transcription_provider: str = "groq"  # Deprecated: use top-level transcription.provider
+@@ -237,6 +238,12 @@ class BedrockProviderConfig(ProviderConfig):
      profile: str | None = None  # Optional AWS shared config profile
  
  
@@ -18,7 +26,7 @@ index c3e75dc..ca8eed6 100644
  class ProvidersConfig(Base):
      """Configuration for LLM providers.
  
-@@ -254,6 +260,7 @@ class ProvidersConfig(Base):
+@@ -254,6 +261,7 @@ class ProvidersConfig(Base):
      openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
      orcarouter: ProviderConfig = Field(default_factory=ProviderConfig)  # OrcaRouter API gateway
      assemblyai: ProviderConfig = Field(default_factory=ProviderConfig)  # AssemblyAI voice transcription

@@ -1,0 +1,17 @@
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
+
+diff --git a/nanobot/nanobot/events.py b/nanobot/nanobot/events.py
+index e4308f7..28b86cb 100644
+--- a/nanobot/nanobot/events.py
++++ b/nanobot/nanobot/events.py
+@@ -17,6 +17,9 @@ class AgentEvent:
+ class ContextCompactionEvent(AgentEvent):
+     compaction_id: str
+     phase: Literal["started", "succeeded", "failed", "cancelled"]
++    # Request a chat notice (e.g. /compact), not event delivery or persistence.
++    # Interactive clients still consume every phase when this is false.
++    notify: bool = False
+ 
+ 
+ @dataclass(frozen=True)

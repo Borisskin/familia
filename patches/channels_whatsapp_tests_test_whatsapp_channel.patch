@@ -1,0 +1,51 @@
+# nanobot baseline: 0.3.5
+# upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
+
+diff --git a/nanobot/nanobot/channels/whatsapp/tests/test_whatsapp_channel.py b/nanobot/nanobot/channels/whatsapp/tests/test_whatsapp_channel.py
+index ff3ee90..8777ed7 100644
+--- a/nanobot/nanobot/channels/whatsapp/tests/test_whatsapp_channel.py
++++ b/nanobot/nanobot/channels/whatsapp/tests/test_whatsapp_channel.py
+@@ -13,6 +13,7 @@ import pytest
+ import nanobot.channels.whatsapp.runtime as whatsapp_module
+ from nanobot.bus.events import OutboundMessage
+ from nanobot.bus.queue import MessageBus
++from nanobot.events import ContextCompactionEvent
+ from nanobot.channels.whatsapp.runtime import (
+     WhatsAppChannel,
+     _legacy_bridge_config_fields,
+@@ -234,6 +235,35 @@ async def test_send_text_uses_neonize_send_message(monkeypatch) -> None:
+     client.send_message.assert_awaited_once_with(("12345", "s.whatsapp.net"), "hi")
+ 
+ 
++def _compaction(*, notify: bool) -> OutboundMessage:
++    return OutboundMessage(
++        channel="whatsapp",
++        chat_id="12345@s.whatsapp.net",
++        content="Context compacted.",
++        event=ContextCompactionEvent(compaction_id="c1", phase="succeeded", notify=notify),
++    )
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    ("notify", "show_notices", "delivered"),
++    [(False, False, False), (True, False, True), (False, True, True)],
++)
++async def test_send_compaction_notice_follows_policy(
++    monkeypatch, notify: bool, show_notices: bool, delivered: bool
++) -> None:
++    _patch_neonize_api(monkeypatch)
++    client = _make_send_client()
++    ch = _make_channel()
++    ch._client = client
++    ch._connected = True
++    ch.show_compaction_notices = show_notices
++
++    await ch.send(_compaction(notify=notify))
++
++    assert client.send_message.await_count == (1 if delivered else 0)
++
++
+ @pytest.mark.asyncio
+ async def test_send_media_dispatches_by_mimetype(monkeypatch) -> None:
+     _patch_neonize_api(monkeypatch)

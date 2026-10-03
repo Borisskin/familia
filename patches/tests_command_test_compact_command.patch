@@ -2,10 +2,19 @@
 # upstream commit: 1bb712d3488915ca4ed9ccc1a93067ff722f5ab9
 
 diff --git a/nanobot/tests/command/test_compact_command.py b/nanobot/tests/command/test_compact_command.py
-index 67734a3..66a5894 100644
+index 67734a3..9f0d91a 100644
 --- a/nanobot/tests/command/test_compact_command.py
 +++ b/nanobot/tests/command/test_compact_command.py
-@@ -176,7 +176,6 @@ async def test_empty_compact_finishes_silently_and_does_not_schedule_idle_archiv
+@@ -71,6 +71,8 @@ async def test_compact_emits_one_lifecycle_and_keeps_the_session(loop, command)
+     assert started.phase == "started"
+     assert completed.phase == "succeeded"
+     assert started.compaction_id == completed.compaction_id
++    assert started.notify is True
++    assert completed.notify is True
+ 
+     loop.sessions.invalidate("cli:test")
+     reloaded = loop.sessions.get_or_create("cli:test")
+@@ -176,7 +178,6 @@ async def test_empty_compact_finishes_silently_and_does_not_schedule_idle_archiv
      loop.auto_compact.check_expired(schedule, loop.runtime_for_session)
      schedule.assert_not_called()
  

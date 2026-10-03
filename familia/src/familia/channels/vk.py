@@ -39,6 +39,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel, DeliveryUnavailableError
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
+from nanobot.events import ContextCompactionEvent
 from nanobot.utils.helpers import split_message
 from pydantic import Field
 
@@ -277,7 +278,8 @@ class VKChannel(BaseChannel):
 
     # --- Typing indicator --------------------------------------------------
 
-    async def _typing_loop(self, peer_id: int, max_seconds: int = 180) -> None:
+    # ponytail: fixed ceiling; tie to turn completion if replies outlast it
+    async def _typing_loop(self, peer_id: int, max_seconds: int = 900) -> None:
         """Refresh VK 'typing...' activity until cancelled or timeout.
 
         VK's ``messages.setActivity`` expires after ~10 s, so we re-issue
@@ -322,6 +324,12 @@ class VKChannel(BaseChannel):
     # --- Outbound ----------------------------------------------------------
 
     async def send(self, msg: OutboundMessage) -> None:
+        # Backport of upstream ab6d5f1d: automatic compaction stays silent.
+        # Placed before _stop_typing so a dropped notice keeps "typing…" alive.
+        if isinstance(msg.event, ContextCompactionEvent) and not (
+            msg.event.notify or self.show_compaction_notices
+        ):
+            return
         # Stop the "typing…" indicator as soon as anything is being
         # delivered — including stream deltas, since the user already
         # sees text appearing.
