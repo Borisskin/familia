@@ -123,6 +123,50 @@ tail -n 50 /opt/familia/audit.jsonl
 
 ## Типовые проблемы
 
+### Проверка памяти и sandbox после развёртывания
+
+`DREAM_CONSOLIDATOR_MEMX_KEY` в `.env` должен совпадать с отдельным ключом
+в `memx-config/acl.json`, разрешающим `shared:*`, `private:*` и `pair:*`.
+Этот ключ нужен и для сжатия истории обычного чата. Админка восстанавливает
+его при установке и обновлении; при ручном развёртывании настройте его сами.
+После изменения `.env` пересоздайте gateway: простой `docker restart`
+не перечитывает переменные окружения.
+
+При включённом инструменте `exec` подключайте
+`docker-compose.exec-sandbox.yml` последним, после локальных override-файлов.
+Требуется Docker Compose 2.24.4 или новее для `!override`.
+
+Если на Ubuntu `bwrap` сообщает `setting up uid map: Permission denied`,
+проверьте `sysctl kernel.apparmor_restrict_unprivileged_userns`.
+При значении `1` загрузите профиль для контейнера:
+
+```bash
+sudo tee /etc/apparmor.d/familia-exec >/dev/null <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+profile familia-exec flags=(unconfined) {
+  userns,
+}
+EOF
+sudo apparmor_parser -r /etc/apparmor.d/familia-exec
+```
+
+Добавьте `FAMILIA_EXEC_APPARMOR_PROFILE=familia-exec` в `.env` и пересоздайте
+gateway с sandbox override. Профиль применяется только к явно выбравшему
+его контейнеру; общесистемный запрет user namespaces остаётся включённым.
+Админка настраивает этот профиль автоматически и проверяет запуск Python
+и запись временного файла внутри sandbox перед завершением установки.
+
+Наличие ответа `familia version` подтверждает только запуск CLI.
+Для проверки работающего gateway используйте `/health` внутри контейнера:
+
+```bash
+docker exec familia-gateway python -c \
+  "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:18790/health', timeout=5).read().decode())"
+```
+
+Ожидается HTTP `200`, `status=ok` и отсутствие `ready=false`.
+
 | Симптом | Вероятная причина |
 | --- | --- |
 | `unknown principal: telegram/12345` | Telegram-чат не привязан к участнику в `principals.json` |

@@ -21,6 +21,8 @@ services:
   familia-gateway:
     cap_add:
       - SYS_ADMIN
-    security_opt:
-      - apparmor=unconfined
+    # Replace inherited security options so a local override cannot leave two
+    # conflicting AppArmor profiles on the container. Requires Compose 2.24.4+.
+    security_opt: !override
+      - apparmor=${FAMILIA_EXEC_APPARMOR_PROFILE:-unconfined}
       - seccomp=unconfined
