@@ -26,6 +26,7 @@ class FamiliaContextExtension:
         "agent/scope_defaults.md",
         "agent/memory_model.md",
         "agent/shopping_vkusvill.md",
+        "agent/pdf_documents.md",
     )
 
     def __init__(self, workspace: str | Path) -> None:

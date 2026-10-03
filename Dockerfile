@@ -41,7 +41,7 @@ RUN if [ -n "$APT_MIRROR" ]; then \
 # Install runtime tools used by the native nanobot channels (libmagic1:
 # python-magic, which the WhatsApp channel needs for media types).
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates git bubblewrap openssh-client ffmpeg libmagic1 && \
+    apt-get install -y --no-install-recommends ca-certificates git bubblewrap openssh-client ffmpeg libmagic1 fonts-dejavu-core && \
     rm -rf /var/lib/apt/lists/*
 
 # Surface mirror fallbacks to pip/uv and npm for the rest of the build.
