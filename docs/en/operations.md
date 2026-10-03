@@ -128,6 +128,48 @@ the message metadata in container logs.
 
 ## Common problems
 
+### Check memory and exec after deployment
+
+`DREAM_CONSOLIDATOR_MEMX_KEY` in `.env` must match a dedicated entry in
+`memx-config/acl.json` allowing `shared:*`, `private:*`, and `pair:*`.
+Normal chat context compaction also needs this key. The admin installer
+configures it on install/update; manual deployments must supply it.
+Recreate the gateway after changing `.env`; `docker restart` does not reload
+environment variables.
+
+When exec is enabled, merge `docker-compose.exec-sandbox.yml` last, after
+local overrides. Docker Compose 2.24.4+ is required for `!override`.
+On Ubuntu with `kernel.apparmor_restrict_unprivileged_userns=1`, a plain
+`apparmor=unconfined` can still make bubblewrap fail to write UID mappings.
+Load a named container profile instead:
+
+```bash
+sudo tee /etc/apparmor.d/familia-exec >/dev/null <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+profile familia-exec flags=(unconfined) {
+  userns,
+}
+EOF
+sudo apparmor_parser -r /etc/apparmor.d/familia-exec
+```
+
+Set `FAMILIA_EXEC_APPARMOR_PROFILE=familia-exec` in `.env` and recreate the
+gateway with the sandbox override. The profile applies only to containers
+that select it; host-wide user namespace restrictions remain enabled.
+The admin installer prepares this profile automatically and verifies Python
+execution and a temporary workspace write before declaring success.
+
+`familia version` only verifies a separate CLI process. Check the running
+gateway through its management listener:
+
+```bash
+docker exec familia-gateway python -c \
+  "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:18790/health', timeout=5).read().decode())"
+```
+
+Expect HTTP `200`, `status=ok`, and no `ready=false`.
+
 | Symptom | Likely cause |
 | --- | --- |
 | `unknown principal: telegram/12345` | Telegram chat not bound to a principal in `principals.json` |
