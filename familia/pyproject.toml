@@ -25,6 +25,9 @@ dependencies = [
     "pyyaml>=6,<7",
     "python-telegram-bot[socks,webhooks]>=22.6,<23.0",
     "socksio>=1.0.0,<2.0.0",
+    "reportlab>=4.4,<5",
+    "pypdf>=5.9,<6",
+    "pymupdf>=1.26,<2",
     "python-socks[asyncio]>=2.8.0,<3.0.0; sys_platform != 'win32'",
 ]
 
